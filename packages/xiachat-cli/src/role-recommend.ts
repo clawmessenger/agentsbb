@@ -23,6 +23,18 @@ export const ROLE_RECOMMEND_MAX_ROLES = 8;
 export const ROLE_RECOMMEND_MAX_NAME = 80;
 export const ROLE_RECOMMEND_MAX_PROMPT = 8000;
 
+/**
+ * 人设目标长度（写进提示词，不是校验上限）。
+ *
+ * 推荐的全部输出就是这份 JSON：角色数 × 每个人设的字数 = 生成时间。设备端实测
+ * 「<= 8000 字符」这种不设上限的写法会让模型给每个角色写三五百字，单轮 12s 起步，
+ * 叠加排队后用户等过 100s。一句话（40 字）把输出压到原来的 1/8，实测落在 3-6s。
+ *
+ * 校验上限仍留 ROLE_RECOMMEND_MAX_PROMPT：模型偶尔不听话写长了，截断会毁掉
+ * 语义，宁可整份收下让用户在界面上看到原文。
+ */
+export const ROLE_RECOMMEND_PROMPT_TARGET_CHARS = 40;
+
 // ---- 讨论风格 --------------------------------------------------------------
 //
 // C 端创建圆桌时先选「讨论风格」（clawmessenger-web/src/lib/
@@ -191,7 +203,7 @@ function buildStyleSection(profile: StyleProfile, maxRoles: number): string[] {
   }
   lines.push(
     "",
-    "Write this style's speaking voice INTO every role_prompt, as an instruction that role must follow on every single turn:",
+    `Fold this style's speaking voice into each role_prompt's ONE sentence (do not paste the voice text verbatim, and do not add a second sentence for it):`,
     profile.voice,
     "role_prompt is handed to that participant verbatim when it speaks, so the voice has to live there — it is what keeps two different styles from sounding alike.",
   );
@@ -227,8 +239,14 @@ export function buildRoleRecommendPrompt(request: RoleRecommendRequest): string 
     "Reply with ONLY a JSON object, no prose and no markdown fence:",
     '{"roles":[{"role_name":"...","role_prompt":"...","speaking_order":0}]}',
     "",
-    "- role_name: a short distinct label (<= 80 characters)",
-    "- role_prompt: the instructions for that role (<= 8000 characters)",
+    "- role_name: a short distinct label (<= 20 characters)",
+    // 人设固定为「一句话」，不再让模型自由发挥成长篇：
+    //   · 速度：这段 JSON 是**全部输出**，人设长度直接等于生成时间。过去只写
+    //     「<= 8000 字符」，模型于是每个角色写三五百字，5 个角色就是上千 token，
+    //     设备端实测单轮 12-84s（含排队），用户等不到就重试，请求进一步堆叠；
+    //   · 一致性：一句话已经足够定调，用户侧也不再提供编辑（见 C 端引导卡），
+    //     长篇人设既改不了也用不上。
+    `- role_prompt: ONE sentence, <= ${ROLE_RECOMMEND_PROMPT_TARGET_CHARS} characters: who this role is and how it speaks. No lists, no headings, no examples, no restating the topic.`,
     "- speaking_order: 0-based, and across the roles exactly 0,1,2,… with no gaps or repeats",
   );
   return lines.join("\n");

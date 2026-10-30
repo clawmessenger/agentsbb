@@ -46,6 +46,14 @@ const (
 // 下限天然受「一个 agent 只能演一个角色」约束（候选节点数）。
 const recommendRoleCountCap = 5
 
+// recommendWaitCapSeconds 是单次角色推荐的**服务端**等待上限（秒）。
+//
+// 主持设备的超时配置是给「讨论轮次」用的（长思考回合可以跑几分钟），拿它当推荐
+// 的上限就等于让配置向导干等：线上配成 120s 时，用户实测「已等待 104s 还没出现」，
+// 而设备端那一个回合早就跑完了。推荐提示词已收成「一句话人设」，正常 3-6s，
+// 20s 足够覆盖冷启动；超过就按超时失败，让用户立刻看到重试入口，而不是继续转圈。
+const recommendWaitCapSeconds = 20
+
 // setupPromptPayload 是 setup_prompt 事件的 data 形状（v3 契约，见 web
 // lib/discussion-v3.ts 的 eventData.setup_prompt）。
 func setupPromptPayload(step, prompt string) map[string]interface{} {
@@ -449,25 +457,36 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		fail(hostErr)
 		return
 	}
-	candidates, candCode := rt.roundtable.roleCandidateNodesFor(ctx, d.CreatedBy, host, req.nodeIDs, req.nodeIDsGiven)
-	if candCode != "" {
-		fail(candCode)
-		return
+	// 角色池（形态 A）与候选设备（形态 B）是两条不同的口径：
+	//   · 形态 A（引导页，前端不传 node_ids）：角色只由议题决定，候选设备既不
+	//     决定数量也不参与分配。候选探测因此**不是**致命条件 —— 用户完全可以先
+	//     攒一批角色，之后再把它们分配给陆续加进来的 agent。
+	//   · 形态 B（小程序 / 显式传 node_ids）：沿用「候选设备 = 角色数上限」，
+	//     推荐结果直接绑设备，对外契约不变。
+	var candidates []string
+	if req.nodeIDsGiven {
+		c, candCode := rt.roundtable.roleCandidateNodesFor(ctx, d.CreatedBy, host, req.nodeIDs, true)
+		if candCode != "" {
+			fail(candCode)
+			return
+		}
+		candidates = c
 	}
-	// 续推：把上一批已绑定的设备从候选里剔掉（仅在前端没给 node_ids 时兜底，
-	// 理由见 appendCandidateNodes）。assignRoleNodes 只在 candidates 里挑设备，一旦
-	// 挑中已占用的那台，confirm 就会以 ROLE_DEVICE_DUPLICATED 整单拒绝，而用户看到
-	// 的只是一句看不懂的报错。
+	// 续推：把上一批的角色内容取出来，拼进提示词让模型避开重复（见
+	// withExistingRolesHint）。设备剔除只在形态 B 下还有意义 —— 形态 A 的角色
+	// 不绑设备，也就不存在「已被占用的设备」。
 	var appendRec db.RongcloudRoleRecommendation
 	appendOK := false
 	if req.appendMode {
 		if rec, ok := rt.currentSetupRecommendation(ctx, discussionID); ok {
 			appendRec, appendOK = rec, true
-			candidates = appendCandidateNodes(candidates, rec.Roles, req.nodeIDsGiven)
-			if len(candidates) == 0 {
-				// 剩余设备都已被上一批占满：没有可推荐的对象，按「没有可用设备」处理。
-				fail("NO_ELIGIBLE_USER_DEVICES")
-				return
+			if req.nodeIDsGiven {
+				candidates = appendCandidateNodes(candidates, rec.Roles, true)
+				if len(candidates) == 0 {
+					// 剩余设备都已被上一批占满：没有可推荐的对象，按「没有可用设备」处理。
+					fail("NO_ELIGIBLE_USER_DEVICES")
+					return
+				}
 			}
 		} else {
 			// 没有当前推荐行（比如首推就失败了）：没有可延续的 recommendationId，
@@ -481,9 +500,23 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		fail("SYSTEM_HOST_OFFLINE")
 		return
 	}
+	// 主持设备的超时是给讨论轮次配的，推荐单独压到 recommendWaitCapSeconds：
+	// 配上 120s 就等于让向导干等两分钟（线上现场）。设备端拿到的是**压过之后**
+	// 的值，两端上限一致，不会出现「服务端已放弃、设备还在跑」的空转。
 	timeout := host.timeoutSeconds
-	if timeout <= 0 {
-		timeout = 60
+	if timeout <= 0 || timeout > recommendWaitCapSeconds {
+		timeout = recommendWaitCapSeconds
+	}
+	// 形态 A 的角色数与候选设备无关：产品口径是「每批 3–5 个角色」，由常量
+	// 直接给；形态 B 才按候选收敛（否则 8 台设备会推 8 个角色，向导一次只能
+	// 配一个，用户要滑 8 轮）。
+	maxRoles := recommendRoleCountCap
+	if req.nodeIDsGiven {
+		maxRoles = min(recommendRoleCountCap, len(candidates))
+	}
+	recommendPrompt := rt.roundtable.recommendationPrompt(ctx)
+	if appendOK {
+		recommendPrompt = withExistingRolesHint(recommendPrompt, appendRec.Roles)
 	}
 	bctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+5)*time.Second)
 	defer cancel()
@@ -491,10 +524,10 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		AIUserID:             host.aiUserID,
 		DisplayName:          host.displayName,
 		Avatar:               host.avatar,
-		RecommendationPrompt: rt.roundtable.recommendationPrompt(ctx),
+		RecommendationPrompt: recommendPrompt,
 		TimeoutSeconds:       timeout,
 		ConfigVersion:        configVersionInt(host.configVersion),
-	}, d.Topic, d.Goal, min(recommendRoleCountCap, len(candidates)), "")
+	}, d.Topic, d.Goal, maxRoles, "")
 	if code != "" {
 		fail(code)
 		return
@@ -504,7 +537,11 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 	if err != nil || d.Status != DiscussionStatusConfiguring {
 		return
 	}
-	assignRoleNodes(payloadRoles(payload), candidates)
+	// 只有形态 B 的调用方带了「这些角色给哪台设备」的意图；形态 A 的角色属于
+	// 角色池，由前端在确认前分配（未分配的角色在 confirm 时被忽略）。
+	if req.nodeIDsGiven {
+		assignRoleNodes(payloadRoles(payload), candidates)
+	}
 
 	rolesJSON, _ := json.Marshal(payload["roles"])
 	expiresAt := time.Now().Add(recommendRolesTTL)
@@ -551,7 +588,7 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 	}
 	if err := rt.emitSetupPrompt(ctx, d, setupStepRoles, map[string]interface{}{
 		"step":             setupStepRoles,
-		"prompt":           "我为这个议题推荐了这些智能体，勾选参与讨论的伙伴：",
+		"prompt":           "我为这个议题推荐了这些角色，勾选要参与讨论的角色并分配伙伴：",
 		"roles":            roles,
 		"recommendationId": recID,
 		"expiresAt":        expiresAt.UnixMilli(),
@@ -840,9 +877,14 @@ func setupRoleSnapshots(canonical roundtableCanonical, validated roundtableValid
 //     一长就整单拒绝；而 broker 解析推荐时用的是 rune，两边差了三倍。
 //   - 角色名判重也要按 NFKC + 小写归一化（与 canonicalizeRoundtablePayload 同口径），
 //     并给出专门的错误码，让客户端能直说「名字重了」而不是笼统的 400。
+// setupConfirmMaxRoles 是确认时一次能提交的角色条数上限。它限制的是「这次提交
+// 带了几个角色」，不是「讨论组能有多少成员」—— 用户可以把讨论组加到很多个
+// agent，分多批提交即可。取 32 是因为再多就说明客户端在构造异常请求了。
+const setupConfirmMaxRoles = 32
+
 func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *RoundtableError) {
 	raw, ok := cmd.Params["roles"].([]interface{})
-	if !ok || len(raw) < 1 || len(raw) > 8 {
+	if !ok || len(raw) < 1 || len(raw) > setupConfirmMaxRoles {
 		return nil, roundtableErr("INVALID_ROUNDTABLE_REQUEST")
 	}
 	roles := make([]roundtableRoleInput, 0, len(raw))
@@ -860,7 +902,7 @@ func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *Roundta
 		if roleID == "" || !roundtableSafeID.MatchString(roleID) || roleName == "" ||
 			utf8.RuneCountInString(roleName) > 80 ||
 			prompt == "" || utf8.RuneCountInString(prompt) > 8000 ||
-			nodeID == "" || utf8.RuneCountInString(nodeID) > 128 {
+			utf8.RuneCountInString(nodeID) > 128 {
 			return nil, roundtableRoleErr("INVALID_ROUNDTABLE_REQUEST", i)
 		}
 		nameKey := strings.ToLower(norm.NFKC.String(roleName))
@@ -868,6 +910,12 @@ func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *Roundta
 			return nil, roundtableRoleErr("ROLE_NAME_DUPLICATED", i)
 		}
 		names[nameKey] = true
+		// 没分配 agent 的角色直接跳过：角色池里的角色可以先存着不参与讨论，
+		// 这是「先出角色、后绑 agent」的核心 —— 若在这里强制要求 node_id，
+		// 用户只要有一个角色没分配就整单提交不了。
+		if nodeID == "" {
+			continue
+		}
 		if nodes[nodeID] {
 			return nil, roundtableRoleErr("ROLE_DEVICE_DUPLICATED", i)
 		}
@@ -879,10 +927,16 @@ func parseSetupConfirmRoles(cmd CommandContent) ([]roundtableRoleInput, *Roundta
 			}
 			model = &ms
 		}
+		// speaking_order 按「已分配角色的出现顺序」重排：跳过的未分配角色不能
+		// 在序号里留洞，下游要求它是恰好 0..n-1 的排列。
 		roles = append(roles, roundtableRoleInput{
 			RoleID: roleID, RoleName: roleName, RolePrompt: prompt,
-			NodeID: nodeID, Model: model, SpeakingOrder: i,
+			NodeID: nodeID, Model: model, SpeakingOrder: len(roles),
 		})
+	}
+	if len(roles) == 0 {
+		// 一个都没分配就确认：没有任何成员可参与讨论，按请求无效处理。
+		return nil, roundtableRoleErr("INVALID_ROUNDTABLE_REQUEST", 0)
 	}
 	return roles, nil
 }
@@ -941,4 +995,69 @@ func (rt *discussionRuntime) actionTouchSetup(ctx context.Context, cmd CommandCo
 	}
 	rt.touchSetup(ctx, row.DiscussionID)
 	return okResult(map[string]interface{}{"ok": true, "active": true})
+}
+
+// existingRolesHintBudget 是已有角色摘要的字符预算。推荐提示词整体要过 CLI 的
+// argv 硬上限（见 CLI 的 8000 字约束），而管理端配置的推荐提示词本身可能已经占
+// 掉大半，摘要必须自觉克制。
+const existingRolesHintBudget = 1200
+
+// withExistingRolesHint 把「上一批已经确定的角色」拼进推荐提示词。
+//
+// 角色池（形态 A）下角色不绑设备，续推时不能再靠「把已占用的设备从候选里剔掉」
+// 来避免重复：模型看不到任何已有信息，只会把同一批人设再写一遍。这里直接把角色
+// 摘要交给它，并要求新一批与已有角色互补。
+func withExistingRolesHint(base string, rolesJSON []byte) string {
+	hint := existingRolesHint(rolesJSON)
+	if hint == "" {
+		return base
+	}
+	if strings.TrimSpace(base) == "" {
+		return hint
+	}
+	return base + "\n\n" + hint
+}
+
+// existingRolesHint 生成角色摘要文本；没有任何具名角色时返回空串（调用方保持
+// 原提示词，不追加空标题）。
+func existingRolesHint(rolesJSON []byte) string {
+	var roles []map[string]interface{}
+	if err := json.Unmarshal(rolesJSON, &roles); err != nil || len(roles) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## 已经确定的角色（必须避开，不要重复推荐）\n")
+	b.WriteString("下面这些角色已经在这个讨论组里用掉了。新一批角色要和它们**互补**：")
+	b.WriteString("不要换名字重复同一类视角，也不要换个说法讲同一个关注点。\n\n")
+	written := 0
+	for _, role := range roles {
+		name, _ := role["role_name"].(string)
+		if name == "" {
+			continue
+		}
+		line := "- " + name
+		if prompt, _ := role["role_prompt"].(string); prompt != "" {
+			line += "：" + summarizeRolePrompt(prompt, 60)
+		}
+		if b.Len()+len(line) > existingRolesHintBudget {
+			b.WriteString("- …（其余角色略；判断标准不变：不复用同名，也不重复同一个关注点）\n")
+			break
+		}
+		b.WriteString(line + "\n")
+		written++
+	}
+	if written == 0 {
+		return ""
+	}
+	return b.String()
+}
+
+// summarizeRolePrompt 按 rune 截断：role_prompt 上限是 8000 字，整段搬进提示词
+// 会把推荐请求本身撑爆。
+func summarizeRolePrompt(prompt string, limit int) string {
+	runes := []rune(strings.TrimSpace(prompt))
+	if len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit]) + "…"
 }

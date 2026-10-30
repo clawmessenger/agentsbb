@@ -6,6 +6,7 @@ import {
   detectDiscussionStyle,
   parseRoleRecommendRequest,
   parseRoleRecommendationOutput,
+  ROLE_RECOMMEND_PROMPT_TARGET_CHARS,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
   type RoleRecommendRequest,
 } from "./role-recommend.js";
@@ -95,6 +96,36 @@ describe("buildRoleRecommendPrompt", () => {
       recommendationPrompt: "",
     });
     expect(prompt).not.toContain("Goal:");
+  });
+
+  // 人设长度 = 生成时间：这段 JSON 是推荐的全部输出，提示词里写「<= 8000 字符」
+  // 时模型每个角色写三五百字，单轮 12s 起步。锁成一句话才谈得上「10 秒内出结果」。
+  it("asks for a one-sentence persona and never advertises the 8000-char validation cap", () => {
+    const prompt = buildRoleRecommendPrompt({
+      requestId: "r",
+      topic: "AI 与就业",
+      goal: "",
+      maxRoles: 3,
+      recommendationPrompt: "",
+    });
+    expect(prompt).toContain("ONE sentence");
+    expect(prompt).toContain(`<= ${ROLE_RECOMMEND_PROMPT_TARGET_CHARS} characters`);
+    expect(prompt).not.toContain("8000");
+    // 名字也要短：长名字同样是输出 token。
+    expect(prompt).toContain("<= 20 characters");
+  });
+
+  it("folds the style voice into the single sentence instead of pasting it verbatim", () => {
+    const prompt = buildRoleRecommendPrompt({
+      requestId: "r",
+      topic: "AI 与就业",
+      goal: "以正反辩论的方式展开讨论",
+      maxRoles: 2,
+      recommendationPrompt: "",
+      style: "debate",
+    });
+    expect(prompt).toContain("Fold this style's speaking voice into each role_prompt's ONE sentence");
+    expect(prompt).not.toContain("Write this style's speaking voice INTO every role_prompt");
   });
 });
 
