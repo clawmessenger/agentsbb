@@ -1687,6 +1687,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Put("/api/claw/contact-groups/assignment", h.ClawAssignContactGroup)
 	r.Put("/api/claw/contact-groups/{id}", h.ClawUpdateContactGroup)
 	r.Delete("/api/claw/contact-groups/{id}", h.ClawDeleteContactGroup)
+	// 联系人备注（我对某人/某个 agent 的私有标注），账号级偏好，跨设备同步。
+	// 与好友列表的取数通道完全解耦 —— 理由见 internal/handler/claw_contact_remark.go
+	// 顶部第 1 条。userId 走 body 而不是路径段（不透明字符串，避免编码对齐问题）。
+	r.Get("/api/claw/contact-remarks", h.ClawListContactRemarks)
+	r.Put("/api/claw/contact-remarks", h.ClawUpdateContactRemark)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
