@@ -303,13 +303,73 @@ func TestDiscussionSnapshotViewShape(t *testing.T) {
 		Topic: "t", Goal: "g", Mode: "moderated", Status: "planning",
 		Version: 2, RoundPolicy: "legacy_capped", RoleSnapshot: []byte(`{"k":1}`),
 	}, nil)
-	for _, key := range []string{"discussionId", "chatroomId", "createdBy", "topic", "goal", "stateVersion", "roundPolicy", "roles", "status", "mode"} {
+	for _, key := range []string{"discussionId", "chatroomId", "createdBy", "topic", "goal", "stateVersion", "roundPolicy", "roles", "status", "mode", "hostNodeId"} {
 		if _, ok := v[key]; !ok {
 			t.Errorf("snapshot missing key %s", key)
 		}
 	}
 	if !strings.Contains(string(mustJSON(v)), `"stateVersion":2`) {
 		t.Error("stateVersion not serialized")
+	}
+}
+
+// TestDiscussionSnapshotViewHostNodeID hostNodeId 是新增字段：有 host 时逐字
+// 透传，没 host 时回**空串**（不是 null —— 客户端按空串判断「不排除任何设备」，
+// null 会让它多一条解析分支）。
+func TestDiscussionSnapshotViewHostNodeID(t *testing.T) {
+	rec := DiscussionRecord{DiscussionID: "d1", ChatroomID: "c1", Status: "configuring", Version: 1}
+
+	withHost := discussionSnapshotViewWithHost(rec, nil, "node-host-7")
+	if got, ok := withHost["hostNodeId"].(string); !ok || got != "node-host-7" {
+		t.Fatalf("hostNodeId = %#v (want node-host-7)", withHost["hostNodeId"])
+	}
+	if !strings.Contains(string(mustJSON(withHost)), `"hostNodeId":"node-host-7"`) {
+		t.Error("hostNodeId not serialized as camelCase string")
+	}
+
+	noHost := discussionSnapshotViewWithHost(rec, nil, "")
+	if got, ok := noHost["hostNodeId"].(string); !ok || got != "" {
+		t.Fatalf("hostNodeId = %#v (want empty string, never null)", noHost["hostNodeId"])
+	}
+	if strings.Contains(string(mustJSON(noHost)), `"hostNodeId":null`) {
+		t.Error("empty host must serialize to \"\" not null")
+	}
+	// 旧签名（无 host 上下文）同样带这个键，值恒为空串。
+	legacy := discussionSnapshotView(rec, nil)
+	if got, ok := legacy["hostNodeId"].(string); !ok || got != "" {
+		t.Fatalf("legacy view hostNodeId = %#v (want empty string)", legacy["hostNodeId"])
+	}
+}
+
+// TestDiscussionGetActiveCarriesHostNodeID getActive 的快照必须带上该聊天室行的
+// host（C 端续推的 node_ids 靠它排除主持设备）。host_node_id 是 UUID 外键，
+// 对外要换成业务 node_id（`/api/claw/nodes` 用的那套 id）。
+func TestDiscussionGetActiveCarriesHostNodeID(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	actor, err := f.rt.resolveActor(ctx, f.ownerRCID)
+	if err != nil {
+		t.Fatalf("resolveActor: %v", err)
+	}
+
+	start := f.rt.actionStart(ctx, CommandContent{
+		Service: "discussion", Action: "start", WebEnvelope: true,
+		Params: discussionParams("chatroomId", f.roomRCID, "topic", "T", "goal", "G", "maxRounds", 3),
+	}, actor)
+	if start.code != 200 {
+		t.Fatalf("start: %d %s", start.code, start.message)
+	}
+
+	active := f.rt.actionGetActive(ctx, CommandContent{
+		Params: discussionParams("chatroomId", f.roomRCID),
+	}, actor)
+	if active.code != 200 {
+		t.Fatalf("getActive: %d %s", active.code, active.message)
+	}
+	snap, _ := active.data.(map[string]interface{})
+	// fixture 把聊天室的 host_node_id 指向 AI 成员节点，所以期望值就是它的业务 id。
+	if got, _ := snap["hostNodeId"].(string); got != f.memberNode.NodeID {
+		t.Fatalf("hostNodeId = %#v (want %s)", snap["hostNodeId"], f.memberNode.NodeID)
 	}
 }
 

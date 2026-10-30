@@ -55,8 +55,10 @@ func (h *Handler) ClawListChatroomDiscussions(w http.ResponseWriter, r *http.Req
 		return
 	}
 	data := make([]map[string]interface{}, 0, len(list))
+	// 同一聊天室的所有讨论共用一个 host：一次查询、整批复用。
+	hostNodeID := h.clawChatroomHostNodeID(r, chatroomID)
 	for _, d := range list {
-		data = append(data, rongcloud.DiscussionSnapshotView(d, h.clawLatestArtifact(r, repo, d.DiscussionID)))
+		data = append(data, rongcloud.DiscussionSnapshotViewWithHost(d, h.clawLatestArtifact(r, repo, d.DiscussionID), hostNodeID))
 	}
 	clawJSON(w, 200, 200, "", data)
 }
@@ -87,7 +89,11 @@ func (h *Handler) ClawGetDiscussion(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 404, 404, "资源不存在", nil)
 		return
 	}
-	clawJSON(w, 200, 200, "", rongcloud.DiscussionSnapshotView(d, h.clawLatestArtifact(r, repo, discussionID)))
+	clawJSON(w, 200, 200, "", rongcloud.DiscussionSnapshotViewWithHost(
+		d,
+		h.clawLatestArtifact(r, repo, discussionID),
+		h.clawChatroomHostNodeID(r, d.ChatroomID),
+	))
 }
 
 // ClawGetDiscussionEvents GET /api/discussions/{discussionId}/events?afterSeq=
@@ -316,6 +322,18 @@ func writeClawDownload(w http.ResponseWriter, filename, contentType string, body
 // 用户是启用成员（owner 也算）。
 func (h *Handler) clawDiscussionRoomAccess(r *http.Request, chatroomID, userID string) (bool, error) {
 	return h.RongCloudDiscussionAccess.CheckMember(r.Context(), chatroomID, userID)
+}
+
+// clawChatroomHostNodeID 读该聊天室的主持设备**业务 node id**（空串 = 没配 host）。
+//
+// host 是 per-chatroom 属性（同一台设备在 A 讨论组是主持、在 B 讨论组可能只是
+// 参与者），所以只能按房间查一次，不能给 `/api/claw/nodes` 加全局 `isHost`。
+// 未装配访问检查器时降级成空串：快照仍要能读，只是少了这一条排除依据。
+func (h *Handler) clawChatroomHostNodeID(r *http.Request, chatroomID string) string {
+	if h.RongCloudDiscussionAccess == nil {
+		return ""
+	}
+	return h.RongCloudDiscussionAccess.ChatroomHostNodeID(r.Context(), chatroomID)
 }
 
 // clawLatestArtifact 读取讨论的最新产物（无则 nil）。

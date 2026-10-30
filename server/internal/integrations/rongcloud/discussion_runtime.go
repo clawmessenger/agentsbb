@@ -172,6 +172,52 @@ func canControl(d DiscussionRecord, ownerRCID, actorRCID string) bool {
 // ---- 快照 / 事件序列化（对齐 Python snapshot_json / event_json） ------------
 
 func discussionSnapshotView(d DiscussionRecord, artifact *ArtifactRecord) map[string]interface{} {
+	return discussionSnapshotViewWithHost(d, artifact, "")
+}
+
+// snapshotView 是运行时内部统一的快照出口：先读该讨论所属聊天室的主持设备，
+// 再序列化（`hostNodeId` 因此不会在任何一个 action 的响应里缺失）。
+//
+// 为什么要在这里统一补：C 端把快照整块合并（uniapp `mergeDiscussionSnapshot`
+// 是 `{...snapshot}` 替换），只要有一个响应漏了这个键，客户端手上的 hostNodeId
+// 就会被抹掉，续推的 node_ids 又开始白占主持那一个名额位。
+func (rt *discussionRuntime) snapshotView(ctx context.Context, d DiscussionRecord, artifact *ArtifactRecord) map[string]interface{} {
+	return discussionSnapshotViewWithHost(d, artifact, rt.chatroomHostNodeID(ctx, d.ChatroomID))
+}
+
+// chatroomHostNodeID 读聊天室的主持设备业务 node id（空 = 没配 host / 查不到）。
+//
+// host 是 **per-chatroom** 属性：同一台设备在 A 讨论组是主持、在 B 讨论组可能只是
+// 参与者，所以只能从 `rongcloud_chatroom.host_node_id` 现查，不能给节点接口加一个
+// 全局 isHost（那会语义错位）。失败一律降级成空串 —— 这只是「少排除一台设备」，
+// 不该让快照读取失败。
+func (rt *discussionRuntime) chatroomHostNodeID(ctx context.Context, chatroomID string) string {
+	if rt == nil || rt.queries == nil || chatroomID == "" {
+		return ""
+	}
+	room, err := rt.queries.GetRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
+	if err != nil {
+		// 降级成空串本身无害（只是「少排除一台主持设备」），但持续失败必须有痕迹：
+		// 否则线上表现只是「续推总少一个候选」，没有任何可观测信号。
+		if rt.logger != nil {
+			rt.logger.Warn("discussion: read chatroom host node id failed",
+				"chatroomId", chatroomID, "error", err)
+		}
+		return ""
+	}
+	if !room.HostBusinessNodeID.Valid {
+		return ""
+	}
+	return room.HostBusinessNodeID.String
+}
+
+// discussionSnapshotViewWithHost 序列化快照（camelCase，对齐 Python snapshot_json）。
+//
+// hostNodeID 是该讨论所属聊天室的主持设备**业务 node id**（`rongcloud_chatroom.host_node_id`
+// 关联出来的 `rongcloud_node.node_id`）。它是新增字段，键名固定 `hostNodeId`，
+// 没有 host 时回**空串**而不是 null —— C 端据此排除主持设备，空串 = 不排除，
+// 老客户端/老数据的行为完全不变。
+func discussionSnapshotViewWithHost(d DiscussionRecord, artifact *ArtifactRecord, hostNodeID string) map[string]interface{} {
 	view := map[string]interface{}{
 		"discussionId":  d.DiscussionID,
 		"chatroomId":    d.ChatroomID,
@@ -186,6 +232,7 @@ func discussionSnapshotView(d DiscussionRecord, artifact *ArtifactRecord) map[st
 		"currentRound":  d.CurrentRound,
 		"stateVersion":  d.Version,
 		"roles":         jsonObjectValue(d.RoleSnapshot),
+		"hostNodeId":    hostNodeID,
 		"createdAt":     isoTime(d.CreatedAt),
 		"updatedAt":     isoTime(d.UpdatedAt),
 		"artifact":      nil,
@@ -480,7 +527,7 @@ func (rt *discussionRuntime) actionStart(ctx context.Context, cmd CommandContent
 	if evErr != nil {
 		return errResult(500, "写入讨论事件失败")
 	}
-	return okResult(discussionSnapshotView(created, nil))
+	return okResult(rt.snapshotView(ctx, created, nil))
 }
 
 // getActive 对齐 Python：成员可见；带最新产物；无活跃时 data=null。
@@ -503,7 +550,7 @@ func (rt *discussionRuntime) actionGetActive(ctx context.Context, cmd CommandCon
 		if err != nil || d.ChatroomID != rcID {
 			return errResult(404, "讨论不存在")
 		}
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, discussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, discussionID)))
 	}
 	d, err := rt.repo.GetActiveByChatroom(ctx, rcID)
 	if errors.Is(err, ErrDiscussionNotFound) {
@@ -512,7 +559,7 @@ func (rt *discussionRuntime) actionGetActive(ctx context.Context, cmd CommandCon
 	if err != nil {
 		return errResult(500, "查询活跃讨论失败")
 	}
-	return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 }
 
 // stop 对齐 Python stop：无版本参数；roundtable → cancel，moderated → owner 强停。
@@ -537,7 +584,7 @@ func (rt *discussionRuntime) actionStop(ctx context.Context, cmd CommandContent,
 		return errResult(403, "only the chatroom owner may stop a discussion")
 	}
 	if !IsLiveDiscussionStatus(d.Status) {
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 	}
 	changed, advErr := rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
 		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
@@ -552,7 +599,7 @@ func (rt *discussionRuntime) actionStop(ctx context.Context, cmd CommandContent,
 		IdempotencyKey: fmt.Sprintf("stop:%s:%d", d.DiscussionID, d.Version+1),
 	}})
 	rt.notifyCancelSafe(ctx, changed)
-	return okResult(discussionSnapshotView(changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
 }
 
 // cancel 对齐 Python cancel：owner-only + 版本校验 + cancelled 事件。
@@ -580,7 +627,7 @@ func (rt *discussionRuntime) actionCancel(ctx context.Context, cmd CommandConten
 		return errResult(403, "only the discussion owner may cancel")
 	}
 	if !IsLiveDiscussionStatus(d.Status) {
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 	}
 	if d.Version != version {
 		return rt.versionConflictResult(ctx, d.DiscussionID)
@@ -598,7 +645,7 @@ func (rt *discussionRuntime) actionCancel(ctx context.Context, cmd CommandConten
 		IdempotencyKey: fmt.Sprintf("cancel:%s:%d", d.DiscussionID, d.Version+1),
 	}})
 	rt.notifyCancelSafe(ctx, changed)
-	return okResult(discussionSnapshotView(changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
 }
 
 // interject 对齐 Python interject：owner 或启用的人类成员；幂等 by messageUid。
@@ -642,7 +689,7 @@ func (rt *discussionRuntime) actionInterject(ctx context.Context, cmd CommandCon
 	existing, _ := rt.repo.ListEventsAfter(ctx, discussionID, 0)
 	for _, e := range existing {
 		if e.IdempotencyKey == idemKey {
-			return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, discussionID)))
+			return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, discussionID)))
 		}
 	}
 	_, appErr := rt.appendEventsSequential(ctx, d, []AppendDiscussionEventParams{{
@@ -656,7 +703,7 @@ func (rt *discussionRuntime) actionInterject(ctx context.Context, cmd CommandCon
 	if appErr != nil {
 		return errResult(500, "写入插话事件失败")
 	}
-	return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, discussionID)))
+	return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, discussionID)))
 }
 
 // retry 对齐 Python retry：owner-only；重投递最近一次未完成的 host_turn /
@@ -716,7 +763,7 @@ func (rt *discussionRuntime) actionRetry(ctx context.Context, cmd CommandContent
 			rt.logger.Warn("discussion retry redeliver failed", "error", sendErr, "discussionId", discussionID)
 		}
 	}
-	return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 }
 
 // continue 对齐 Python continue_round（legacy_capped 分支）：roundtable 模式且
@@ -783,7 +830,7 @@ func (rt *discussionRuntime) actionContinue(ctx context.Context, cmd CommandCont
 		return rt.advanceErrorResult(ctx, advErr, d.DiscussionID)
 	}
 	_, _ = rt.appendEventsSequential(ctx, changed, events)
-	return okResult(discussionSnapshotView(changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
 }
 
 // finish 对齐 Python finish（legacy_capped 分支）：roundtable 且 awaiting_user 时
@@ -829,7 +876,7 @@ func (rt *discussionRuntime) actionFinish(ctx context.Context, cmd CommandConten
 		Payload:        mustJSON(map[string]interface{}{"round": d.CurrentRound}),
 		IdempotencyKey: fmt.Sprintf("final-synthesis:%s:%d", discussionID, d.Version+1),
 	}})
-	return okResult(discussionSnapshotView(changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, changed, rt.latestArtifactPtr(ctx, changed.DiscussionID)))
 }
 
 // ---- system host / workflow capabilities ---------------------------------
@@ -923,7 +970,7 @@ func (rt *discussionRuntime) versionConflictResult(ctx context.Context, discussi
 	}
 	return commandResult{
 		code: 409, message: "discussion version mismatch",
-		data: map[string]interface{}{"latestSnapshot": discussionSnapshotView(d, nil)},
+		data: map[string]interface{}{"latestSnapshot": rt.snapshotView(ctx, d, nil)},
 	}
 }
 
@@ -1023,8 +1070,17 @@ func newDiscussionID() string {
 // ---- 导出的序列化入口（HTTP 层扁平 REST 用） -------------------------------
 
 // DiscussionSnapshotView 序列化讨论快照（camelCase，对齐 Python snapshot_json）。
+//
+// `hostNodeId` 需要 per-chatroom 的 host 才能填；HTTP 层请用
+// DiscussionSnapshotViewWithHost，本函数回空串（保留旧签名，避免调用点全改）。
 func DiscussionSnapshotView(d DiscussionRecord, artifact *ArtifactRecord) map[string]interface{} {
 	return discussionSnapshotView(d, artifact)
+}
+
+// DiscussionSnapshotViewWithHost 同上，但带上该讨论所属聊天室的主持设备业务 node id
+// （HTTP 层扁平 REST 用；空串 = 没配 host）。
+func DiscussionSnapshotViewWithHost(d DiscussionRecord, artifact *ArtifactRecord, hostNodeID string) map[string]interface{} {
+	return discussionSnapshotViewWithHost(d, artifact, hostNodeID)
 }
 
 // DiscussionEventView 序列化事件（含 v3 信封展开）。
@@ -1066,6 +1122,26 @@ type DiscussionRoomAccess struct {
 
 func NewDiscussionRoomAccess(queries *db.Queries) *DiscussionRoomAccess {
 	return &DiscussionRoomAccess{queries: queries}
+}
+
+// ChatroomHostNodeID 返回该聊天室的主持设备**业务 node id**（`host_node_id` 关联
+// 出来的 `rongcloud_node.node_id`）。没配 host / 房间不存在 / 未装配数据库 → 空串。
+//
+// C 端拿它排除主持设备（续推的 node_ids 不该白占主持那一个名额位）。刻意做成
+// per-chatroom 的查询，而不是给 `/api/claw/nodes` 加全局 `isHost`：同一台设备在 A
+// 讨论组是主持、在 B 讨论组可能只是参与者，全局标记会语义错位。
+func (a *DiscussionRoomAccess) ChatroomHostNodeID(ctx context.Context, chatroomID string) string {
+	if a == nil || a.queries == nil || chatroomID == "" {
+		return ""
+	}
+	room, err := a.queries.GetRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
+	if err != nil {
+		return ""
+	}
+	if !room.HostBusinessNodeID.Valid {
+		return ""
+	}
+	return room.HostBusinessNodeID.String
 }
 
 // CheckMember 返回用户是否可访问该聊天室的讨论资源。

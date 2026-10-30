@@ -2248,7 +2248,7 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 		if !sameJSONObject(priorPayload, identity) {
 			return errResult(400, "conflicting control request identity")
 		}
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 	}
 	if version, ok := paramInt(cmd, "stateVersion", "state_version", "version"); !ok || version != d.Version {
 		return rt.versionConflictResult(ctx, d.DiscussionID)
@@ -2291,7 +2291,7 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 			return errResult(500, "写入讨论事件失败")
 		}
 		rt.interactiveBroadcast(ctx, advanced, done)
-		return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 	}
 
 	roundStarted, _, err := rt.interactiveEmit(ctx, advanced, interactiveEvent{
@@ -2339,7 +2339,7 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 	}
 	// 回包用 dispatched：角色板刚同步过，前端要立刻看到新成员在板上（版本号没变，
 	// 所以这里不存在乐观锁语义上的冲突）。
-	return okResult(discussionSnapshotView(dispatched, rt.latestArtifactPtr(ctx, dispatched.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, dispatched, rt.latestArtifactPtr(ctx, dispatched.DiscussionID)))
 }
 
 // interactiveInterject 记录一次用户插话（v3）：不重置轮次指针、不打断在跑的发言，
@@ -2363,7 +2363,7 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		if existing, _ := payload["content"].(string); existing != content {
 			return errResult(400, "conflicting message uid")
 		}
-		view := discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID))
+		view := rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID))
 		if round, ok := payload["consumedFromRound"].(float64); ok {
 			view["appliedRound"] = int(round)
 		}
@@ -2416,7 +2416,7 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		return errResult(500, "写入插话事件失败")
 	}
 	rt.interactiveBroadcast(ctx, d, event)
-	view := discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID))
+	view := rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID))
 	view["appliedRound"] = consumedRound
 	return okResult(view)
 }
@@ -2428,7 +2428,7 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 // 迟到的 cancel 会把已完成的讨论倒写成 cancelled。
 func (rt *discussionRuntime) interactiveCancel(ctx context.Context, d DiscussionRecord, actorRCID, reason string) commandResult {
 	if !IsLiveDiscussionStatus(d.Status) {
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 	}
 	advanced, err := rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
 		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
@@ -2453,7 +2453,7 @@ func (rt *discussionRuntime) interactiveCancel(ctx context.Context, d Discussion
 	if emitErr == nil {
 		rt.interactiveBroadcast(ctx, advanced, event)
 	}
-	return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 }
 
 // interactiveRetryAcceptsStatus 报告 interactiveRetry 是否接受该讨论状态。
@@ -2520,7 +2520,7 @@ func (rt *discussionRuntime) interactiveRetry(ctx context.Context, d DiscussionR
 	if err := rt.interactiveDispatch(ctx, advanced, host, 1); err != nil {
 		return errResult(500, "重试主持人汇总失败")
 	}
-	return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 }
 
 // interactiveSettleActive 把该讨论仍在途的派发命令置为终结态（取消时用）。
@@ -2585,7 +2585,7 @@ func (rt *discussionRuntime) interactiveLifecycleAction(ctx context.Context, act
 		if err != nil {
 			return okResult(nil), true
 		}
-		return okResult(discussionSnapshotView(d2, nil)), true
+		return okResult(rt.snapshotView(ctx, d2, nil)), true
 	}
 	switch action {
 	case "continue":
