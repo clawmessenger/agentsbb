@@ -51,6 +51,12 @@ const recommendRoleCountCap = 5
 // clawAdminDiscussionHostTimeoutInit = 120）：一次完整的设备端 LLM 回合十几秒到
 // 100s+，兜底值比产品要求的一次推荐耗时还短，等于必然报超时。只影响
 // timeout_seconds 为 0/缺失的配置（正常路径用配置值）。
+// recommendRoleWaitCapSeconds 是单次角色推荐的**服务端**等待上限（秒）。
+//
+// 线上现场：主持超时配成 120s，配置向导「已等待 104s 还没出现下一批」。推荐
+// 和讨论轮次不是一类请求 —— 它只要一份几行的 JSON，不该共享「长回合」的额度。
+const recommendRoleWaitCapSeconds = 20
+
 const recommendRolesFallbackTimeoutSeconds = 120
 
 // setupPromptPayload 是 setup_prompt 事件的 data 形状（v3 契约，见 web
@@ -587,11 +593,15 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 		fail("SYSTEM_HOST_OFFLINE")
 		return
 	}
+	// 主持设备的超时配置是给**讨论轮次**用的（长思考回合可以跑几分钟）。拿它当
+	// 推荐上限就等于让配置向导干等：线上配成 120s 时用户实测「已等待 104s 还没
+	// 出现」，而设备端那一个回合早就结束了。推荐提示词已收成「一句话人设」，
+	// 正常 3-6s，recommendRoleWaitCapSeconds 足够覆盖冷启动；超过就按超时失败，
+	// 让用户立刻看到重试入口。设备端拿到的是**压过之后**的值，两端上限一致，
+	// 不会出现「服务端已放弃、设备还在跑」的空转。
 	timeout := host.timeoutSeconds
-	if timeout <= 0 {
-		// 配置缺失/为 0 时的兜底，与 handler 侧 clawAdminDiscussionHostTimeoutInit
-		// （120s）同口径：一份「没配超时」的主持配置不该比默认值更急。
-		timeout = recommendRolesFallbackTimeoutSeconds
+	if timeout <= 0 || timeout > recommendRoleWaitCapSeconds {
+		timeout = recommendRoleWaitCapSeconds
 	}
 	bctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+5)*time.Second)
 	defer cancel()
