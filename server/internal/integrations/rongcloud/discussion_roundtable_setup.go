@@ -55,7 +55,16 @@ const recommendRoleCountCap = 5
 //
 // 线上现场：主持超时配成 120s，配置向导「已等待 104s 还没出现下一批」。推荐
 // 和讨论轮次不是一类请求 —— 它只要一份几行的 JSON，不该共享「长回合」的额度。
-const recommendRoleWaitCapSeconds = 20
+//
+// 但额度也不能压得太狠。2026-10-30 线上实测（设备端 1.3.15、人设已收成一句话、
+// 每次只要 3 个角色）同一台机器的单轮耗时：5.8s / 15.2s / 16.6s / 25.9s /
+// 37.0s / 48.2s。波动来自上游模型网关（同一模型两次能差 6 倍），不是输出量 ——
+// 提示词收短并没有把这一段压下来。先前的 20s 会把这些**本来能成功**的回合全部
+// 判死：设备端 48.2s 给出了 3 个角色，服务端 20s 时已经放弃并报了超时。
+//
+// 取 60s：覆盖实测最慢的 48s 并留余量。真正的死局不会拖到这里 —— 设备没收到
+// 命令时设备端会在自己的 stale 判定里退出；模型返回空时实测 1s 内就回错。
+const recommendRoleWaitCapSeconds = 60
 
 const recommendRolesFallbackTimeoutSeconds = 120
 
@@ -466,6 +475,10 @@ func setupRecommendFailureMessage(code string) string {
 		return "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试"
 	case "ROLE_RECOMMENDATION_INVALID":
 		return "主持设备返回的推荐结果无法解析，请重试"
+	case "ROLE_RECOMMENDATION_EMPTY":
+		// 与上一条分开：空产出不是「格式不对」，是这个模型当前根本不出字。
+		// 让用户去点重试只会重复同一个结果，动作应该是换主持模型。
+		return "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试"
 	case "SYSTEM_HOST_OFFLINE", "SYSTEM_HOST_NOT_CONFIGURED", "SYSTEM_HOST_DISABLED":
 		return "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行"
 	case "NO_ELIGIBLE_USER_DEVICES":
@@ -596,8 +609,8 @@ func (rt *discussionRuntime) recommendForSetupBatch(ctx context.Context, discuss
 	// 主持设备的超时配置是给**讨论轮次**用的（长思考回合可以跑几分钟）。拿它当
 	// 推荐上限就等于让配置向导干等：线上配成 120s 时用户实测「已等待 104s 还没
 	// 出现」，而设备端那一个回合早就结束了。推荐提示词已收成「一句话人设」，
-	// 正常 3-6s，recommendRoleWaitCapSeconds 足够覆盖冷启动；超过就按超时失败，
-	// 让用户立刻看到重试入口。设备端拿到的是**压过之后**的值，两端上限一致，
+	// 但实测耗时由上游网关决定（5.8s～48.2s），recommendRoleWaitCapSeconds 按这个
+	// 分布取值；超过才按超时失败。设备端拿到的是**压过之后**的值，两端上限一致，
 	// 不会出现「服务端已放弃、设备还在跑」的空转。
 	timeout := host.timeoutSeconds
 	if timeout <= 0 || timeout > recommendRoleWaitCapSeconds {

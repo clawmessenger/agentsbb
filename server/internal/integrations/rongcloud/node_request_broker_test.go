@@ -179,7 +179,7 @@ func TestNodeRequestBrokerOmitsAssignmentForAdminPreview(t *testing.T) {
 
 func TestMapNodeError(t *testing.T) {
 	for _, value := range []interface{}{"timeout", "TIMEOUT", " model_timeout ", "role_recommendation_timeout"} {
-		if got := mapNodeError(value); got != NodeRequestCodeRecommendTimeout {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendTimeout {
 			t.Errorf("mapNodeError(%v) = %q, want timeout", value, got)
 		}
 	}
@@ -191,12 +191,36 @@ func TestMapNodeError(t *testing.T) {
 		"Agent turn timeout after 600000ms",
 		"request timed out",
 	} {
-		if got := mapNodeError(value); got != NodeRequestCodeRecommendTimeout {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendTimeout {
 			t.Errorf("mapNodeError(%q) = %q, want timeout", value, got)
 		}
 	}
+	// 设备端自证 reason=empty-output：模型这一轮什么都没产出。它不该和「格式
+	// 不对」共用 INVALID —— 处置动作是换主持模型，不是点重试。
+	for _, detail := range []interface{}{
+		map[string]interface{}{"reason": "empty-output", "sample": ""},
+		map[string]interface{}{"reason": " empty-output "},
+	} {
+		got := mapNodeError("role recommendation invalid", detail)
+		if got != NodeRequestCodeRecommendEmpty {
+			t.Errorf("mapNodeError(empty-output, %v) = %q, want empty", detail, got)
+		}
+	}
+	// 其它 reason（no-json / speaking-order-not-permutation …）仍然是 INVALID：
+	// 那些重试一次很可能就好了。
+	for _, detail := range []interface{}{
+		map[string]interface{}{"reason": "no-json", "sample": "我无法完成"},
+		map[string]interface{}{"reason": "speaking-order-not-permutation"},
+		map[string]interface{}{"reason": 42},
+		"not-an-object",
+		nil,
+	} {
+		if got := mapNodeError("role recommendation invalid", detail); got != NodeRequestCodeRecommendInvalid {
+			t.Errorf("mapNodeError(%v) = %q, want invalid", detail, got)
+		}
+	}
 	for _, value := range []interface{}{nil, "boom", 42, "agent turn failed"} {
-		if got := mapNodeError(value); got != NodeRequestCodeRecommendInvalid {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendInvalid {
 			t.Errorf("mapNodeError(%v) = %q, want invalid", value, got)
 		}
 	}
@@ -209,6 +233,7 @@ func TestSetupRecommendFailureMessage(t *testing.T) {
 	cases := map[string]string{
 		"ROLE_RECOMMENDATION_TIMEOUT": "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试",
 		"ROLE_RECOMMENDATION_INVALID": "主持设备返回的推荐结果无法解析，请重试",
+		"ROLE_RECOMMENDATION_EMPTY":   "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试",
 		"SYSTEM_HOST_OFFLINE":         "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行",
 		"NO_ELIGIBLE_USER_DEVICES":    "没有可用于讨论的在线设备",
 		"WHATEVER_ELSE":               "角色推荐失败，请重试",

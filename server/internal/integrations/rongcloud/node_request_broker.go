@@ -72,6 +72,10 @@ const (
 	NodeRequestCodeHostOffline       = "SYSTEM_HOST_OFFLINE"
 	NodeRequestCodeRecommendTimeout  = "ROLE_RECOMMENDATION_TIMEOUT"
 	NodeRequestCodeRecommendInvalid  = "ROLE_RECOMMENDATION_INVALID"
+	// NodeRequestCodeRecommendEmpty 是「设备在跑，但这轮什么都没产出」：
+	// 模型返回空（detail.reason=empty-output），实测 1s 内就回。与 INVALID
+	// 分开是因为处置动作不同 —— 用户要换主持模型，而不是点重试。
+	NodeRequestCodeRecommendEmpty = "ROLE_RECOMMENDATION_EMPTY"
 	// 模型目录往返的失败码（管理端「供应商 → 模型」选择器用）。
 	NodeRequestCodeCatalogTimeout = "MODEL_CATALOG_TIMEOUT"
 	NodeRequestCodeCatalogInvalid = "MODEL_CATALOG_INVALID"
@@ -745,7 +749,7 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 		"error", result.Payload["error"],
 		"detail", nodeErrorDetail(result.Payload["detail"]))
 
-	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"]), nil)
+	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"], result.Payload["detail"]), nil)
 	return true
 }
 
@@ -954,7 +958,7 @@ func roleOrder(value interface{}) (int, bool) {
 // 它们过去全部落到 INVALID，前端于是把「主持设备 300 秒没产出」显示成
 // 「角色推荐失败，请重试」—— 与真正的原因（设备端智能体卡住 / 模型不可用）
 // 差着一整个排查方向，用户只能反复点重试。
-func mapNodeError(value interface{}) string {
+func mapNodeError(value interface{}, detail interface{}) string {
 	text, _ := value.(string)
 	lower := strings.ToLower(strings.TrimSpace(text))
 	switch lower {
@@ -964,7 +968,27 @@ func mapNodeError(value interface{}) string {
 	if strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") {
 		return NodeRequestCodeRecommendTimeout
 	}
+	// 设备端自证说这一轮**什么都没产出**（reason=empty-output，raw 为空串）。
+	//
+	// 它必须和「答案不合协议」分开：后者重试一下很可能就好了，而空产出意味着
+	// 这个模型当前根本不能用 —— 用户要做的是换主持模型，不是反复点重试。
+	// 2026-10-30 现场：主持模型被换成 opencode/beam-free 后，每次都在 0.9s 内
+	// 空手而归，界面却只说「内容无法解析」，排查方向整个跑偏。
+	if nodeErrorReason(detail) == "empty-output" {
+		return NodeRequestCodeRecommendEmpty
+	}
 	return NodeRequestCodeRecommendInvalid
+}
+
+// nodeErrorReason 取设备端自证里的 reason 短标识（payload.detail.reason）。
+// 设备端 1.3.14 起才有这个字段，旧设备或结构不符时返回空串。
+func nodeErrorReason(value interface{}) string {
+	object, ok := value.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	text, _ := object["reason"].(string)
+	return strings.TrimSpace(text)
 }
 
 // nodeErrorDetail 把设备端随错误应答带回的自证信息（payload.detail）压成一行
