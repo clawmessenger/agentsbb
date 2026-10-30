@@ -75,6 +75,11 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	// conversation_type)，没有 workspace_id，全站共用一份副本。删掉某个工作区
 	// 只会让其它工作区的会话号缓存失效，所以归 installation 级。
 	"im_conversations":                   workspaceDeleteKeep,
+	// 联系人备注（608）：主键是 (owner_user_id, target_user_id)，owner 是
+	// claw_im_users.user_id，全表没有 workspace_id —— 与 im_conversations 同理，
+	// 属 installation 级用户偏好。workspace 拆除不得触碰：删一个工作区不该清掉
+	// 用户对整本通讯录的私有标注（该表也刻意零外键，见 608 up 的说明）。
+	"im_contact_remark":                  workspaceDeleteKeep,
 	"client_usage_daily":                 workspaceDeleteDetach,
 	"comment":                            workspaceDelete,
 	"comment_reaction":                   workspaceDelete,
