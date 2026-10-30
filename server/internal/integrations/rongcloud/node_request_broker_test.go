@@ -3,6 +3,7 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -365,6 +366,94 @@ func TestNodeRequestBrokerErrorAnswer(t *testing.T) {
 	broker.AcceptResponse("rc_node_host", `{"request_id":"`+requestID+`","msg_type":"command_result","payload":{"kind":"error","error":"timeout"}}`)
 	if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendTimeout {
 		t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendTimeout)
+	}
+}
+
+// 设备端自证（payload.detail）只进日志：错误码分类一个字都不能跟着变。
+func TestNodeRequestBrokerLogsNodeErrorDetail(t *testing.T) {
+	newBroker := func() (*NodeRequestBroker, *strings.Builder) {
+		var buf strings.Builder
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		broker := NewNodeRequestBroker(logger)
+		broker.BindSender(func(_ context.Context, _ string, _ string) error { return nil })
+		return broker, &buf
+	}
+	start := func(t *testing.T, broker *NodeRequestBroker) string {
+		t.Helper()
+		requestID, code := broker.StartRecommendation(
+			context.Background(),
+			NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30},
+			"AI 与就业", "", 3, "",
+		)
+		if code != "" {
+			t.Fatalf("start failed: %s", code)
+		}
+		return requestID
+	}
+
+	t.Run("records the reason and sample from a new device", func(t *testing.T) {
+		broker, logs := newBroker()
+		requestID := start(t, broker)
+		answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"kind":"error",` +
+			`"error":"role recommendation invalid",` +
+			`"detail":{"reason":"speaking-order-not-permutation","sample":"{\"roles\":[{\"speaking_order\":0}]}"}}}`
+		if !broker.AcceptResponse("rc_node_host", answer) {
+			t.Fatal("AcceptResponse must claim the answer")
+		}
+		if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendInvalid {
+			t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendInvalid)
+		}
+		logged := logs.String()
+		if !strings.Contains(logged, "node reported an error") {
+			t.Fatalf("error branch not logged: %s", logged)
+		}
+		if !strings.Contains(logged, "speaking-order-not-permutation") {
+			t.Fatalf("detail missing from the log line: %s", logged)
+		}
+		if !strings.Contains(logged, "roles") {
+			t.Fatalf("sample missing from the log line: %s", logged)
+		}
+	})
+
+	t.Run("keeps the timeout classification when detail is present", func(t *testing.T) {
+		broker, logs := newBroker()
+		requestID := start(t, broker)
+		answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"kind":"error",` +
+			`"error":"agent turn timeout after 300000ms","detail":{"reason":"no-json","sample":"..."}}}`
+		broker.AcceptResponse("rc_node_host", answer)
+		if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendTimeout {
+			t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendTimeout)
+		}
+		if !strings.Contains(logs.String(), "no-json") {
+			t.Fatalf("detail missing from the log line: %s", logs.String())
+		}
+	})
+
+	t.Run("an old device without detail still logs the plain error", func(t *testing.T) {
+		broker, logs := newBroker()
+		requestID := start(t, broker)
+		broker.AcceptResponse("rc_node_host", `{"request_id":"`+requestID+`","msg_type":"command_result",`+
+			`"payload":{"kind":"error","error":"role recommendation invalid"}}`)
+		if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendInvalid {
+			t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendInvalid)
+		}
+		if !strings.Contains(logs.String(), "role recommendation invalid") {
+			t.Fatalf("error text missing from the log line: %s", logs.String())
+		}
+	})
+}
+
+func TestNodeErrorDetail(t *testing.T) {
+	if got := nodeErrorDetail(nil); got != "" {
+		t.Fatalf("a missing detail must be empty, got %q", got)
+	}
+	got := nodeErrorDetail(map[string]interface{}{"reason": "no-json", "sample": "x"})
+	if !strings.Contains(got, `"reason":"no-json"`) || !strings.Contains(got, `"sample":"x"`) {
+		t.Fatalf("detail not serialised: %s", got)
+	}
+	long := nodeErrorDetail(map[string]interface{}{"sample": strings.Repeat("角", nodeErrorDetailMaxChars+50)})
+	if runes := []rune(long); len(runes) > nodeErrorDetailMaxChars+1 {
+		t.Fatalf("detail not truncated: %d runes", len(runes))
 	}
 }
 

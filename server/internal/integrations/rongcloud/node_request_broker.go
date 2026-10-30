@@ -105,6 +105,11 @@ const (
 	// return. Shared with the admin handler so the request and the validation
 	// agree on the ceiling.
 	RecommendRolesMaxRoles = 8
+
+	// nodeErrorDetailMaxChars 是设备端自证信息进日志的长度上限（按 rune 算）。
+	// 设备端的 sample 已经是 400 字符内的单行片段，这里再兜一层：detail 是任意
+	// JSON，不该由它决定日志行有多长。
+	nodeErrorDetailMaxChars = 500
 )
 
 type pendingNodeRequest struct {
@@ -729,10 +734,16 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 
 	// 设备回的原文必须留痕：对外只暴露两个码（TIMEOUT / INVALID），没有这条
 	// 日志时「设备卡住」「模型报错」「应答格式坏」在服务端看起来完全一样。
+	//
+	// detail 是设备端新版回执里的自证字段（payload.detail = {reason, sample}）：
+	// reason 是稳定短标识（no-json / speaking-order-not-permutation …），sample
+	// 是模型原文的单行片段。它只进日志，**不参与任何判定** —— 两个对外错误码的
+	// 语义不变，旧设备不带 detail 时这一行与过去完全一致。
 	b.logger.Warn("role recommendation: node reported an error",
 		"request_id", result.RequestID,
 		"node", senderID,
-		"error", result.Payload["error"])
+		"error", result.Payload["error"],
+		"detail", nodeErrorDetail(result.Payload["detail"]))
 
 	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"]), nil)
 	return true
@@ -954,4 +965,28 @@ func mapNodeError(value interface{}) string {
 		return NodeRequestCodeRecommendTimeout
 	}
 	return NodeRequestCodeRecommendInvalid
+}
+
+// nodeErrorDetail 把设备端随错误应答带回的自证信息（payload.detail）压成一行
+// 日志字段。
+//
+// 不做结构断言：新版是 {reason, sample}，旧版根本没有这个键，将来也可能加字段。
+// 能 JSON 序列化就原样记，序列化不了退回 fmt.Sprint；按 rune 截断到
+// nodeErrorDetailMaxChars，免得一段模型原文把日志行撑爆。它**只**用于日志。
+func nodeErrorDetail(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	text := ""
+	if encoded, err := json.Marshal(value); err == nil {
+		text = string(encoded)
+	} else {
+		text = fmt.Sprint(value)
+	}
+	trimmed := strings.TrimSpace(text)
+	runes := []rune(trimmed)
+	if len(runes) > nodeErrorDetailMaxChars {
+		return string(runes[:nodeErrorDetailMaxChars]) + "…"
+	}
+	return trimmed
 }
