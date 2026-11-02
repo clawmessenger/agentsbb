@@ -512,6 +512,12 @@ func (h *systemHandler) completeFriendRequest(ctx context.Context, request Frien
 				pendingFromRequester = true
 			}
 		case friendAddExisting:
+			// 这一档有两义：「本来就是好友」与「对方免验证，这次直接成了好友」
+			// （processCode/顶层 25460，见 user_api.go 的 friendCodeAlreadyFriends）。
+			// 两者分不开，所以一律**不记进 createdOwnerEdges** —— 回滚时不会删它。
+			// 与加三态之前的实现一致（旧代码把 25460 一律当 alreadyFriends），
+			// 是**刻意保留**、不是新缺陷：误删两个真人的好友关系，比漏删一条本次新建
+			// 的边贵得多（后者只是残留，可在下次审批/删好友时清掉）。
 			existingEdges++
 		default:
 			createdEdges++
