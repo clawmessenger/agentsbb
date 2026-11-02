@@ -76,7 +76,51 @@ func (c *rongcloudAPIClient) expireToken(ctx context.Context, userID string, tim
 const (
 	friendOptTypeRequest = "1"
 	friendOptTypeDirect  = "2"
+
+	// friendCodeAlreadyFriends 是融云的「双方已经是好友」码。它在 /friend/add.json
+	// 里可能出现在两处：顶层 code（本次调用被判成业务错误），或 200 响应体里的
+	// processCode（对方把「添加好友权限」设成了任何人可直接添加，这次直接成了好友、
+	// 没有产生申请）。两处都表示**边存在**。
+	friendCodeAlreadyFriends = 25460
+	// friendCodePendingApproval 是 /friend/add.json 的 processCode「待对方同意」：
+	// 申请确实建立了，但**好友边没有建立**。权威语义见 web 端
+	// clawmessenger-web/src/services/contacts.ts:376-388（FRIEND_CODE_PENDING）。
+	friendCodePendingApproval = 25461
 )
+
+// friendAddOutcome 是 /friend/add.json 的**三态**结果。
+//
+// 为什么不能只看 HTTP 层 code：postForm 把 `code == 200` 当成功返回 nil error，可
+// 融云在 200 的同时会用响应体里的 processCode 表达「这次到底建没建边」。旧实现
+// 只区分「没报错 / 25460」，于是 processCode=25461（只产生待同意申请）被当成
+// 「边建好了」—— 审批回 success、拥有者界面显示已同意，请求方的联系人里却没有
+// 拥有者。addFriendWithOptType 保持两返回值语义不变（老调用方不动），需要区分
+// 三态的调用方走 addFriendDetailed。
+type friendAddOutcome int
+
+const (
+	// friendAddUnknown 是零值，只在**报错时**返回；调用方必须先看 error。
+	friendAddUnknown friendAddOutcome = iota
+	// friendAddLinked 边确实建立了。
+	friendAddLinked
+	// friendAddExisting 双方本来就是好友，本次调用没有新建边（回滚时不能撤它）。
+	friendAddExisting
+	// friendAddPending 只产生了一条待对方同意的申请，**边没有建立**。
+	friendAddPending
+)
+
+func (o friendAddOutcome) String() string {
+	switch o {
+	case friendAddLinked:
+		return "linked"
+	case friendAddExisting:
+		return "existing"
+	case friendAddPending:
+		return "pending"
+	default:
+		return "unknown"
+	}
+}
 
 // addFriend creates a one-way RongCloud friend relation from userID to
 // friendID with optType=2 (direct add, no approval step). The legacy Python
@@ -97,9 +141,29 @@ func (c *rongcloudAPIClient) addFriend(ctx context.Context, userID, friendID, re
 // An alreadyFriends result only makes sense for optType=2: with optType=1 the
 // edge is not created by this call, so 25460 can only mean the two are already
 // friends from before.
+//
+// 这是 addFriendDetailed 的薄封装，两返回值语义与加三态之前逐字一致：只回答
+// 「这对关系本来就在吗」。「只产生了待同意申请」（processCode=25461）在这里和
+// 以前一样看不出来 —— 需要区分它的调用方（friend_request.go 的审批收尾）直接
+// 用 addFriendDetailed。
 func (c *rongcloudAPIClient) addFriendWithOptType(ctx context.Context, userID, friendID, remark, optType string) (alreadyFriends bool, err error) {
+	outcome, err := c.addFriendDetailed(ctx, userID, friendID, remark, optType)
+	if err != nil {
+		return false, err
+	}
+	return outcome == friendAddExisting, nil
+}
+
+// addFriendDetailed 是 /friend/add.json 的三态版本：建上了 / 本来就是好友 /
+// 只产生了待同意申请。
+//
+// 关键差别在 200 响应体的 processCode：只看顶层 code 的话，25461（待对方同意）
+// 和真正建好边完全同形，调用方会把「只发出去一条申请」当成「边建好了」。
+//
+// 报错时返回 friendAddUnknown + error，调用方必须先看 error 再读 outcome。
+func (c *rongcloudAPIClient) addFriendDetailed(ctx context.Context, userID, friendID, remark, optType string) (friendAddOutcome, error) {
 	if optType != friendOptTypeRequest && optType != friendOptTypeDirect {
-		return false, fmt.Errorf("rongcloud: unsupported friend optType %q", optType)
+		return friendAddUnknown, fmt.Errorf("rongcloud: unsupported friend optType %q", optType)
 	}
 	form := url.Values{
 		"userId":   {userID},
@@ -111,12 +175,24 @@ func (c *rongcloudAPIClient) addFriendWithOptType(ctx context.Context, userID, f
 	}
 	result, err := c.postForm(ctx, "/friend/add.json", form)
 	if err != nil {
-		if code, ok := result["code"].(float64); ok && code == 25460 {
-			return true, nil // already friends
+		// 顶层 code=25460：已经是好友。postForm 把它归成业务错误，但这里要按
+		// 「边存在」处理（幂等重绑、先私下同意再补批都走这条）。
+		if code, _, ok := RongCloudAPIError(err); ok && code == friendCodeAlreadyFriends {
+			return friendAddExisting, nil
 		}
-		return false, err
+		return friendAddUnknown, err
 	}
-	return false, nil
+	if processCode, ok := result["processCode"].(float64); ok {
+		switch int(processCode) {
+		case friendCodePendingApproval:
+			// 200 + 25461：申请建立了，边没有。审批链路最容易在这里假成功。
+			return friendAddPending, nil
+		case friendCodeAlreadyFriends:
+			// 200 + 25460：对方免验证，这次直接成了好友（边存在，但没有申请）。
+			return friendAddExisting, nil
+		}
+	}
+	return friendAddLinked, nil
 }
 
 // friendEntry is one entry from the RongCloud friend list.
