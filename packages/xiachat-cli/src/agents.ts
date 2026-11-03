@@ -258,7 +258,13 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     "-p", prompt,
     // stream-json：逐行 JSON 事件流（thinking_delta / text_delta 可解析，
     // 同时是思考流数据源）。--verbose 是 stream-json 的前置要求。
-    "--output-format", "stream-json", "--verbose",
+    //
+    // ⚠️ --include-partial-messages 不能省（2026-11-03 实测 claude 2.1.317）：
+    // 只给 `-p --output-format stream-json --verbose` 时它**一条 stream_event
+    // 都不发**，整轮只有 3 行（system/init → assistant 全文 → result）。于是
+    // 设备端拿到的增量恒为 0：正文只能等整包落地由兜底回放，思考卡片则永远
+    // 不出现。加上这个参数才出现 content_block_delta（text_delta/thinking_delta）。
+    "--output-format", "stream-json", "--verbose", "--include-partial-messages",
     ...buildModelArgs("claude", model),
   ],
   codex: (prompt, model, _sessionKey, ctx) => [
