@@ -990,7 +990,15 @@ export class MessageDispatcher {
         const interval = textOnly ? STREAM_TEXT_FRAME_INTERVAL_MS : STREAM_FRAME_INTERVAL_MS;
         // 节流：距上一帧不足间隔时只攒不动，由下个 chunk 或终帧冲刷。
         if (now - lastSent < interval) {
-          if (activity && pendingActivityFlush === null) {
+          // 补偿帧：**思考和工具步骤都要排**，不能只排工具。
+          //
+          // 现场（2026-11-03，codex 节点）：整轮只有「正文」和「思考」两类事件，
+          // 而且 codex 0.144 + quukk 网关的到达顺序是 agent_message 先出、
+          // reasoning 后出。思考紧跟在正文之后，必然落在上一帧的 900ms 窗口里 →
+          // 以前这里只给 activity 排补偿帧，reasoning 就一路攒到终帧才上屏：
+          // 流式全程没有一张思考卡片，用户看到的就是「codex 不会思考」。
+          // 工具阶段久久不来正文时同理（这条是原有逻辑，保持）。
+          if ((activity || reasoningDelta) && pendingActivityFlush === null) {
             pendingActivityFlush = setTimeout(() => {
               pendingActivityFlush = null;
               void emitStreamingFrame(true);

@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 process.env.CODEX_HOME = mkdtempSync(join(tmpdir(), "cm-codex-home-"));
 import {
   agentRuntimeEnv,
+  clearStaleOpenclawGatewayLock,
   buildAgentArgs,
   buildSpawnInvocation,
   buildModelArgs,
@@ -16,6 +17,7 @@ import {
   extractOpenclawReply,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
+  openclawGatewayLockFailure,
   openclawTurnHealth,
   parseOpenclawJsonOutput,
   resolveWindowsShim,
@@ -25,7 +27,9 @@ import {
   trimIncompleteUtf8Tail,
 } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyTurnError } from "./turn-error.js";
@@ -1164,3 +1168,136 @@ describe.skipIf(process.platform !== "win32")("Windows .cmd shim 穿透（cmd.ex
     expect(viaCmd.args.every((a) => !a.includes("\n"))).toBe(true);
   });
 })
+
+// --- openclaw 陈旧网关锁自愈 -------------------------------------------------
+// 现场（2026-11-03）：`~/.openclaw/tmp/openclaw/gateway.<hash>.lock` 记着
+// pid=23136，那个 pid 已被无关进程复用，18789 又没有任何监听 —— openclaw 只按
+// pid 判活，于是永远认为「gateway 已在跑」，等 5s 锁超时后 exit 1。节点连续
+// 4 天每轮都失败，web 只看到「进程异常退出，没有任何输出」。
+describe("openclaw 网关锁自愈", () => {
+  const LOCK = JSON.stringify({ pid: 999999, port: 1, createdAt: "2026-10-30T11:04:57.274Z" });
+
+  function lockDirWith(files: Record<string, string>): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "cm-openclaw-lock-"));
+    for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  it("认得两种措辞（信封 error.message / stderr 的 Reason 行），其余错误不误判", () => {
+    expect(openclawGatewayLockFailure(
+      'agent exited with code 1: \n[stdout tail]\n{"ok":false,"error":{"message":"gateway already running (pid 23136); lock timeout after 5000ms"}}',
+    )?.message).toContain("gateway already running");
+    expect(openclawGatewayLockFailure(
+      "[openclaw] Could not start the CLI.\n[openclaw] Reason: gateway already running (pid 1); lock timeout after 5000ms",
+    )?.message).toContain("gateway already running");
+    expect(openclawGatewayLockFailure("agent exited with code 1: model_not_found")).toBeNull();
+    expect(openclawGatewayLockFailure(undefined)).toBeNull();
+  });
+
+  it("端口探不到 → 把锁改名成 .stale-<ts>（保留现场）并返回 true", async () => {
+    const { dir, cleanup } = lockDirWith({ "gateway.138fef5d.lock": LOCK, "gateway.state.lock.sqlite": "" });
+    try {
+      const cleared = await clearStaleOpenclawGatewayLock({
+        lockDir: dir,
+        probePort: async () => false,
+        now: () => 1234,
+        logger: () => {},
+      });
+      expect(cleared).toBe(true);
+      expect(existsSync(join(dir, "gateway.138fef5d.lock"))).toBe(false);
+      expect(existsSync(join(dir, "gateway.138fef5d.lock.stale-1234"))).toBe(true);
+      // `gateway.state.lock.sqlite` 不是网关锁，绝不碰
+      expect(existsSync(join(dir, "gateway.state.lock.sqlite"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("端口有监听（真 gateway 在跑）→ 一把都不动", async () => {
+    const { dir, cleanup } = lockDirWith({ "gateway.aaa.lock": LOCK });
+    try {
+      const cleared = await clearStaleOpenclawGatewayLock({
+        lockDir: dir,
+        probePort: async () => true,
+        now: () => 1234,
+        logger: () => {},
+      });
+      expect(cleared).toBe(false);
+      expect(existsSync(join(dir, "gateway.aaa.lock"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("没有锁目录 / 目录里没有网关锁 → false（不抛错）", async () => {
+    expect(await clearStaleOpenclawGatewayLock({
+      lockDir: join(tmpdir(), "cm-openclaw-lock-does-not-exist"),
+      probePort: async () => false,
+      logger: () => {},
+    })).toBe(false);
+  });
+
+  it("ok=false 的失败信封算「没正常收尾」，detail 带上 openclaw 自己的错误串", () => {
+    const health = openclawTurnHealth(
+      '{"ok":false,"error":{"type":"cli_error","message":"gateway already running (pid 23136); lock timeout after 5000ms"}}',
+    );
+    expect(health.incomplete).toBe(true);
+    expect(health.detail).toContain("gateway already running");
+  });
+
+  it("端到端：撞锁失败 → 清锁 → 自动重试一次并拿到正文（重试只一次）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-openclaw-retry-"));
+    const lockDir = join(dir, "locks");
+    rmSync(lockDir, { recursive: true, force: true });
+    writeFileSync(join(dir, "placeholder"), "");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "gateway.deadbeef.lock"), LOCK);
+    const stateFile = join(dir, "attempts.txt");
+    const helper = join(dir, "flaky-openclaw.cjs");
+    writeFileSync(helper, [
+      `const fs = require("node:fs");`,
+      `const state = ${JSON.stringify(stateFile)};`,
+      `const first = !fs.existsSync(state);`,
+      `fs.writeFileSync(state, String((first ? 0 : Number(fs.readFileSync(state, "utf8"))) + 1));`,
+      `if (first) {`,
+      `  process.stdout.write(JSON.stringify({ ok: false, error: { type: "cli_error",`,
+      `    message: "gateway already running (pid 999999); lock timeout after 5000ms" } }),`,
+      `    () => process.exit(1));`,
+      `} else {`,
+      `  process.stdout.write(JSON.stringify({ payloads: [{ text: "第二次成功" }] }), () => process.exit(0));`,
+      `}`,
+    ].join("\n"));
+    const agentPath = join(dir, process.platform === "win32" ? "openclaw-flaky.cmd" : "openclaw-flaky");
+    if (process.platform === "win32") {
+      writeFileSync(agentPath, `@echo off\r\nnode "${helper}"\r\n`, { mode: 0o755 });
+    } else {
+      writeFileSync(agentPath, `#!/bin/sh\nexec node "${helper}"\n`, { mode: 0o755 });
+      chmodSync(agentPath, 0o755);
+    }
+    const prevLockDir = process.env.CLAWMESSENGER_OPENCLAW_LOCK_DIR;
+    process.env.CLAWMESSENGER_OPENCLAW_LOCK_DIR = lockDir;
+    try {
+      const reply = await runAgentTurn({ execPath: agentPath, agentName: "openclaw", prompt: "hi" });
+      expect(reply).toBe("第二次成功");
+      // 锁被改名而不是删除：排障要看得到原来那个 pid
+      const entries = readdirSync(lockDir);
+      expect(entries.some((name: string) => name.startsWith("gateway.deadbeef.lock.stale-"))).toBe(true);
+      // 只重试一次：恰好两次调用（第 1 次撞锁失败 + 第 2 次成功），没有第三次
+      expect(Number(readFileSync(stateFile, "utf8"))).toBe(2);
+    } finally {
+      if (prevLockDir === undefined) delete process.env.CLAWMESSENGER_OPENCLAW_LOCK_DIR;
+      else process.env.CLAWMESSENGER_OPENCLAW_LOCK_DIR = prevLockDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("buildModelArgs: claude 只吃裸模型名", () => {
+  it("provider/model 路由剥成裸 slug（整串会被上游判为未知模型）", () => {
+    expect(buildModelArgs("claude", "quukk/DeepSeek-V4-Pro-0813"))
+      .toEqual(["--model", "DeepSeek-V4-Pro-0813"]);
+    expect(buildModelArgs("claude", "claude-sonnet-4-5"))
+      .toEqual(["--model", "claude-sonnet-4-5"]);
+    expect(buildModelArgs("claude", undefined)).toEqual([]);
+  });
+});

@@ -2398,3 +2398,54 @@ describe("chat_stream 终帧补发", () => {
     expect(completed[0].stream_id).toBe(completed[1].stream_id)
   })
 });
+
+// ---- 思考紧跟在正文之后（codex 的真实到达顺序）------------------------------
+// 现场（2026-11-03）：codex 节点「有回答但没有思考卡片」。实测 codex 0.144 +
+// quukk 网关的事件顺序是 agent_message 先出、reasoning 后出，然后立刻
+// turn.completed —— 思考增量必然落在上一帧的 900ms 节流窗口里。原来只有
+// activity 会排补偿帧，于是 reasoning 一路攒到终帧才上屏：流式全程 0 帧带思考，
+// 看起来就是「它不会思考」。这里断言流式期间至少有一帧带 reasoning。
+describe("chat_stream 思考紧跟在正文之后（codex 顺序）", () => {
+  it("流式期间必须有一帧带 reasoning，不能只靠终帧补", async () => {
+    const raw: string[] = [];
+    const dispatcher = new MessageDispatcher({
+      send: async () => {},
+      sendStream: async (_t: 1 | 3 | 4, _c: string, _o: string, content: string) => { raw.push(content) },
+      selfUserId: "node_self",
+    });
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user_a",
+      toUserId: "",
+      targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({ content: "hi" }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (
+        _p: string,
+        _m: string | undefined,
+        onDelta: (text: string, reasoning?: string) => unknown,
+      ) => {
+        for (let i = 0; i < 6; i += 1) {
+          await onDelta("字");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        // 正文之后才来的思考（codex 实测就是这个顺序）
+        await onDelta("", "想".repeat(50));
+        // 进程收尾还要一会儿（实测 ~1s），补偿帧就在这个窗口里发出去
+        await new Promise((resolve) => setTimeout(resolve, 1300));
+        return "字".repeat(6);
+      },
+    });
+
+    const frames = raw.map((content) => JSON.parse(content) as {
+      status: string; reasoning?: string; timeline?: unknown
+    });
+    const streamingWithReasoning = frames.filter((f) => f.status === "streaming" && f.reasoning);
+    expect(streamingWithReasoning.length).toBeGreaterThanOrEqual(1);
+    expect(streamingWithReasoning[0]!.timeline).toHaveLength(1);
+    // 终帧仍是完整快照
+    expect(frames.at(-1)!.reasoning).toBe("想".repeat(50));
+  }, 20_000);
+});

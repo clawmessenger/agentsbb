@@ -1,7 +1,9 @@
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  anthropicModelsUrl,
   modelsUrl,
+  parseClaudeConfig,
   parseCodebuddyProviderConfig,
   parseCodexConfig,
   parseHermesConfig,
@@ -86,6 +88,96 @@ describe("probeProviderModels", () => {
       { id: "p", baseUrl: "http://127.0.0.1:1/v1" },
       { fetchImpl: boom as unknown as typeof fetch },
     )).toBeNull();
+  });
+});
+
+// --- claude：Anthropic 风格的端点与认证 -------------------------------------
+// 现场（2026-11-03）：claude 节点在「设备管理 → 默认模型」永远空目录。根因是
+// 这张表里根本没有 claude —— 既没有可列举模型的子命令，也没有配置可读。
+describe("probeProviderModels (Anthropic 风格)", () => {
+  it("authStyle=anthropic 走 x-api-key + anthropic-version，模型清单在 /v1/models", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(fakeResponse(JSON.stringify({ data: [{ id: "glm-5.3" }] })));
+    const ids = await probeProviderModels(
+      { id: "quukk", baseUrl: "https://llmapi.quukk.com", apiKey: "sk-a", authStyle: "anthropic" },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(ids).toEqual(["glm-5.3"]);
+    const [url, init] = fetchImpl.mock.calls[0];
+    // ANTHROPIC_BASE_URL 一般不带 /v1，必须补上；拼成 /v1/v1/models 会 404。
+    expect(url).toBe("https://llmapi.quukk.com/v1/models");
+    expect((init as RequestInit).headers).toMatchObject({
+      "x-api-key": "sk-a",
+      "anthropic-version": "2023-06-01",
+    });
+    expect((init as RequestInit).headers).not.toHaveProperty("authorization");
+  });
+
+  it("OpenAI 风格不受影响（仍是 Bearer + {base}/models）", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(fakeResponse(JSON.stringify({ data: [{ id: "k3" }] })));
+    await probeProviderModels(
+      { id: "quukk", baseUrl: "https://llmapi.quukk.com/v1", apiKey: "sk-1" },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("https://llmapi.quukk.com/v1/models");
+    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer sk-1" });
+  });
+
+  it("anthropicModelsUrl 不重复拼版本段", () => {
+    expect(anthropicModelsUrl("https://llmapi.quukk.com")).toBe("https://llmapi.quukk.com/v1/models");
+    expect(anthropicModelsUrl("https://llmapi.quukk.com/")).toBe("https://llmapi.quukk.com/v1/models");
+    expect(anthropicModelsUrl("https://llmapi.quukk.com/v1")).toBe("https://llmapi.quukk.com/v1/models");
+  });
+});
+
+describe("parseClaudeConfig", () => {
+  it("读 env 段的 ANTHROPIC_BASE_URL / AUTH_TOKEN / MODEL，provider 由域名派生", () => {
+    const config = parseClaudeConfig(JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: "https://llmapi.quukk.com",
+        ANTHROPIC_AUTH_TOKEN: "sk-ant-1",
+        ANTHROPIC_MODEL: "DeepSeek-V4-Pro-0813",
+      },
+    }));
+    expect(config.endpoints).toEqual([
+      { id: "quukk", baseUrl: "https://llmapi.quukk.com", apiKey: "sk-ant-1", authStyle: "anthropic" },
+    ]);
+    // web 存的是 provider/model 路由，模型侧只吃裸 slug（见 buildModelArgs）
+    expect(config.defaultModel).toBe("quukk/DeepSeek-V4-Pro-0813");
+  });
+
+  it("也认 ANTHROPIC_API_KEY 与顶层 model", () => {
+    const config = parseClaudeConfig(JSON.stringify({
+      model: "glm-5.2",
+      env: { ANTHROPIC_BASE_URL: "https://gw.example.com/v1", ANTHROPIC_API_KEY: "sk-2" },
+    }));
+    expect(config.endpoints[0]).toMatchObject({ id: "gw", apiKey: "sk-2", authStyle: "anthropic" });
+    expect(config.defaultModel).toBe("gw/glm-5.2");
+  });
+
+  it("没配 base URL 时落到官方端点，不伪造 key；破损 JSON 返回空", () => {
+    const fallback = parseClaudeConfig(JSON.stringify({ env: { ANTHROPIC_MODEL: "claude-sonnet-4-5" } }));
+    expect(fallback.endpoints).toEqual([
+      { id: "anthropic", baseUrl: "https://api.anthropic.com", authStyle: "anthropic" },
+    ]);
+    expect(fallback.defaultModel).toBe("anthropic/claude-sonnet-4-5");
+
+    expect(parseClaudeConfig("{not json")).toEqual({ endpoints: [], defaultModel: null });
+  });
+
+  it("readAgentConfig('claude') 能命中 ~/.claude/settings.json", () => {
+    const home = "C:/fake-home";
+    const config = readAgentConfig("claude", {
+      home,
+      env: {},
+      readFile: (path: string) => {
+        if (path === join(home, ".claude", "settings.json")) {
+          return JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://llmapi.quukk.com", ANTHROPIC_MODEL: "k3" } });
+        }
+        throw new Error("ENOENT");
+      },
+    });
+    expect(config?.defaultModel).toBe("quukk/k3");
   });
 });
 

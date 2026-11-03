@@ -30,6 +30,14 @@ export interface ProviderEndpoint {
   name?: string;
   baseUrl: string;
   apiKey?: string;
+  /**
+   * 认证/协议风格。缺省 `openai`（`Authorization: Bearer` + `{base}/models`）。
+   *
+   * `anthropic` 只给 claude 用：Anthropic 原生接口是 `x-api-key` +
+   * `anthropic-version` 头，模型清单在 `/v1/models`（base 通常不带 `/v1`，
+   * 拼错就成了 `/v1/v1/models`）。实测 quukk 网关两种风格都吃得上。
+   */
+  authStyle?: "openai" | "anthropic";
 }
 
 export interface AgentConfig {
@@ -122,6 +130,15 @@ export function modelsUrl(baseUrl: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/models`;
 }
 
+/**
+ * Anthropic 风格端点没有「标准 base 带 /v1」的约定（`ANTHROPIC_BASE_URL` 一般
+ * 只写域名），而模型清单固定在 `/v1/models`。已带版本段的就不要重复拼。
+ */
+export function anthropicModelsUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  return /\/v\d+$/.test(trimmed) ? `${trimmed}/models` : `${trimmed}/v1/models`;
+}
+
 /** Probes one OpenAI-compatible endpoint. Never rejects; `null` = unusable. */
 export async function probeProviderModels(
   endpoint: ProviderEndpoint,
@@ -129,10 +146,18 @@ export async function probeProviderModels(
 ): Promise<string[] | null> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   if (typeof fetchImpl !== "function") return null;
+  const anthropic = endpoint.authStyle === "anthropic";
   const headers: Record<string, string> = { accept: "application/json" };
-  if (endpoint.apiKey) headers.authorization = `Bearer ${endpoint.apiKey}`;
+  if (endpoint.apiKey) {
+    if (anthropic) {
+      headers["x-api-key"] = endpoint.apiKey;
+      headers["anthropic-version"] = "2023-06-01";
+    } else {
+      headers.authorization = `Bearer ${endpoint.apiKey}`;
+    }
+  }
   try {
-    const response = await fetchImpl(modelsUrl(endpoint.baseUrl), {
+    const response = await fetchImpl(anthropic ? anthropicModelsUrl(endpoint.baseUrl) : modelsUrl(endpoint.baseUrl), {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS),
@@ -541,6 +566,53 @@ export function parseOpencodeConfig(text: string): AgentConfig {
   };
 }
 
+// `~/.claude/settings.json`（Claude Code）—— 它的模型选择与网关全靠 `env` 段：
+//
+//   { "env": { "ANTHROPIC_BASE_URL": "https://llmapi.quukk.com",
+//              "ANTHROPIC_AUTH_TOKEN": "sk-…",
+//              "ANTHROPIC_MODEL": "DeepSeek-V4-Pro-0813" } }
+//
+// 现场（2026-11-03）：claude 节点在「设备管理 → 默认模型」永远显示
+// 「设备未返回可用模型目录」——因为 model-providers 里根本没有 claude 这一支，
+// 目录既没有 CLI 列举（claude 没有列模型的子命令），也没有配置可读，必然空。
+//
+// 两条与其它 agent 不同的地方：
+//   · 认证是 Anthropic 风格（x-api-key + anthropic-version），走 authStyle；
+//   · `ANTHROPIC_BASE_URL` 通常不带 `/v1`，模型清单在 `/v1/models`。
+// 顺带读一下 `~/.claude.json`（CLI 的另一个落盘口）：里面有时带顶层 `model`
+// 与 `env`，两份都读、先命中的赢。
+export function parseClaudeConfig(text: string): AgentConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { endpoints: [], defaultModel: null };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { endpoints: [], defaultModel: null };
+  }
+  const record = parsed as Record<string, unknown>;
+  const env = (typeof record.env === "object" && record.env !== null && !Array.isArray(record.env)
+    ? record.env
+    : {}) as Record<string, unknown>;
+  const baseUrl = asString(env.ANTHROPIC_BASE_URL);
+  const apiKey = asString(env.ANTHROPIC_AUTH_TOKEN ?? env.ANTHROPIC_API_KEY);
+  const model = asString(env.ANTHROPIC_MODEL) ?? asString(record.model);
+  // 没配 base URL 时 claude 走官方 Anthropic 端点：把它当成端点报出去更有用
+  // （面板至少能 probe 到官方目录），但**不伪造 key** —— 没有 key 的 probe 会
+  // 401 落空，目录为空，与「压根没有 claude 支持」相比也算如实降级。
+  const id = providerIdFromBaseUrl(baseUrl ?? "https://api.anthropic.com", "anthropic");
+  return {
+    endpoints: [{
+      id,
+      baseUrl: baseUrl ?? "https://api.anthropic.com",
+      ...(apiKey ? { apiKey } : {}),
+      authStyle: "anthropic",
+    }],
+    defaultModel: model ? `${id}/${model}` : null,
+  };
+}
+
 // --- per-agent wiring ------------------------------------------------------
 
 const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfig>> = {
@@ -550,6 +622,7 @@ const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfi
   qwen: parseQwenConfig,
   codebuddy: parseCodebuddyProviderConfig,
   opencode: parseOpencodeConfig,
+  claude: parseClaudeConfig,
 };
 
 function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): string[] {
@@ -571,6 +644,16 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
     const candidates: string[] = [];
     if (env.QWEN_HOME) candidates.push(join(env.QWEN_HOME, "settings.json"));
     candidates.push(join(home, ".qwen", "settings.json"));
+    return candidates;
+  }
+  if (agentName === "claude") {
+    // CLAUDE_CONFIG_DIR 是 Claude Code 自己认的目录变量（多账号/多配置时用）。
+    const candidates: string[] = [];
+    const configDir = env.CLAUDE_CONFIG_DIR;
+    if (configDir) candidates.push(join(configDir, "settings.json"));
+    candidates.push(join(home, ".claude", "settings.json"));
+    // ~/.claude.json 是 CLI 的另一份落盘（老版本把配置写在这里）。
+    candidates.push(join(home, ".claude.json"));
     return candidates;
   }
   if (agentName === "codebuddy") {

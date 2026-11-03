@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { access, constants } from "node:fs/promises";
+import { connect } from "node:net";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -98,6 +99,9 @@ export interface RunAgentTurnOpts {
   // 内部用：serve 模式起不来时退回 run --format json，递归进来时置 true，
   // 避免二次分流。外部调用方不该传。
   disableServerMode?: boolean;
+  // 内部用：openclaw 陈旧的网关锁已被本进程清理并重试过一次，递归进来时置 true，
+  // 保证「清锁 + 重试」最多一次。外部调用方不该传。
+  openclawLockRetryUsed?: boolean;
 }
 
 // Agents known to reject or hang on stdin-mode invocation get an argv
@@ -162,6 +166,12 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // 策略（提示词走 stdin），但 `--model` 是它确实支持的参数，守卫先行会把
   // stdin 模式下选好的模型静默丢掉。
   if (name === "qwen") {
+    return route ? ["--model", route.model] : ["--model", model];
+  }
+  // claude 同 qwen：`--model` 只吃裸模型名，`quukk/glm-…` 整串传过去会被上游
+  // 当成未知模型拒掉。web 存的是 provider/model 路由，这里剥掉前缀。
+  // （claude 有 argv 策略，但这条仍要放在下面「无策略不注入」守卫之前。）
+  if (name === "claude") {
     return route ? ["--model", route.model] : ["--model", model];
   }
   // 没有 argv 策略的 agent 会退化成「裸进程名」（buildAgentArgs 返回 []），给它
@@ -541,7 +551,22 @@ export function openclawTurnHealth(raw: string): OpenclawTurnHealth {
     return { incomplete: false };
   }
   if (typeof parsed !== "object" || parsed === null) return { incomplete: false };
-  const meta = (parsed as { meta?: unknown }).meta;
+  // 失败信封：`{"ok":false,"error":{"type":"cli_error","message":"…"}}`。
+  // 它压根没有 meta（下面那段直接 return 了），以前会被当成「正常收尾」，
+  // 于是 extractOpenclawReply 落空、整份 JSON 被当正文发出去。这里先认出来，
+  // 并把 openclaw 自己给的错误串带进 detail —— 上层的清锁自愈就靠它认分支。
+  const envelope = parsed as {
+    ok?: unknown;
+    error?: { message?: unknown } | null;
+    meta?: unknown;
+  };
+  if (envelope.ok === false) {
+    const message = typeof envelope.error?.message === "string" && envelope.error.message.trim()
+      ? envelope.error.message.trim()
+      : "openclaw returned ok=false";
+    return { incomplete: true, detail: message };
+  }
+  const meta = envelope.meta;
   if (typeof meta !== "object" || meta === null) return { incomplete: false };
   const m = meta as {
     aborted?: unknown;
@@ -1431,7 +1456,170 @@ function logFsRestrictionOnce(
   );
 }
 
+// --- openclaw 陈旧网关锁自愈 -------------------------------------------------
+//
+// 现场（2026-11-03）：openclaw 节点每一轮都失败，web 气泡只说
+// 「进程异常退出，没有任何输出」。真因在 openclaw 自己的 gateway 锁：
+//   ~/.openclaw/tmp/openclaw/gateway.<hash>.lock
+//   {"pid":23136,"port":18789,"createdAt":"2026-10-30T11:04:57.274Z"}
+// 那次 gateway 是被异常终止的（留下锁文件），而 Windows 把 pid 23136 复用给了
+// 另一个无关进程（supervisor 的 `run --agent qwen` 子进程）。于是：
+//   · openclaw 只按 pid 判活 → 认为「gateway 已在跑」；
+//   · 它去连 127.0.0.1:18789 时没有任何监听 → 等 5s 锁超时后 exit 1；
+//   · 只要那个 pid 还活着，这个节点就**永远**起不来（实测持续 4 天）。
+//
+// 所以判据必须是「端口探不到」而不是「pid 死了」——pid 复用让 pid 判活完全不可信。
+// 清理也必须是**有界**的：只在 openclaw 已经自己等锁超时（错误串命中）之后才动，
+// 且端口能连通时绝不改锁（那是真的有个 gateway 在服役）。
+
+const OPENCLAW_GATEWAY_LOCK_RE = /^gateway\.[A-Za-z0-9_-]+\.lock$/;
+const OPENCLAW_DEFAULT_GATEWAY_PORT = 18789;
+
+/** 从一次失败的错误串里认出「openclaw 网关锁陈旧」。null = 不是这种失败。 */
+export function openclawGatewayLockFailure(raw: string | undefined): { message: string } | null {
+  const text = (raw ?? "").slice(0, 4000);
+  if (!text) return null;
+  // 两种措辞都取自 openclaw 自己的输出：
+  //   envelope: {"ok":false,"error":{"message":"gateway already running (pid N); lock timeout after 5000ms"}}
+  //   stderr:   [openclaw] Could not start the CLI. Reason: gateway already running …
+  if (!/gateway already running|lock timeout/i.test(text)) return null;
+  const message = /"message"\s*:\s*"([^"]+)"/.exec(text)?.[1]
+    ?? /Reason:\s*(.+)/.exec(text)?.[1]?.trim()
+    ?? "openclaw gateway lock timeout";
+  return { message };
+}
+
+export interface OpenclawLockRecoveryOpts {
+  /** 锁目录，默认 `~/.openclaw/tmp/openclaw`。测试注入临时目录。 */
+  lockDir?: string;
+  /** TCP 探活。返回 true = 端口有人在听（真的 gateway 在跑）。 */
+  probePort?: (port: number, timeoutMs: number) => Promise<boolean>;
+  now?: () => number;
+  logger?: (message: string) => void;
+}
+
+/** 默认探活：连上就算活，1s 超时。 */
+function probeTcpPort(port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (alive: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(alive);
+    };
+    const socket = connect({ host: "127.0.0.1", port });
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+interface OpenclawGatewayLock {
+  file: string;
+  port: number;
+  pid?: number;
+}
+
+function readOpenclawGatewayLocks(lockDir: string): OpenclawGatewayLock[] {
+  let names: string[];
+  try {
+    names = readdirSync(lockDir);
+  } catch {
+    return [];
+  }
+  const locks: OpenclawGatewayLock[] = [];
+  for (const name of names) {
+    if (!OPENCLAW_GATEWAY_LOCK_RE.test(name)) continue;
+    const file = join(lockDir, name);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(file, "utf8"));
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const record = parsed as { port?: unknown; pid?: unknown };
+    const port = typeof record.port === "number" && Number.isInteger(record.port) && record.port > 0
+      ? record.port
+      : OPENCLAW_DEFAULT_GATEWAY_PORT;
+    locks.push({
+      file,
+      port,
+      ...(typeof record.pid === "number" ? { pid: record.pid } : {}),
+    });
+  }
+  return locks;
+}
+
+/**
+ * 清掉「指向不存在的 gateway」的陈旧锁：把 `gateway.<hash>.lock` 改名成
+ * `.stale-<epochms>`（保留现场，不删），返回是否真的清掉了东西。
+ *
+ * 只要任意一把锁的端口能连通（真 gateway 在跑）就**一把都不动**并返回 false：
+ * 宁可让这一轮继续失败，也不能把正在服役的 gateway 的锁抢走。
+ */
+export async function clearStaleOpenclawGatewayLock(
+  opts: OpenclawLockRecoveryOpts = {},
+): Promise<boolean> {
+  // 环境变量是排障/测试用的口子：单测不能去动执行者自己的 ~/.openclaw。
+  const lockDir = opts.lockDir
+    ?? process.env.CLAWMESSENGER_OPENCLAW_LOCK_DIR
+    ?? join(homedir(), ".openclaw", "tmp", "openclaw");
+  const probe = opts.probePort ?? probeTcpPort;
+  const now = opts.now ?? Date.now;
+  const logger = opts.logger ?? ((message: string) => console.warn(message));
+  const locks = readOpenclawGatewayLocks(lockDir);
+  if (locks.length === 0) return false;
+
+  // 先判活：任何一把锁的端口有人在听 → 视为健康，整批不动。
+  for (const lock of locks) {
+    if (await probe(lock.port, 1000)) {
+      logger(
+        `openclaw gateway lock: 127.0.0.1:${lock.port} 有监听，锁是活的，不动它（${lock.file}）`,
+      );
+      return false;
+    }
+  }
+
+  let cleared = 0;
+  for (const lock of locks) {
+    const target = `${lock.file}.stale-${now()}`;
+    try {
+      renameSync(lock.file, target);
+      cleared += 1;
+      logger(
+        `openclaw gateway lock stale (pid=${lock.pid ?? "?"}, 127.0.0.1:${lock.port} 无监听)`
+        + ` → 已改名为 ${target}，本轮回退重试一次`,
+      );
+    } catch (err) {
+      logger(
+        `openclaw gateway lock 清理失败（${lock.file}）：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return cleared > 0;
+}
+
+/**
+ * 跑一轮 agent。openclaw 撞上陈旧网关锁时清锁并重试**一次**（见上面那段注释）。
+ *
+ * 为什么放在这一层而不是 im.ts：这是 openclaw 二进制的状态问题，跟会话形态无关；
+ * 私聊/群聊/讨论组都从 runAgentTurn 进来，放这里才没有漏网的入口。
+ */
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
+  return runAgentTurnInner(opts).catch(async (err: unknown) => {
+    if (opts.openclawLockRetryUsed || !emitsJsonEnvelope(opts.agentName)) throw err;
+    const failure = openclawGatewayLockFailure(err instanceof Error ? err.message : String(err));
+    if (!failure) throw err;
+    const cleared = await clearStaleOpenclawGatewayLock();
+    if (!cleared) throw err;
+    return runAgentTurn({ ...opts, openclawLockRetryUsed: true });
+  });
+}
+
+function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const hardLimit = opts.hardOutputBytes ?? HARD_OUTPUT_BYTES;
   // stream-json 的 JSONL 冗余大（事件元数据 + 思考流），64KB 会截断长回答。
@@ -1482,7 +1670,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         console.warn(
           `opencode serve 不可用，回退到 run --format json：${err instanceof Error ? err.message : String(err)}`,
         );
-        return runAgentTurn({ ...opts, disableServerMode: true });
+        return runAgentTurnInner({ ...opts, disableServerMode: true });
       });
     }
   }
