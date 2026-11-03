@@ -1730,6 +1730,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/user/binding", h.ClawUserBinding)
 	r.Post("/api/user/wechat-bind", h.ClawUserWeChatBind)
 	r.Get("/api/config/user-guide", h.ClawUserGuide)
+	// 品牌图片（默认头像 / 三张群类图 / Logo）由后台「系统配置」发布，这里公开下发。
+	// 不要求登录：登录页本身要用 Logo，且回包只是 5 个图片地址。
+	r.Get("/api/config/branding", h.ClawBranding)
 	r.Post("/api/im/refresh-token", h.ClawImRefreshToken)
 	// 配额与半成品列表（讨论组引导式创建与配额）：C 端预检 / 会话列表合并。
 	r.Get("/api/quota/me", h.ClawGetMyQuota)
@@ -1754,6 +1757,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)
 	r.Get("/api/admin/system/config/{key}", h.ClawAdminSystemConfigGet)
 	r.Put("/api/admin/system/config/{key}", h.ClawAdminSystemConfigPut)
+	// 品牌图片上传：`/api/upload-file` 要普通用户登录态、`/api/claw/node-files`
+	// 要设备凭据，后台的 admin token 两条都过不去，所以单开一条只写 branding/ 前缀的。
+	r.Post("/api/admin/branding/upload", h.ClawAdminUploadBrandingImage)
 	// 接入提示词的专用读写口：正文是纯文本，走 system/config 会被包一层
 	// {"value": ...}，后台编辑框还得自己拆，这里直接收发 text。
 	r.Get("/api/admin/onboarding-prompt", h.ClawAdminOnboardingPromptGet)
