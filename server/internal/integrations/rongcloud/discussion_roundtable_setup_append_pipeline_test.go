@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,8 +214,16 @@ func TestSetupRecommendAppendWithNodeIDsKeepsRowAndAvoidsAddedDevice(t *testing.
 		return rolesNamed(fmt.Sprintf("批次%d", round), maxRoles)
 	}))
 
-	// ---- 轮 1：首推（无 node_ids，服务端自己从 8 台里挑 5 个角色）----
-	f.rt.recommendForSetupBatch(context.Background(), discussionID, 1, setupRecommendRequest{})
+	// ---- 轮 1：首推，显式给 node_ids —— 这条用例守的是「角色绑设备」的形态 B；
+	// 不带 node_ids 时角色进角色池、不绑设备（见 WithoutNodeIDsHintsExistingRoles）----
+	allNodeIDs := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		allNodeIDs = append(allNodeIDs, node.NodeID)
+	}
+	f.rt.recommendForSetupBatch(context.Background(), discussionID, 1, setupRecommendRequest{
+		nodeIDs:      allNodeIDs,
+		nodeIDsGiven: true,
+	})
 	first := f.lastRolesPrompt(t, discussionID)
 	firstID, _ := first["recommendationId"].(string)
 	if firstID == "" {
@@ -307,46 +316,52 @@ func TestSetupRecommendAppendWithNodeIDsKeepsRowAndAvoidsAddedDevice(t *testing.
 	assertRolesAssignable(t, []map[string]interface{}{addedRole}, eventRoles(t, second))
 }
 
-// 没给 node_ids 时（老前端 / 服务端自动选候选）：必须沿用整行排除兜底，
-// 否则 assignRoleNodes 会挑到历史角色已占用的设备 → confirm ROLE_DEVICE_DUPLICATED。
-func TestSetupRecommendAppendWithoutNodeIDsStillExcludesHistory(t *testing.T) {
+// 没给 node_ids 的续推走的是**角色池**（形态 A）：角色不绑设备，所以不存在
+// 「历史设备占用」这回事，续推靠的是把上一批角色写进推荐提示词，让模型避开重复。
+//
+// 旧实现靠 appendCandidateNodes 剔设备来防重复；角色池下没有设备可剔，如果
+// 提示词里也不提，模型会把同一批人设再写一遍 —— 这条用例守的就是那个提示词。
+func TestSetupRecommendAppendWithoutNodeIDsHintsExistingRoles(t *testing.T) {
 	f, broker, _, discussionID := appendFixture(t, 8)
 	broker.BindSender(respondRolesSender(t, broker, func(round, maxRoles int) []map[string]interface{} {
 		return rolesNamed(fmt.Sprintf("批次%d", round), maxRoles)
 	}))
 
+	// 轮 1：不带 node_ids → 角色池，固定按产品上限要 3–5 个，且不带设备。
 	f.rt.recommendForSetupBatch(context.Background(), discussionID, 1, setupRecommendRequest{})
 	first := f.lastRolesPrompt(t, discussionID)
-	firstNodes := payloadRoleNodeIDs(t, first)
-
-	// 续推但不带 node_ids：候选 = 全部 eligible − 整行历史角色设备。
-	f.rt.recommendForSetupBatch(context.Background(), discussionID, 2, setupRecommendRequest{appendMode: true})
-	second := f.lastRolesPrompt(t, discussionID)
-	secondNodes := payloadRoleNodeIDs(t, second)
-	if len(secondNodes) == 0 {
-		t.Fatalf("续推没有推出任何角色（8 台设备里 5 台被历史占用，还剩 3 台可用）")
+	firstRoles := eventRoles(t, first)
+	if len(firstRoles) != recommendRoleCountCap {
+		t.Fatalf("轮 1 角色数 = %d, want %d（角色池与在线设备数解耦）",
+			len(firstRoles), recommendRoleCountCap)
 	}
-
-	used := make(map[string]bool, len(firstNodes))
-	for _, nodeID := range firstNodes {
-		used[nodeID] = true
-	}
-	for _, nodeID := range secondNodes {
-		if used[nodeID] {
-			t.Fatalf("未给 node_ids 时把新角色分给了历史角色已占用的设备 %s；"+
-				"confirm 会以 ROLE_DEVICE_DUPLICATED 整单拒绝", nodeID)
+	for _, role := range firstRoles {
+		if nodeID, _ := role["nodeId"].(string); nodeID != "" {
+			t.Fatalf("角色池里的角色不该绑定设备，got nodeId=%s：%#v", nodeID, role)
 		}
 	}
 
-	// 同一推荐行 + 追加落库。
-	firstID, _ := first["recommendationId"].(string)
-	secondID, _ := second["recommendationId"].(string)
-	if firstID != secondID {
-		t.Fatalf("续推换了推荐行：%q → %q", firstID, secondID)
+	// 轮 2：续推，换一个只抓包不应答的发送端 —— 这条用例只关心提示词带了什么。
+	var captured map[string]interface{}
+	broker.BindSender(captureSender(t, &captured))
+	f.rt.recommendForSetupBatch(context.Background(), discussionID, 2, setupRecommendRequest{appendMode: true})
+	if captured == nil {
+		t.Fatalf("续推没有下发推荐请求")
 	}
-	if len(secondNodes) != len(firstNodes) && len(secondNodes)+len(firstNodes) != 8 {
-		// 8 台候选里轮 1 用掉 5 台，剩 3 台 → 轮 2 只能是 3 个角色。
-		t.Fatalf("轮 2 角色数 = %d, want %d（剩余可用设备数）", len(secondNodes), 8-len(firstNodes))
+	params, _ := captured["params"].(map[string]interface{})
+	prompt, _ := params["recommendation_prompt"].(string)
+	if !strings.Contains(prompt, "已经确定的角色") {
+		t.Fatalf("续推提示词没有「已经确定的角色」段落：%q", prompt)
+	}
+	for _, role := range firstRoles {
+		name, _ := role["roleName"].(string)
+		if name == "" {
+			continue
+		}
+		if !strings.Contains(prompt, name) {
+			t.Fatalf("续推提示词没带上已确定的角色 %q —— 模型会重复推荐同一批人设\nprompt=%s",
+				name, prompt)
+		}
 	}
 }
 
