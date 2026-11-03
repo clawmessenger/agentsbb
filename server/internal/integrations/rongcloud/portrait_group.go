@@ -21,8 +21,9 @@ import (
 // 所以图源必须由服务端按 kind 决议并写下去，否则「web 换了图、手机还是灰人形」。
 //
 // 两条硬约束：
-//  1. 必须是 PNG。原生 App 用 Glide / SDWebImage 加载头像，解不了 SVG；web 用的
-//     是同一套图形的 SVG 版本（public/group-avatars/*.svg）。
+//  1. 必须是 PNG。原生 App 用 Glide / SDWebImage 加载头像，解不了 SVG；web 的
+//     群聊 / 聊天室用同一套图形的 SVG 版本（public/group-avatars/*.svg），讨论组
+//     自 2026-10-29 起两端共用这张 PNG（设计交付的位图，没有矢量版）。
 //  2. 图源要能被 env 覆盖。换域名 / 走 CDN 时不该改代码，与
 //     CLAW_DEFAULT_PORTRAIT_URI 同一套思路。图必须公网可读 —— 融云只存 URL，
 //     真去拉图的是客户端。
@@ -61,10 +62,17 @@ func GroupPortraitBase() string {
 
 // GroupPortraitURI 返回某类群会话的默认头像。未知 kind 回落到统一默认图
 // （default_user.png）—— 宁可显示一张灰人形，也不要写进一个 404 的 URL。
+//
+// 优先级：后台「系统配置 → 品牌图片」override > `CLAW_GROUP_PORTRAIT_BASE` env >
+// 内置常量。override 存的已经是绝对 URL（后台保存时归一化过），这里直接返回，
+// 不再拼基址。
 func GroupPortraitURI(kind string) string {
 	normalized := strings.ToLower(strings.TrimSpace(kind))
 	for _, known := range groupPortraitKinds {
 		if normalized == known {
+			if override := CurrentBrandingOverrides().groupPortrait(known); override != "" {
+				return override
+			}
 			return GroupPortraitBase() + "/" + known + ".png"
 		}
 	}
@@ -114,11 +122,23 @@ func GroupDefaultPortraitURIs() []string {
 // 基址同时认当前 env 与线上常量：换域名时两种写法都算我方发布的图。更早的历史
 // 域名不在识别范围内（写下去之后没人再改基址），需要时把旧基址填进 env 即可。
 func IsGroupDefaultPortrait(portrait string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(portrait))
+	trimmed := strings.TrimSpace(portrait)
+	if trimmed == "" {
+		return false
+	}
+	parsed, err := url.Parse(trimmed)
 	if err != nil {
 		return false
 	}
 	path := strings.TrimRight(parsed.Path, "/")
+	// 后台换成外链 / 对象存储之后的图，路径与基址无关，只能整条比：
+	// 用 path 比会在「两张图恰好同 path、不同 host」时误判成同一张。
+	overrides := CurrentBrandingOverrides()
+	for _, kind := range groupPortraitKinds {
+		if o := overrides.groupPortrait(kind); o != "" && sameImageURL(o, trimmed) {
+			return true
+		}
+	}
 	bases := []string{DefaultGroupPortraitBaseURL, GroupPortraitBase()}
 	for _, kind := range groupPortraitKinds {
 		for _, base := range bases {

@@ -919,6 +919,11 @@ func main() {
 	rongcloud.LogDefaultPortraitSource(slog.Default())
 	// 群类会话（群聊 / 讨论组 / 聊天室）走另外三张图，同样打出实际图源。
 	rongcloud.LogGroupPortraitSource(slog.Default())
+	// 后台「系统配置 → 品牌图片」里配过的图要盖掉上面那两组内置/env 图源。
+	// 启动时加载一次；后台保存后由 ClawAdminSystemConfigPut 再刷新，不用重启。
+	if h != nil {
+		h.ApplyBranding(context.Background(), "")
+	}
 
 	go func() {
 		slog.Info("server starting", "port", port)
