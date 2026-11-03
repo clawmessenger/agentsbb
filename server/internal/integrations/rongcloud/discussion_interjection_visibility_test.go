@@ -389,3 +389,161 @@ func TestInterjectionVisible_NotRepeatedInNextRound(t *testing.T) {
 	}
 	assertPromptMisses(t, round4Prompt, content, "R=N 的插话不得在第 N+1 轮重复注入")
 }
+
+// assertionHelper 断言「标题 + 具体内容」成对出现，防止只断言原文还在（那样两句
+// 标题写成一模一样也会绿）。
+func assertOpinionUnder(t *testing.T, prompt, header, content, context string) {
+	t.Helper()
+	want := header + "\n- " + content
+	if !strings.Contains(prompt, want) {
+		t.Errorf("%s：提示词里没有「%s」+ 该条内容\n--- prompt ---\n%s", context, header, prompt)
+	}
+}
+
+// TestInteractiveBuildPromptOpinionHeaders 是文案分叉的纯函数断言（不起库）：
+// 同一次派发里既可能有本轮新插话、也可能有上一轮沿用下来的那条，两段标题必须分开，
+// 且内容必须落在自己的标题下面。
+func TestInteractiveBuildPromptOpinionHeaders(t *testing.T) {
+	rt := &discussionRuntime{}
+	d := DiscussionRecord{DiscussionID: "disc-pure", CurrentRound: 3}
+	role := interactiveRole{MemberID: "rc-critic", RoleName: "质疑者"}
+	opinions := []interactiveOpinion{
+		{messageUID: "uid-fresh", content: "【插话-新】本轮刚提的意见", round: 3},
+		{messageUID: "uid-carried", content: "【插话-沿用】上一轮已经纳入过的意见", round: 3, alreadyApplied: true},
+	}
+	prompt := rt.interactiveBuildPrompt(d, role, "", opinions, interactiveHistory{})
+
+	assertOpinionUnder(t, prompt, interactiveOpinionHeaderFresh, "【插话-新】本轮刚提的意见", "新插话应用第一次的文案")
+	assertOpinionUnder(t, prompt, interactiveOpinionHeaderCarried, "【插话-沿用】上一轮已经纳入过的意见", "沿用插话应用第二次的文案")
+	// 反向：两条不能互换标题（互换就等于文案没分叉）。
+	assertPromptMisses(t, prompt, interactiveOpinionHeaderFresh+"\n- 【插话-沿用】",
+		"已被用过的插话不得挂在「本轮用户插话」标题下")
+	assertPromptMisses(t, prompt, interactiveOpinionHeaderCarried+"\n- 【插话-新】",
+		"本轮新插话不得挂在「沿用」标题下")
+
+	// 两句文案必须是两句不同的话：写成同一个字符串等于没改。
+	if interactiveOpinionHeaderFresh == interactiveOpinionHeaderCarried {
+		t.Fatalf("两种插话标题不能相同：%q", interactiveOpinionHeaderFresh)
+	}
+	// 沿用文案必须自带「不要表述为重复强调」的约束，否则分叉没有意义。
+	if !strings.Contains(interactiveOpinionHeaderCarried, "不要表述为用户重复强调") {
+		t.Errorf("沿用文案缺少「不要表述为用户重复强调」：%q", interactiveOpinionHeaderCarried)
+	}
+}
+
+// TestInterjectionVisible_SecondReadUsesCarriedWording 复现 QA 用例
+// TestQA_Interject_HostReadsSameOpinionInTwoConsecutiveRounds 的观感问题：
+//
+//	收口阶段（R = N+1）的一条插话，第 N 轮的主持人读一次、第 N+1 轮再读一次。
+//	第一次是本轮插话（必须纳入），第二次必须标成「此前补充的意见（沿用…）」——
+//	否则两次都用同一句「必须纳入」时，模型会把用户这一句话表述成「再次强调」，
+//	观感像用户在刷屏。
+//
+// 判据是「这条意见是否已经被用过」（此前落过 interjection_applied 回执），不是
+// 「第几次读」：回执只对真正注入的那几条落，且幂等。
+func TestInterjectionVisible_SecondReadUsesCarriedWording(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	d := newWindowFixtureDiscussion(t, f, 3, interjectionVisibilityMembers)
+
+	for _, member := range interjectionVisibilityMembers {
+		appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", member[0],
+			map[string]interface{}{"round": 3, "content": member[1] + "第三轮的判断"})
+	}
+	summarizing, err := f.rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
+		Status: DiscussionStatusSummarizing, CurrentRound: 3, RoundRevision: d.RoundRevision,
+	})
+	if err != nil {
+		t.Fatalf("advance to summarizing: %v", err)
+	}
+
+	uid := "uid-twice-" + uniqueID("t")
+	const content = "【插话-两次读】结论里要写明验收口径以合同附件为准"
+	if applied := appliedRoundOf(t, interjectAs(t, f, interjectCmd(d.DiscussionID, summarizing.Version, uid, content)), "收口阶段插话"); applied != 4 {
+		t.Fatalf("appliedRound = %d，期望 4", applied)
+	}
+
+	// 第一次：第 3 轮主持人收口时读 —— 此前没人读过它，必须是「本轮用户插话」。
+	host := roleFromSnapshot(t, summarizing, "host-rc")
+	if err := f.rt.interactiveDispatch(ctx, summarizing, host, 1); err != nil {
+		t.Fatalf("dispatch host round 3: %v", err)
+	}
+	round3Prompt := dispatchTasksByTarget(t, f, summarizing.DiscussionID)["host-rc"].Prompt
+	if round3Prompt == "" {
+		t.Fatal("第 3 轮主持人派发没有落进 outbox")
+	}
+	assertOpinionUnder(t, round3Prompt, interactiveOpinionHeaderFresh, content, "第一次读必须是本轮插话")
+	assertPromptMisses(t, round3Prompt, interactiveOpinionHeaderCarried+"\n- "+content,
+		"第一次读不得标成沿用（此前没人读到过它）")
+
+	// 第二次：第 4 轮主持人再读同一条 —— 必须换成「沿用」文案，且同一句话不得
+	// 在一条提示词里出现两遍。
+	next, err := f.rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
+		DiscussionID: summarizing.DiscussionID, ExpectedVersion: summarizing.Version,
+		Status: DiscussionStatusRunning, CurrentRound: 4, RoundRevision: 0,
+	})
+	if err != nil {
+		t.Fatalf("advance to round 4: %v", err)
+	}
+	host4 := roleFromSnapshot(t, next, "host-rc")
+	if err := f.rt.interactiveDispatch(ctx, next, host4, 1); err != nil {
+		t.Fatalf("dispatch host round 4: %v", err)
+	}
+	round4Prompt := dispatchTasksByTarget(t, f, next.DiscussionID)["host-rc"].Prompt
+	if round4Prompt == "" {
+		t.Fatal("第 4 轮主持人派发没有落进 outbox")
+	}
+	assertOpinionUnder(t, round4Prompt, interactiveOpinionHeaderCarried, content, "第二次读必须标成沿用")
+	assertPromptMisses(t, round4Prompt, interactiveOpinionHeaderFresh+"\n- "+content,
+		"第二次读不得再挂「本轮用户插话（必须纳入你的发言）」——那会让模型当成用户又强调了一遍")
+	if got := strings.Count(round4Prompt, content); got != 1 {
+		t.Fatalf("第二次读的提示词里同一句插话出现 %d 次，期望 1\n--- prompt ---\n%s", got, round4Prompt)
+	}
+
+	// 回执不因第二次注入而重复落（判据靠它，重复就会串轮次）。
+	if got := interjectionAppliedUIDs(t, f, next.DiscussionID)[uid]; got != 1 {
+		t.Fatalf("interjection_applied 回执条数 = %d，期望 1（uid=%s）", got, uid)
+	}
+}
+
+// TestInterjectionVisible_SameRoundMembersKeepFreshWording 钉住判据的边界：同一轮里
+// 前一位成员消费后落的回执（信封 round == 本轮）**不能**把同轮后一位成员降级成
+// 「沿用」—— 那位成员是第一次读到这条意见，「必须纳入你的发言」的力道不能丢。
+func TestInterjectionVisible_SameRoundMembersKeepFreshWording(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	d := newWindowFixtureDiscussion(t, f, 3, interjectionVisibilityMembers)
+
+	// 第 3 轮只让分析者发言 → 插话归当前轮（3），本轮所有成员都该读到。
+	appendFixtureEvent(t, f, d.DiscussionID, "contribution_completed", "rc-analyst",
+		map[string]interface{}{"round": 3, "content": "分析者第三轮的判断"})
+
+	uid := "uid-sameround-" + uniqueID("t")
+	const content = "【插话-同轮】成本口径请统一按含税价"
+	if applied := appliedRoundOf(t, interjectAs(t, f, interjectCmd(d.DiscussionID, d.Version, uid, content)), "中途插话"); applied != 3 {
+		t.Fatalf("appliedRound = %d，期望 3", applied)
+	}
+
+	// 分析者先派发：读一次并落回执。
+	analyst := roleFromSnapshot(t, d, "rc-analyst")
+	if err := f.rt.interactiveDispatch(ctx, d, analyst, 1); err != nil {
+		t.Fatalf("dispatch analyst: %v", err)
+	}
+	analystPrompt := dispatchTasksByTarget(t, f, d.DiscussionID)["rc-analyst"].Prompt
+	assertOpinionUnder(t, analystPrompt, interactiveOpinionHeaderFresh, content, "同轮第一位成员是新读")
+	if got := interjectionAppliedUIDs(t, f, d.DiscussionID)[uid]; got != 1 {
+		t.Fatalf("回执条数 = %d，期望 1", got)
+	}
+
+	// 质疑者随后派发：回执已经存在（同轮落的），但它仍是第一次读到 → 文案不变。
+	critic := roleFromSnapshot(t, d, "rc-critic")
+	if err := f.rt.interactiveDispatch(ctx, d, critic, 1); err != nil {
+		t.Fatalf("dispatch critic: %v", err)
+	}
+	criticPrompt := dispatchTasksByTarget(t, f, d.DiscussionID)["rc-critic"].Prompt
+	assertOpinionUnder(t, criticPrompt, interactiveOpinionHeaderFresh, content,
+		"同轮第二位成员仍是第一次读到，必须保留「必须纳入」的文案")
+	assertPromptMisses(t, criticPrompt, interactiveOpinionHeaderCarried,
+		"同轮之内的回执不得把后一位成员降级成沿用")
+}
