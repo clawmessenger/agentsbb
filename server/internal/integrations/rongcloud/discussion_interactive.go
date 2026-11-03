@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -963,6 +964,18 @@ func roleEntryLabel(entry map[string]interface{}) string {
 	return ""
 }
 
+// 用户插话在提示词里的两种标题：
+//
+//	interactiveOpinionHeaderFresh    本轮新收到的插话（第一次进上下文）
+//	interactiveOpinionHeaderCarried  此前已纳入过、这次是沿用（见 interactiveOpinion.alreadyApplied）
+//
+// 抽成常量是为了让用例能直接断言标题与具体内容成对出现 —— 写成内联字符串时，用例
+// 只能断言「插话原文还在」，改错文案（比如两句都写成「本轮用户插话」）也不会红。
+const (
+	interactiveOpinionHeaderFresh   = "本轮用户插话（必须纳入你的发言）："
+	interactiveOpinionHeaderCarried = "用户此前补充的意见（沿用，不要表述为用户重复强调，仍须在发言中体现）："
+)
+
 // interactiveBuildPrompt 拼出私发给设备的你的角色提示词：人设 + 本轮上下文
 // （话题/目标 + 前序发言 + 本轮用户插话 + 本轮要求）。设备端（CLI）把 role_prompt
 // 原样塞进 agent 提示词，所以插话与前序发言都是从这里进入 agent 的上下文
@@ -1010,13 +1023,34 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 	// opinions 已经过 interactiveVisibleOpinions 过滤：普通成员拿到的是本轮那些，
 	// 主持人还会额外拿到「归属下一轮」的那几条（收口阶段插话时，主持人正是本轮
 	// 最后一位发言者，它必须当场读进纪要）。对主持人而言它们同样是「本轮收到的
-	// 用户插话」，所以标签沿用「本轮」不需要分叉，模型也不会因此误判轮次。
+	// 用户插话」，所以标签沿用「本轮」不需要**按轮次**分叉，模型也不会因此误判轮次。
+	//
+	// 唯一要分叉的是「这条意见此前已经被用过」（opinion.alreadyApplied）：同一条
+	// R == N+1 的插话会进两次提示词 —— 第 N 轮收口的主持人读一次、第 N+1 轮再读
+	// 一次。两次都是「本轮用户插话（必须纳入你的发言）」时，模型会把用户这一句话
+	// 表述成「用户再次强调 / 反复要求」，观感像用户在刷屏。所以第二次起换一句
+	// 文案，把「沿用」说清楚，同时保留「仍须在发言中体现」的要求 —— 第 N+1 轮的
+	// 成员是第一次读到它，不能被一句「此前补充的」打发掉。
 	if len(opinions) > 0 {
-		lines := []string{"本轮用户插话（必须纳入你的发言）："}
+		fresh := make([]string, 0, len(opinions))
+		carried := make([]string, 0, len(opinions))
 		for _, opinion := range opinions {
-			lines = append(lines, "- "+opinion.content)
+			if opinion.alreadyApplied {
+				carried = append(carried, "- "+opinion.content)
+				continue
+			}
+			fresh = append(fresh, "- "+opinion.content)
 		}
-		core = append(core, strings.Join(lines, "\n"))
+		// 两段分开拼：同一轮里既可能有新插话、也可能有上一轮沿用下来的那条，
+		// 混在一句标题下就只能二选一。
+		if len(fresh) > 0 {
+			core = append(core, strings.Join(
+				append([]string{interactiveOpinionHeaderFresh}, fresh...), "\n"))
+		}
+		if len(carried) > 0 {
+			core = append(core, strings.Join(
+				append([]string{interactiveOpinionHeaderCarried}, carried...), "\n"))
+		}
 	}
 	coreText := strings.Join(core, "\n")
 	// 话题/目标/插话与本轮要求先占额度，剩下的才是前序发言的预算：宁可少给历史，
@@ -1201,6 +1235,15 @@ type interactiveOpinion struct {
 	messageUID string
 	content    string
 	round      int
+	// alreadyApplied 表示这条插话在**更早的轮次**已经落过摄入回执
+	// （interjection_applied），也就是此前真的有人把它读进过提示词。
+	//
+	// 提示词要按它分两句文案：同一条插话会被读两次（收口阶段 R=N+1 的插话，
+	// 主持人第 N 轮收口读一次、第 N+1 轮再读一次，见 interactiveVisibleOpinions），
+	// 两次都用「本轮用户插话（必须纳入…）」时模型会把同一句表述成「用户再次强调」，
+	// 观感像用户在刷屏。判据刻意取「是否已被用过」而不是「第几次读」：回执是幂等的
+	// 且只对真正注入的那几条落，所以「有回执」等价于「此前真的读到过」。
+	alreadyApplied bool
 }
 
 // interactiveStatement 是提示词上下文里的一条已发生发言（成员发言或主持纪要）。
@@ -1335,6 +1378,16 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 	opinions := []interactiveOpinion{}
 	contributionAt := map[string]int{}
 	summaryAt := map[int]int{}
+	// appliedRoundAt 记录「该 messageUid 的摄入回执（interjection_applied）落在第几轮」。
+	// 回执的 payload 只有 messageUid / targetRequestId / replacementRequestId（v3 契约
+	// 不允许多余字段），轮次只在 v3 信封里，所以这里顺带读一次 e.V3Envelope。
+	//
+	// 为什么要轮次而不只是「有没有回执」：同一条插话在一轮之内会先后注入给多个成员
+	// （R == N 时本轮人人都该读到），第一个成员消费完就落了回执（key 不含成员）。只看
+	// 「有没有回执」的话，同轮第二个成员就会被写成「沿用」，反而削弱了「必须纳入」。
+	// 只有**更早轮次**落下的回执才说明「这条意见此前真的被读过一轮」，也才是要换文案
+	// 的那一次。
+	appliedRoundAt := map[string]int{}
 	for _, e := range events {
 		var payload map[string]interface{}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
@@ -1358,6 +1411,20 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 			opinions = append(opinions, interactiveOpinion{
 				messageUID: uid, content: content, round: opinionRound,
 			})
+		case "interjection_applied":
+			// 「这条插话已经被注入过某人的提示词」的回执（见下方落回执的那段）。
+			// 只取 messageUid 与信封里的轮次，用来给更早轮次消费过的那几条换文案。
+			uid, _ := payload["messageUid"].(string)
+			if uid == "" {
+				continue
+			}
+			appliedRound := interactiveEnvelopeRound(e.V3Envelope)
+			if previous, ok := appliedRoundAt[uid]; ok && previous <= appliedRound {
+				// 同一条插话理论上只有一条回执（幂等 key 不含成员）；真出现多条时取
+				// 最早那次 —— 判断的是「第一次被用掉是哪一轮」。
+				continue
+			}
+			appliedRoundAt[uid] = appliedRound
 		case "contribution_completed":
 			round, _ := payload["round"].(float64)
 			content, _ := payload["content"].(string)
@@ -1406,7 +1473,46 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 			history.focus[int(round)] = focus
 		}
 	}
+	// 标记「此前已被用过」：回执落在**更早**的轮次才算（同轮第一个成员消费后落的回执
+	// 不能把同轮后面的成员降级成「沿用」，那会削弱「必须纳入」）。
+	//
+	// 信封缺失（appliedRound == 0，只有手工造事件流才会出现）按「已用过」处理：这条
+	// 插话确实进过某条提示词，宁可降一档文案，也不要让模型把同一句话再说一遍。
+	for i := range opinions {
+		appliedRound, ok := appliedRoundAt[opinions[i].messageUID]
+		if !ok {
+			continue
+		}
+		if appliedRound <= 0 || appliedRound < d.CurrentRound {
+			opinions[i].alreadyApplied = true
+		}
+	}
 	return opinions, history
+}
+
+// interactiveEnvelopeRound 从 v3 信封里取 round；取不到（信封缺失/字段缺失）返回 0。
+//
+// 摄入回执 payload 按契约只能有 messageUid / targetRequestId / replacementRequestId，
+// 轮次只在信封里 —— 所以判「这条意见是哪一轮被用掉的」必须读信封。
+func interactiveEnvelopeRound(envelope json.RawMessage) int {
+	if len(envelope) == 0 {
+		return 0
+	}
+	var fields struct {
+		Round interface{} `json:"round"`
+	}
+	if err := json.Unmarshal(envelope, &fields); err != nil {
+		return 0
+	}
+	switch value := fields.Round.(type) {
+	case float64:
+		return int(value)
+	case string:
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return 0
 }
 
 // interactiveVisibleOpinions 从「归属轮次 ∈ {本轮, 下一轮}」的候选插话里筛出
