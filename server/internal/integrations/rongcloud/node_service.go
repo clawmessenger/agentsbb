@@ -1741,13 +1741,17 @@ func LegacyDefaultPortraitURIs() []string {
 	return append([]string(nil), legacyDefaultPortraitURIs...)
 }
 
-// DefaultUserPortrait 返回统一默认头像 URL。CLAW_DEFAULT_PORTRAIT_URI 覆盖优先
+// DefaultUserPortrait 返回统一默认头像 URL。后台「系统配置 → 品牌图片」配过就以
+// 配过的为准（见 branding_override.go），其次 CLAW_DEFAULT_PORTRAIT_URI 覆盖
 // （自建域名 / CDN），否则用统一图源 DefaultUserPortraitURI。
 //
 // 这里刻意不再按 MULTICA_PUBLIC_URL 拼旧静态路径：线上只要设了它，就会继续把
 // 1.9 KB 的旧灰人形图推给融云。也不再有单独的 AI 节点头像 env —— 那会让
 // 「AI 一张图、真人另一张图」的漂移重开。
 func DefaultUserPortrait() string {
+	if override := CurrentBrandingOverrides().userPortrait(); override != "" {
+		return override
+	}
 	if v := strings.TrimSpace(os.Getenv("CLAW_DEFAULT_PORTRAIT_URI")); v != "" {
 		return v
 	}
