@@ -874,6 +874,18 @@ type ImContactGroupMember struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+// 联系人备注（本人私有标注，跨设备同步）。行不存在 = 没有备注；不与好友关系/节点生命周期绑定。
+type ImContactRemark struct {
+	// 做备注的人：claw_im_users.user_id（融云 userId），与 clawRequireClawUser 返回值同源。
+	OwnerUserID string `json:"owner_user_id"`
+	// 被备注的人或智能体：融云 userId。web 取 device.sn / friend.userId，移动端取 device.rongcloud_id / user.userId。
+	TargetUserID string `json:"target_user_id"`
+	// 已 trim 的备注文本，长度按字符计 1..32。32 个中文（96 字节）合法。
+	Remark    string             `json:"remark"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 // 融云会话号映射：target_id（对方融云 id / 群号）+ conversation_type → conversation_id。
 type ImConversation struct {
 	ID               int64  `json:"id"`
