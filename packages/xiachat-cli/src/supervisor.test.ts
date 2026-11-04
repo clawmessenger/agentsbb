@@ -537,6 +537,36 @@ describe("device exe upgrade", () => {
     expect(h.spawned[0].child.kills).toEqual([]);
   });
 
+  // installDir 上报（设备详情字段扩展）：每轮 10s 轮询与升级回传都要带上本进程
+  // exe 所在目录。断言用真实的 path.dirname(process.execPath) —— 值本身取自测试
+  // 进程，与 vitest 的运行位置无关；服务端按「空值保留旧值」upsert，这里钉住的
+  // 是「CLI 有值时必须报」，漏报会让后台详情页的安装目录一直显示「-」。
+  it("reports installDir with every control poll and every upgrade report", async () => {
+    const { h } = upgradeHarness({ upgradeIdleMs: 600_000 });
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+    vi.useFakeTimers();
+    const report = vi.spyOn(h.api, "reportDeviceUpgrade").mockResolvedValue(undefined);
+    const control = vi.mocked(h.api.fetchDeviceControl);
+    control.mockResolvedValue({
+      agents: [{ agent: "ops", nodeId: "node_ops", desiredState: "running", version: 0 }],
+      upgrade: intent(),
+    });
+
+    await realSleep(CONTROL_TICK_MS * 4);
+
+    const expectedDir = dirname(process.execPath);
+    const polled = control.mock.calls.map((call) => call[3]);
+    expect(polled.length).toBeGreaterThan(0);
+    for (const payload of polled) {
+      expect(payload.installDir).toBe(expectedDir);
+    }
+    const reported = report.mock.calls.map((call) => call[3]);
+    expect(reported.length).toBeGreaterThan(0);
+    for (const payload of reported) {
+      expect(payload.installDir).toBe(expectedDir);
+    }
+  });
+
   it("downloads, verifies, swaps in place and asks for a relaunch when forced", async () => {
     const { h, relaunched } = upgradeHarness({
       upgradeIdleMs: 600_000,

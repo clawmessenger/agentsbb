@@ -301,7 +301,7 @@ export class XiachatApi {
     nodeId: string,
     credentialId: string,
     secret: string,
-    report?: { version?: string; platform?: string; hostname?: string },
+    report?: { version?: string; platform?: string; hostname?: string; installDir?: string },
   ): Promise<DeviceControlSnapshot> {
     const raw = await this.request<{
       data?: { ownerUserId?: string; agents?: AgentControlState[]; upgrade?: DeviceUpgradeIntent };
@@ -315,6 +315,7 @@ export class XiachatApi {
         ...(report?.version ? { version: report.version } : {}),
         ...(report?.platform ? { platform: report.platform } : {}),
         ...(report?.hostname ? { hostname: report.hostname } : {}),
+        ...(report?.installDir ? { installDir: report.installDir } : {}),
       },
     );
     const agents = raw.data?.agents;
@@ -333,6 +334,10 @@ export class XiachatApi {
   // 回传升级进度（阶段跃迁时调用，不是按百分比刷）。服务端按代次防抖：代次对不上
   // 的回报会被 409 丢掉，这里把它当成功返回 —— 设备对「这条回传过期了」没有可
   // 采取的动作，下一轮轮询自然会拿到新代次。
+  //
+  // reported* 四个字段是设备的环境事实（版本/平台/主机名/安装目录），与进度无关，
+  // 但顺同一条请求带过去：服务端对它们走「空值保留旧值」的 upsert，老 CLI 少报
+  // 任何一个都不会擦掉已上报的值。
   async reportDeviceUpgrade(
     nodeId: string,
     credentialId: string,
@@ -345,6 +350,7 @@ export class XiachatApi {
       reportedVersion?: string;
       reportedPlatform?: string;
       reportedHostname?: string;
+      installDir?: string;
     },
   ): Promise<void> {
     try {
@@ -359,6 +365,7 @@ export class XiachatApi {
         ...(report.reportedVersion ? { reportedVersion: report.reportedVersion } : {}),
         ...(report.reportedPlatform ? { reportedPlatform: report.reportedPlatform } : {}),
         ...(report.reportedHostname ? { reportedHostname: report.reportedHostname } : {}),
+        ...(report.installDir ? { installDir: report.installDir } : {}),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

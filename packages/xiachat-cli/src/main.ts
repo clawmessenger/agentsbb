@@ -1808,6 +1808,10 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   const devicePlatform = supervisor.platform ?? process.platform;
   const deviceArch = supervisor.arch ?? process.arch;
   const platformTag = `${devicePlatform}-${deviceArch}`;
+  // CLI 安装目录（exe 所在文件夹）：后台详情页/C 端面板据此给出「去哪个目录找
+  // 日志/换 exe」的指引。启动时算一次 —— self-update 只交换文件不换目录，运行期
+  // 不变。SEA 单文件下 process.execPath 即 exe 自身绝对路径。
+  const installDir = path.dirname(process.execPath);
   // 能不能升级，取决于发布矩阵里有没有这个平台的产物 —— 与资产名映射同源，
   // 与服务端的 clawUpgradeAssetForPlatform 也必须一致。平台未知/未构建的组合
   // 仍然拒绝：收下了也只会去下一个不存在的资产（404）。
@@ -1912,6 +1916,8 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         reportedVersion: currentVersion,
         reportedPlatform: platformTag,
         reportedHostname: os.hostname(),
+        // 目录与版本/主机名一样是环境事实，顺同一条回传上报；老服务端忽略。
+        installDir,
         ...(extra?.errorCode ? { errorCode: extra.errorCode } : {}),
         ...(extra?.errorDetail ? { errorDetail: extra.errorDetail.slice(0, 800) } : {}),
       });
@@ -2126,6 +2132,8 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         // 后台「机器名称」在机器昵称为空时用它兜底。同一次 10 秒轮询顺带上报，
         // 不额外开通道；老服务端会忽略这个字段。
         hostname: os.hostname(),
+        // 安装目录同理：详情页据此给精确到路径的排查指引，老服务端忽略。
+        installDir,
       });
       // 权限快照：先落盘，再收敛启停 —— 闸门依赖它，落盘失败只记日志（最坏
       // 结果是沿用上一份，不能因为写不了文件就把轮询判失败）。

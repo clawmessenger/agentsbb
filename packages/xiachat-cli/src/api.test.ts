@@ -168,6 +168,70 @@ describe("XiachatApi", () => {
       server.close();
     }
   });
+
+  // installDir（设备详情字段扩展）：与 hostname 同款的可选展开 —— 带了就进请求体，
+  // 没带就不落字段。两条上报通道（10s 轮询 + 升级回传）都要覆盖，漏任何一条
+  // 后台详情页的安装目录都会一直显示「-」。
+  it("fetchDeviceControl sends installDir when provided and omits it when not", async () => {
+    const { server, url, captured } = await startJsonServer({
+      "POST /api/claw/device/control": { status: 200, body: { code: 200, data: { agents: [] } } },
+    });
+    try {
+      const api = new XiachatApi(url);
+      await api.fetchDeviceControl("node_1", "dc_1", "s3cret", {
+        version: "1.3.19",
+        platform: "win32-x64",
+        hostname: "HOST-A",
+        installDir: "C:\\Users\\ops\\.clawmessenger\\bin",
+      });
+      expect(captured["POST /api/claw/device/control"]).toMatchObject({
+        nodeId: "node_1",
+        credentialId: "dc_1",
+        secret: "s3cret",
+        version: "1.3.19",
+        platform: "win32-x64",
+        hostname: "HOST-A",
+        installDir: "C:\\Users\\ops\\.clawmessenger\\bin",
+      });
+
+      await api.fetchDeviceControl("node_1", "dc_1", "s3cret", { version: "1.3.19" });
+      expect(captured["POST /api/claw/device/control"]).not.toHaveProperty("installDir");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("reportDeviceUpgrade sends installDir when provided and omits it when not", async () => {
+    const { server, url, captured } = await startJsonServer({
+      "POST /api/claw/device/upgrade/report": { status: 200, body: { code: 200, data: { applied: true } } },
+    });
+    try {
+      const api = new XiachatApi(url);
+      await api.reportDeviceUpgrade("node_1", "dc_1", "s3cret", {
+        generation: 7,
+        status: "succeeded",
+        reportedVersion: "1.3.19",
+        reportedPlatform: "win32-x64",
+        reportedHostname: "HOST-A",
+        installDir: "/home/ops/.local/bin",
+      });
+      expect(captured["POST /api/claw/device/upgrade/report"]).toMatchObject({
+        nodeId: "node_1",
+        generation: 7,
+        status: "succeeded",
+        reportedVersion: "1.3.19",
+        installDir: "/home/ops/.local/bin",
+      });
+
+      await api.reportDeviceUpgrade("node_1", "dc_1", "s3cret", {
+        generation: 7,
+        status: "succeeded",
+      });
+      expect(captured["POST /api/claw/device/upgrade/report"]).not.toHaveProperty("installDir");
+    } finally {
+      server.close();
+    }
+  });
 });
 
 interface CapturedServer {
