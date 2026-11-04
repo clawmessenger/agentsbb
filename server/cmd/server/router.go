@@ -1278,6 +1278,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// 的 sqlc 查询（新表 / 新列），所以直接给集成层一个 DBTX；
 				// *pgxpool.Pool 满足 db.DBTX。为 nil 时这三个 service 回 503。
 				DB: pool,
+				// ASR 语音转写闸门：融云命令通道 ai/recognizeVoice 的唯一服务端
+				// 入口（Web sendSystemRequest 与小程序 aiService.recognizeVoice
+				// 同源）。实时读 asr 配置行（loadAsrConfig fail-closed），关闭时
+				// 回 4501 asr_disabled；开启时零改动放行。
+				AsrVoiceGate: h.AsrGate,
 			})
 
 			// Phase 2a: construct service-layer dependencies.

@@ -189,6 +189,11 @@ func (h *Handler) asrGate(ctx context.Context) error {
 	return nil
 }
 
+// AsrGate 是 asrGate 的导出形态：cmd/server 装配融云命令通道的语音转写闸门
+// （rongcloud.ChannelDeps.AsrVoiceGate）时跨包取用。语义与 asrGate 完全一致
+// ——内部路径继续用小写，导出仅为装配点服务。
+func (h *Handler) AsrGate(ctx context.Context) error { return h.asrGate(ctx) }
+
 // asrAdminData 把配置转成管理端回包形态：sk 脱敏、ask 明文、其余原样。
 // 三个出参接口（能力声明除外）统一走这里，脱敏不可能被绕过。
 func asrAdminData(cfg asrConfig) map[string]interface{} {

@@ -44,6 +44,12 @@ type ChannelDeps struct {
 	// 查询（新表 / 新列），因此直接在集成层用参数化 SQL 走 DBTX。
 	// Nil 时三个 store 保持 nil，对应 service 回 503 而不是 panic。
 	DB db.DBTX
+	// AsrVoiceGate 是语音转写路径（ai/recognizeVoice）的开关闸门，HTTP 侧
+	// 实时读 rongcloud_system_config 的 config_key='asr' 行（fail-closed：
+	// 行不存在/损坏/读取失败一律按关闭）。返回 nil 放行，返回任意 error 拒绝
+	// （回 4501 asr_disabled，见 asr_voice_gate.go）。Nil 表示未装配 = 不设闸
+	// （行为与闸门引入前完全一致）。
+	AsrVoiceGate func(ctx context.Context) error
 }
 
 func RegisterRongCloud(reg *channel.Registry, deps ChannelDeps) {
@@ -102,6 +108,8 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 		// 没配 DB 时三者保持 nil，对应 service 回 503 —— 与 group/discussion
 		// 「未装配即降级」的语义一致。
 		systemHandler := newSystemHandler(client, creds.SystemNodeID, logger, deps.Queries, deps.Registry, deps.NodeRequests, deps.GroupMirror, discussionRuntime, relayHub)
+		// ASR 语音转写闸门（ai/recognizeVoice）：nil = 未装配不设闸。
+		systemHandler.voiceGate = deps.AsrVoiceGate
 		if deps.DB != nil {
 			systemHandler.lobsterStore = NewLobsterStore(deps.DB)
 			systemHandler.friendStore = NewFriendStore(deps.DB, client, logger)

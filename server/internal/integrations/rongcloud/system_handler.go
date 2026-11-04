@@ -26,6 +26,13 @@ type systemHandler struct {
 	discussionRuntime *discussionRuntime
 	// relayHub 仲裁讨论组闲聊的按序发言（chatroom_relay.go）。
 	relayHub *chatroomRelayHub
+	// voiceGate 是 service=ai 语音转写路径（ai/recognizeVoice）的 ASR 闸门，
+	// 由 registration.go 按 ChannelDeps.AsrVoiceGate 注入（HTTP 侧实时读
+	// rongcloud_system_config 的 config_key='asr' 行，fail-closed）。nil 表示
+	// 该部署未装配 = 不设闸（行为与历史完全一致）；非 nil 时返回任意 error
+	// 一律按「关闭」拒绝 —— 闸门实现只有两种返回：nil（开启放行）或哨兵
+	// 错误（关闭 / 读取失败按关闭处理）。
+	voiceGate func(ctx context.Context) error
 	// lobsterStore / friendStore / userStore 是 service=lobster / friend / user
 	// 的本地表读写（见 lobster_command.go / friend_command.go / user_command.go）。
 	// 由 registration.go 按 ChannelDeps.DB 装配；nil 表示该能力未启用（回 503，
@@ -338,6 +345,17 @@ func (h *systemHandler) commitResult(ctx context.Context, msg NormalizedMessage,
 }
 
 func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
+	// 语音转写闸门（ai/recognizeVoice）：后台开关关闭时以 4501 asr_disabled
+	// 明确拒绝，禁止 500、禁止静默成功（设计文档 3.1）。闸门在一切业务分支
+	// （含 queries 未装配的 503）之前生效 ——「关闭 = 没有这个功能」的语义
+	// 优先于基础设施降级。getNodes 等节点管理动作不依赖 ASR，不受开关影响。
+	// nil 闸门 = 未装配 = 与历史行为一致（本 if 不触发）。
+	if cmd.Action == "recognizeVoice" && h.voiceGate != nil {
+		if err := h.voiceGate(ctx); err != nil {
+			return h.replyErr(ctx, msg, cmd, AsrDisabledCommandCode, AsrDisabledCommandMessage)
+		}
+	}
+
 	if h.queries == nil {
 		return h.sendError(ctx, msg, cmd.RequestID, "database not available")
 	}
