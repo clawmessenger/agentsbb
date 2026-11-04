@@ -49,6 +49,10 @@ type discussionRuntime struct {
 	// quota 是用户级创建配额（讨论组/群聊/聊天室三入口统一硬校验）。
 	// nil 时放行（未装配数据库的部署不引入新失败面）。
 	quota *quota.Service
+	// recommendGate 保证同一 discussion 同时只有一批角色推荐在跑：
+	// 一次推荐 = 设备端一整轮 LLM，叠加派发只会多排一轮、更慢，角色还可能翻倍。
+	// 零值可用，见 discussion_roundtable_recommend_gate.go。
+	recommendGate setupRecommendGate
 }
 
 // DiscussionSystemHostConfig 是管理端 system_host 配置的运行时视图（P4）。
@@ -884,13 +888,22 @@ func (rt *discussionRuntime) actionFinish(ctx context.Context, cmd CommandConten
 // actionGetSystemHostStatus 对齐 Python：system_host 未配置时 reason=
 // SYSTEM_HOST_NOT_CONFIGURED（code 200, data 里带空 display_name/avatar）。
 // Go 侧存储在 rongcloud_system_config 的 config_key='system_host' 行。
+//
+// timeout_seconds 也在这里下发，**只读**：C 端只用它算「一次节点请求多久没回
+// 算可疑」的本地窗口（web 侧 recommendWaitTimeoutMs = timeout + 5s），与
+// discussion_roundtable_setup.go 里 `context.WithTimeout(timeout+5s)` 同口径。
+// 它是管理端配置，任何 C 端写路径都不认这个字段（改它只能走管理端接口）。
+// 不下发的话前端只能拍一个固定值：运维把超时配到 120s 以上时，前端会先于服务端
+// 判死并诱导用户「重试」—— 一次多余的完整设备端 LLM 回合。未配置时回 0，
+// 由前端按默认值兜底。
 func (rt *discussionRuntime) actionGetSystemHostStatus(ctx context.Context) commandResult {
 	if rt.systemHostLoader != nil {
 		if cfg, found, err := rt.systemHostLoader(ctx); err == nil && found {
 			data := map[string]interface{}{
-				"display_name": cfg.DisplayName,
-				"avatar":       cfg.Avatar,
-				"reason":       nil,
+				"display_name":    cfg.DisplayName,
+				"avatar":          cfg.Avatar,
+				"reason":          nil,
+				"timeout_seconds": cfg.TimeoutSeconds,
 			}
 			if cfg.NodeID == "" {
 				data["reason"] = "SYSTEM_HOST_NOT_CONFIGURED"
@@ -900,6 +913,7 @@ func (rt *discussionRuntime) actionGetSystemHostStatus(ctx context.Context) comm
 	}
 	return okResult(map[string]interface{}{
 		"display_name": "", "avatar": "", "reason": "SYSTEM_HOST_NOT_CONFIGURED",
+		"timeout_seconds": 0,
 	})
 }
 

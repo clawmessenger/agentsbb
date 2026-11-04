@@ -97,7 +97,8 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 	}
 	timeout := host.timeoutSeconds
 	if timeout <= 0 {
-		timeout = 60
+		// 与 setup 链路同一口径（见 recommendRolesFallbackTimeoutSeconds）。
+		timeout = recommendRolesFallbackTimeoutSeconds
 	}
 	bctx, cancel := context.WithTimeout(ctx, time.Duration(timeout+5)*time.Second)
 	defer cancel()
@@ -108,6 +109,9 @@ func (rt *discussionRuntime) actionRecommendRoles(ctx context.Context, cmd Comma
 		RecommendationPrompt: rt.roundtable.recommendationPrompt(ctx),
 		TimeoutSeconds:       timeout,
 		ConfigVersion:        configVersionInt(host.configVersion),
+		// 推荐这一轮用主持配的模型，而不是节点默认：短任务上旗舰模型与快模型
+		// 差一个数量级，设备端每轮还要付一次冷启动，两个都省下来才看得见。
+		Model: host.model,
 	}, topic, goal, maxRoles, style)
 	if code != "" {
 		return errResult(503, code)

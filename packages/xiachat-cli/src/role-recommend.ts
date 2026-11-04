@@ -21,19 +21,39 @@ export const ROLE_RECOMMEND_PROTOCOL_VERSION = "v1";
 
 export const ROLE_RECOMMEND_MAX_ROLES = 8;
 export const ROLE_RECOMMEND_MAX_NAME = 80;
+/** 本地**拒收**闸门：role_prompt 超过这个长度就判定模型答非所问。
+ *
+ * 故意远大于产品口径（`ROLE_RECOMMEND_ROLE_PROMPT_CHARS` = 120 字）：它挡的是
+ * 「模型把整篇分析当 role_prompt 塞回来」这类明显跑偏的应答，不是产品要求的
+ * 产出尺寸。把这个值压到 120 会把模型正常的长回答判成错误回复，失败率反而升
+ * 高 —— 产出尺寸只写在提示词里，校验闸门保持宽松。
+ */
 export const ROLE_RECOMMEND_MAX_PROMPT = 8000;
+/** 产品口径：一轮推荐要几个角色（服务端下发的 max_roles 更小时以它为准）。 */
+export const ROLE_RECOMMEND_TARGET_ROLES = 3;
+/** 产品口径：每个 role_prompt 的字数上限（中文按字数算，标点也算一个字）。
+ *
+ * 只出现在提示词里，**不参与**本地校验（见 ROLE_RECOMMEND_MAX_PROMPT）。
+ * 为什么钉这么短：role_prompt 是每轮发言都注入给 agent 的人设，一段人设越长，
+ * 设备端一次完整 LLM 回合就越慢，讨论组「推荐角色」等十几秒到 100s+ 的主因之一
+ * 就是产出量太大。
+ */
+export const ROLE_RECOMMEND_ROLE_PROMPT_CHARS = 120;
 
 /**
- * 人设目标长度（写进提示词，不是校验上限）。
+ * 本轮实际要几个角色：产品口径 3 个，服务端下发的 max_roles 更小时按 max_roles
+ * （一个 agent 只能演一个角色，候选设备不够时多要的角色没人演）。
  *
- * 推荐的全部输出就是这份 JSON：角色数 × 每个人设的字数 = 生成时间。设备端实测
- * 「<= 8000 字符」这种不设上限的写法会让模型给每个角色写三五百字，单轮 12s 起步，
- * 叠加排队后用户等过 100s。一句话（40 字）把输出压到原来的 1/8，实测落在 3-6s。
- *
- * 校验上限仍留 ROLE_RECOMMEND_MAX_PROMPT：模型偶尔不听话写长了，截断会毁掉
- * 语义，宁可整份收下让用户在界面上看到原文。
+ * max_roles **缺失**时调用方已在 parseRoleRecommendRequest 里回落到 3；而 max_roles
+ * **非法**（非整数、越界）不是回落 —— 那条命令在 parseRoleRecommendRequest 里整条
+ * 拒收，根本走不到这里。函数里的 !Number.isFinite 分支只是给导出的公共函数兜底
+ * （直接传 NaN/Infinity 时不至于算出 NaN 个角色）。
  */
-export const ROLE_RECOMMEND_PROMPT_TARGET_CHARS = 40;
+export function roleRecommendTargetRoleCount(maxRoles: number): number {
+  if (!Number.isFinite(maxRoles)) return ROLE_RECOMMEND_TARGET_ROLES;
+  const bounded = Math.min(ROLE_RECOMMEND_MAX_ROLES, Math.max(1, Math.trunc(maxRoles)));
+  return Math.min(ROLE_RECOMMEND_TARGET_ROLES, bounded);
+}
 
 // ---- 讨论风格 --------------------------------------------------------------
 //
@@ -185,9 +205,13 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
  * 风格段落：把该风格的角色骨架与发言口吻要求写进提示词。角色骨架保证「换个风格
  * 就换一批角色」，口吻要求保证「换个风格就换一种说话方式」（它最终落在
  * role_prompt 里，而 role_prompt 就是每轮发言时注入给 agent 的人设）。
+ *
+ * `targetRoles` 是**本轮实际要的角色数**（已经过 roleRecommendTargetRoleCount 夹逼），
+ * 不是服务端下发的 max_roles：两处用不同的数字会让提示词自相矛盾 ——
+ * 「Use exactly these role_name values」列了 4 个，下面又写「Return exactly 3 roles」。
  */
-function buildStyleSection(profile: StyleProfile, maxRoles: number): string[] {
-  const names = profile.roleNames.slice(0, maxRoles);
+function buildStyleSection(profile: StyleProfile, targetRoles: number): string[] {
+  const names = profile.roleNames.slice(0, targetRoles);
   const lines = [
     `Discussion style: ${profile.label}.`,
     "This style has its own cast. Do not fall back on a generic set of roles — a different style must produce different role names.",
@@ -195,7 +219,7 @@ function buildStyleSection(profile: StyleProfile, maxRoles: number): string[] {
     "Use exactly these role_name values, in this order:",
     ...names.map((name, index) => `${index + 1}. ${name}`),
   ];
-  const spare = maxRoles - names.length;
+  const spare = targetRoles - names.length;
   if (spare > 0) {
     lines.push(
       `This round wants ${spare} more participant(s) than the list provides: add up to ${spare} role(s) in the same spirit, and never reuse a name already listed.`,
@@ -203,7 +227,7 @@ function buildStyleSection(profile: StyleProfile, maxRoles: number): string[] {
   }
   lines.push(
     "",
-    `Fold this style's speaking voice into each role_prompt's ONE sentence (do not paste the voice text verbatim, and do not add a second sentence for it):`,
+    `Fold this style's speaking voice into each role_prompt's single continuous paragraph (do not paste the voice text verbatim, and do not add a separate sentence for it):`,
     profile.voice,
     "role_prompt is handed to that participant verbatim when it speaks, so the voice has to live there — it is what keeps two different styles from sounding alike.",
   );
@@ -229,25 +253,26 @@ export function buildRoleRecommendPrompt(request: RoleRecommendRequest): string 
   if (request.goal.trim()) {
     lines.push(`Goal: ${request.goal.trim()}`);
   }
+  // 本轮实际要几个角色：产品口径 3 个与 max_roles 取小（见 roleRecommendTargetRoleCount）。
+  const targetRoles = roleRecommendTargetRoleCount(request.maxRoles);
   const style = detectDiscussionStyle(request.style, request.goal);
   if (style !== null) {
-    lines.push("", ...buildStyleSection(STYLE_PROFILES[style], request.maxRoles));
+    lines.push("", ...buildStyleSection(STYLE_PROFILES[style], targetRoles));
   }
   lines.push(
-    `Return between 1 and ${request.maxRoles} roles.`,
+    `Return exactly ${targetRoles} role${targetRoles === 1 ? "" : "s"}.`,
     "",
     "Reply with ONLY a JSON object, no prose and no markdown fence:",
     '{"roles":[{"role_name":"...","role_prompt":"...","speaking_order":0}]}',
     "",
+    // 名字与正文都直接等于输出 token，长度就是生成时间（HEAD 侧曾把人设钉成
+    // 一句话 40 字，后按线上实测并入 hotfix 的 120 字段落口径 —— 见
+    // ROLE_RECOMMEND_ROLE_PROMPT_CHARS 的注释；名字上限两侧各自收紧，取更严者）。
     "- role_name: a short distinct label (<= 20 characters)",
-    // 人设固定为「一句话」，不再让模型自由发挥成长篇：
-    //   · 速度：这段 JSON 是**全部输出**，人设长度直接等于生成时间。过去只写
-    //     「<= 8000 字符」，模型于是每个角色写三五百字，5 个角色就是上千 token，
-    //     设备端实测单轮 12-84s（含排队），用户等不到就重试，请求进一步堆叠；
-    //   · 一致性：一句话已经足够定调，用户侧也不再提供编辑（见 C 端引导卡），
-    //     长篇人设既改不了也用不上。
-    `- role_prompt: ONE sentence, <= ${ROLE_RECOMMEND_PROMPT_TARGET_CHARS} characters: who this role is and how it speaks. No lists, no headings, no examples, no restating the topic.`,
+    `- role_prompt: ONE continuous paragraph of a natural persona, at most ${ROLE_RECOMMEND_ROLE_PROMPT_CHARS} Chinese characters (中文按字数算，标点也算一个字). 不写小标题、不分点、不举例、不换行 —— 就一段话，说清这个角色是谁、关心什么、发言时怎么做。`,
     "- speaking_order: 0-based, and across the roles exactly 0,1,2,… with no gaps or repeats",
+    "",
+    `Keep role_prompt at or under ${ROLE_RECOMMEND_ROLE_PROMPT_CHARS} characters on purpose: it is injected into that participant's context on every speaking turn, so a long one slows the whole roundtable down. 一段话写清人设即可，不要为了显得完整而展开。`,
   );
   return lines.join("\n");
 }

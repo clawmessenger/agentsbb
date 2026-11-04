@@ -54,6 +54,9 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 	// 在自己发的消息里不该被自己关掉的开关挡住，与设备端私聊的 owner 口径一致。
 	perms := h.rt.agentPermissions(ctx, relayMemberIDs(speakers))
 	// 定向选择 + 权限过滤 + 回退全员与聊天室共用同一个实现。
+	// resolveRelayDispatch 内部同时完成 filterMembersByPermission（hotfix 的
+	// sceneGroup 权限闸门 + 主人豁免）与 applyBehaviorPrompts（行为准则注入），
+	// 并在定向目标被筛空时回退全员（mentionFallback=true）。
 	speakers, mentionFallback := resolveRelayDispatch(
 		speakers, mentions, mentionAll, text, perms, sceneGroup, requesterRCID,
 	)

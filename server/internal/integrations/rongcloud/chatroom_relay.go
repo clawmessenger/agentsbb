@@ -383,7 +383,9 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	// 他自己关掉的开关不该挡住他自己的 agent（与设备端私聊的 reason:"owner" 同口径）。
 	//
 	// 定向选择 + 权限过滤 + 回退全员只有这一个实现，群聊路径共用（见
-	// resolveRelayDispatch）。
+	// resolveRelayDispatch）。resolveRelayDispatch 内部对 full/targeted/fallback
+	// 三条路径都套了 filterMembersByPermission + applyBehaviorPrompts，hotfix 侧的
+	// 权限闸门与行为准则注入语义在此完整保留。
 	members, mentionFallback := resolveRelayDispatch(
 		allMembers, mentions, mentionAll, text, perms, scene, requesterRCID,
 	)

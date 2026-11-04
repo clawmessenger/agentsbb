@@ -3,6 +3,7 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -178,7 +179,7 @@ func TestNodeRequestBrokerOmitsAssignmentForAdminPreview(t *testing.T) {
 
 func TestMapNodeError(t *testing.T) {
 	for _, value := range []interface{}{"timeout", "TIMEOUT", " model_timeout ", "role_recommendation_timeout"} {
-		if got := mapNodeError(value); got != NodeRequestCodeRecommendTimeout {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendTimeout {
 			t.Errorf("mapNodeError(%v) = %q, want timeout", value, got)
 		}
 	}
@@ -190,12 +191,36 @@ func TestMapNodeError(t *testing.T) {
 		"Agent turn timeout after 600000ms",
 		"request timed out",
 	} {
-		if got := mapNodeError(value); got != NodeRequestCodeRecommendTimeout {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendTimeout {
 			t.Errorf("mapNodeError(%q) = %q, want timeout", value, got)
 		}
 	}
+	// 设备端自证 reason=empty-output：模型这一轮什么都没产出。它不该和「格式
+	// 不对」共用 INVALID —— 处置动作是换主持模型，不是点重试。
+	for _, detail := range []interface{}{
+		map[string]interface{}{"reason": "empty-output", "sample": ""},
+		map[string]interface{}{"reason": " empty-output "},
+	} {
+		got := mapNodeError("role recommendation invalid", detail)
+		if got != NodeRequestCodeRecommendEmpty {
+			t.Errorf("mapNodeError(empty-output, %v) = %q, want empty", detail, got)
+		}
+	}
+	// 其它 reason（no-json / speaking-order-not-permutation …）仍然是 INVALID：
+	// 那些重试一次很可能就好了。
+	for _, detail := range []interface{}{
+		map[string]interface{}{"reason": "no-json", "sample": "我无法完成"},
+		map[string]interface{}{"reason": "speaking-order-not-permutation"},
+		map[string]interface{}{"reason": 42},
+		"not-an-object",
+		nil,
+	} {
+		if got := mapNodeError("role recommendation invalid", detail); got != NodeRequestCodeRecommendInvalid {
+			t.Errorf("mapNodeError(%v) = %q, want invalid", detail, got)
+		}
+	}
 	for _, value := range []interface{}{nil, "boom", 42, "agent turn failed"} {
-		if got := mapNodeError(value); got != NodeRequestCodeRecommendInvalid {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendInvalid {
 			t.Errorf("mapNodeError(%v) = %q, want invalid", value, got)
 		}
 	}
@@ -208,6 +233,7 @@ func TestSetupRecommendFailureMessage(t *testing.T) {
 	cases := map[string]string{
 		"ROLE_RECOMMENDATION_TIMEOUT": "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试",
 		"ROLE_RECOMMENDATION_INVALID": "主持设备返回的推荐结果无法解析，请重试",
+		"ROLE_RECOMMENDATION_EMPTY":   "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试",
 		"SYSTEM_HOST_OFFLINE":         "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行",
 		"NO_ELIGIBLE_USER_DEVICES":    "没有可用于讨论的在线设备",
 		"WHATEVER_ELSE":               "角色推荐失败，请重试",
@@ -368,6 +394,94 @@ func TestNodeRequestBrokerErrorAnswer(t *testing.T) {
 	}
 }
 
+// 设备端自证（payload.detail）只进日志：错误码分类一个字都不能跟着变。
+func TestNodeRequestBrokerLogsNodeErrorDetail(t *testing.T) {
+	newBroker := func() (*NodeRequestBroker, *strings.Builder) {
+		var buf strings.Builder
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		broker := NewNodeRequestBroker(logger)
+		broker.BindSender(func(_ context.Context, _ string, _ string) error { return nil })
+		return broker, &buf
+	}
+	start := func(t *testing.T, broker *NodeRequestBroker) string {
+		t.Helper()
+		requestID, code := broker.StartRecommendation(
+			context.Background(),
+			NodeRequestHost{AIUserID: "rc_node_host", TimeoutSeconds: 30},
+			"AI 与就业", "", 3, "",
+		)
+		if code != "" {
+			t.Fatalf("start failed: %s", code)
+		}
+		return requestID
+	}
+
+	t.Run("records the reason and sample from a new device", func(t *testing.T) {
+		broker, logs := newBroker()
+		requestID := start(t, broker)
+		answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"kind":"error",` +
+			`"error":"role recommendation invalid",` +
+			`"detail":{"reason":"speaking-order-not-permutation","sample":"{\"roles\":[{\"speaking_order\":0}]}"}}}`
+		if !broker.AcceptResponse("rc_node_host", answer) {
+			t.Fatal("AcceptResponse must claim the answer")
+		}
+		if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendInvalid {
+			t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendInvalid)
+		}
+		logged := logs.String()
+		if !strings.Contains(logged, "node reported an error") {
+			t.Fatalf("error branch not logged: %s", logged)
+		}
+		if !strings.Contains(logged, "speaking-order-not-permutation") {
+			t.Fatalf("detail missing from the log line: %s", logged)
+		}
+		if !strings.Contains(logged, "roles") {
+			t.Fatalf("sample missing from the log line: %s", logged)
+		}
+	})
+
+	t.Run("keeps the timeout classification when detail is present", func(t *testing.T) {
+		broker, logs := newBroker()
+		requestID := start(t, broker)
+		answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"kind":"error",` +
+			`"error":"agent turn timeout after 300000ms","detail":{"reason":"no-json","sample":"..."}}}`
+		broker.AcceptResponse("rc_node_host", answer)
+		if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendTimeout {
+			t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendTimeout)
+		}
+		if !strings.Contains(logs.String(), "no-json") {
+			t.Fatalf("detail missing from the log line: %s", logs.String())
+		}
+	})
+
+	t.Run("an old device without detail still logs the plain error", func(t *testing.T) {
+		broker, logs := newBroker()
+		requestID := start(t, broker)
+		broker.AcceptResponse("rc_node_host", `{"request_id":"`+requestID+`","msg_type":"command_result",`+
+			`"payload":{"kind":"error","error":"role recommendation invalid"}}`)
+		if _, code := broker.AwaitRecommendation(context.Background(), requestID); code != NodeRequestCodeRecommendInvalid {
+			t.Fatalf("got %q, want %q", code, NodeRequestCodeRecommendInvalid)
+		}
+		if !strings.Contains(logs.String(), "role recommendation invalid") {
+			t.Fatalf("error text missing from the log line: %s", logs.String())
+		}
+	})
+}
+
+func TestNodeErrorDetail(t *testing.T) {
+	if got := nodeErrorDetail(nil); got != "" {
+		t.Fatalf("a missing detail must be empty, got %q", got)
+	}
+	got := nodeErrorDetail(map[string]interface{}{"reason": "no-json", "sample": "x"})
+	if !strings.Contains(got, `"reason":"no-json"`) || !strings.Contains(got, `"sample":"x"`) {
+		t.Fatalf("detail not serialised: %s", got)
+	}
+	long := nodeErrorDetail(map[string]interface{}{"sample": strings.Repeat("角", nodeErrorDetailMaxChars+50)})
+	if runes := []rune(long); len(runes) > nodeErrorDetailMaxChars+1 {
+		t.Fatalf("detail not truncated: %d runes", len(runes))
+	}
+}
+
 func TestNodeRequestBrokerIgnoresForeignMessages(t *testing.T) {
 	broker, _, _ := startBroker(t)
 
@@ -478,5 +592,53 @@ func TestNodeRequestBrokerOmitsEmptyStyle(t *testing.T) {
 	}
 	if envelope.Params["topic"] != "t" {
 		t.Fatalf("the rest of the envelope must be unchanged: %#v", envelope.Params)
+	}
+}
+
+// 推荐用哪个模型是它快慢的主要杠杆：同一条「3 段人设 + 一层 JSON」的短任务，
+// 旗舰模型二十几秒、快模型 2-3 秒。所以只验两件事 —— 配了就必须下发（顺带去掉
+// 手填带进来的空白），没配就**不下发这个键**（让设备端沿用节点默认；发空串等于
+// 让设备端把「没指定」当成「指定了空模型」，那样整轮直接起不来）。
+func TestNodeRequestBrokerRecommendationCarriesHostModel(t *testing.T) {
+	readParams := func(t *testing.T, sent *string, mu *sync.Mutex) map[string]interface{} {
+		t.Helper()
+		mu.Lock()
+		wire := *sent
+		mu.Unlock()
+		idx := strings.Index(wire, "|")
+		if idx < 0 {
+			t.Fatalf("wire payload has no separator: %q", wire)
+		}
+		var envelope struct {
+			Params map[string]interface{} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(wire[idx+1:]), &envelope); err != nil {
+			t.Fatalf("unmarshal wire payload: %v", err)
+		}
+		return envelope.Params
+	}
+
+	broker, sent, mu := startBroker(t)
+	if _, code := broker.StartRecommendation(context.Background(), NodeRequestHost{
+		AIUserID:       "rc_node_host",
+		TimeoutSeconds: 30,
+		Model:          "  anthropic/claude-haiku-5-5  ",
+	}, "t", "", 3, ""); code != "" {
+		t.Fatalf("StartRecommendation failed: %s", code)
+	}
+	if got := readParams(t, sent, mu)["model"]; got != "anthropic/claude-haiku-5-5" {
+		t.Fatalf("model = %#v, want the host route with surrounding blanks trimmed", got)
+	}
+
+	blank, blankSent, blankMu := startBroker(t)
+	if _, code := blank.StartRecommendation(context.Background(), NodeRequestHost{
+		AIUserID:       "rc_node_host",
+		TimeoutSeconds: 30,
+		Model:          "   ",
+	}, "t", "", 3, ""); code != "" {
+		t.Fatalf("StartRecommendation failed: %s", code)
+	}
+	if _, ok := readParams(t, blankSent, blankMu)["model"]; ok {
+		t.Fatal("an unset host model must not put a model key on the wire")
 	}
 }

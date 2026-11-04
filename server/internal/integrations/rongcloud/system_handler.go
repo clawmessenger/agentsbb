@@ -59,6 +59,11 @@ type systemHandler struct {
 	// 这个正例必须能在没有数据库的 CI 里跑；伪造 Scan 的接收者列表会随生成代码
 	// 静默失效，比不测更危险。
 	agentNodeLookup func(ctx context.Context, rcID string) (bool, error)
+	// joinPermissionRows 是群聊加入侧闸门的权限读取接缝（group_join_gate.go）。
+	// 与 agentNodeLookup 同理：判定本身是纯函数、可以脱离数据库测，但「闸门到
+	// 底有没有接进 addMember」只能靠一条真实调用链证明，而那条链要读权限位。
+	// 生产恒为 nil（走 ListRongCloudNodePermissionsByRcUserIDs）。
+	joinPermissionRows agentJoinPermissionRows
 	// wechatAPIBase / wechatHTTPClient 供 service=user 的 wxLogin 调微信
 	// jscode2session；空值走默认域名与 8s 超时客户端（测试注入假服务）。
 	wechatAPIBase    string
@@ -199,7 +204,9 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetList(ctx, cmd, actor))
 
 	case "get", "info", "getInfo":
-		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd))
+		// getInfo 是只读、不校验身份，但 isOwner 需要观察者视角 ——
+		// 直接把发送者的融云 id 透传进去（拿不到就是空串 → isOwner=false）。
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd, strings.TrimSpace(msg.FromUserID)))
 
 	case "update":
 		actor, err := h.resolveActor(ctx, msg.FromUserID)
