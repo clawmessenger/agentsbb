@@ -122,8 +122,14 @@ func (h *systemHandler) handleUserCommand(ctx context.Context, msg NormalizedMes
 	case "search":
 		// web「添加好友」的账号搜索（user_search_command.go）。
 		return h.handleUserSearch(ctx, msg, cmd)
+	case "getProfiles":
+		// 批量按 id 取资料（user_profiles_command.go）。群聊添加成员弹窗靠它
+		// 把 agent 头像从「全员同一张默认图」变成各自的镜像头像；web 端把
+		// 回包直接当数组用（sendSystemRequest<UserInfo[]>），数据侧是本地
+		// 镜像表 rongcloud_user。
+		return h.handleUserProfiles(ctx, msg, cmd)
 	default:
-		// user 服务的其余 action（login/getInfo/getProfiles/…）没有 IM 实现：
+		// user 服务的其余 action（login/getInfo/…）没有 IM 实现：
 		// 走 404 契约，客户端据此降级到 HTTP（/api/login、/api/user/info）。
 		return h.replyErr(ctx, msg, cmd, 404, unknownServiceOrActionMessage(cmd))
 	}

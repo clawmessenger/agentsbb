@@ -60,23 +60,52 @@ func (h *systemHandler) handleGroupAddMember(ctx context.Context, msg Normalized
 		return h.sendWebError(ctx, msg, cmd, 403, "only a group member can invite new members")
 	}
 
-	if err := h.client.joinGroup(ctx, groupID, memberIDs); err != nil {
+	// 加入侧闸门（迁移 607 的 allow_group）：主人关掉这个开关表达的是「别把我
+	// 的智能体拉进别人的群」，而此前它只在派发侧生效 —— agent 照样被拉进去，
+	// 只是永远不吭声，用户看到的是「这群里有个哑巴」。
+	//
+	// 逐人判、部分放行：一次勾 5 个人，只为其中 1 个 agent 被拦就整单失败，
+	// 用户只会反复重试；而被拦的必须回给前端点名，否则他会以为加成功了。
+	perms, err := h.agentJoinPermissions(ctx, memberIDs)
+	if err != nil {
+		// 读不到权限位就不知道能不能加。宁可 503 让用户重试，也不静默放行
+		// （与派发侧 "dispatch denied (no-permission-info)" 同一取舍方向）。
+		h.logger.Error("rongcloud: group add member permission lookup", "error", err, "group_id", groupID)
+		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
+	}
+	joinable, rejected := decideAgentJoin(memberIDs, perms, senderID)
+	if len(joinable) == 0 {
+		h.logger.Info("rongcloud: group add member denied by owner permission",
+			"group_id", groupID, "inviter", senderID, "denied", len(rejected))
+		return h.sendWebErrorWithData(ctx, msg, cmd, 403,
+			"the owners of these agents disabled group chat for them",
+			map[string]interface{}{"groupId": groupID, "skipped": rejected})
+	}
+
+	if err := h.client.joinGroup(ctx, groupID, joinable); err != nil {
 		h.logger.Error("rongcloud: group join", "error", err, "group_id", groupID)
 		return h.sendWebError(ctx, msg, cmd, 500, "failed to add the members to the RongCloud group")
 	}
 
 	// 融云已经加进去了；镜像写失败不回滚（镜像只是读模型，丢一次可由下次
 	// getMembers 的融云结果遮住），但必须留日志。
-	if err := h.groupMirror.AddMembers(ctx, groupID, memberIDs); err != nil {
+	if err := h.groupMirror.AddMembers(ctx, groupID, joinable); err != nil {
 		h.logger.Error("rongcloud: group mirror add members", "error", err, "group_id", groupID)
 	}
 
-	h.logger.Info("rongcloud: group members added", "group_id", groupID, "count", len(memberIDs))
-	return h.sendWebOK(ctx, msg, cmd, map[string]interface{}{
+	data := map[string]interface{}{
 		"groupId":    groupID,
-		"userIds":    memberIDs,
-		"addedCount": len(memberIDs),
-	})
+		"userIds":    joinable,
+		"addedCount": len(joinable),
+	}
+	if len(rejected) > 0 {
+		data["skipped"] = rejected
+		h.logger.Info("rongcloud: group add member partially denied",
+			"group_id", groupID, "added", len(joinable), "denied", len(rejected))
+	}
+
+	h.logger.Info("rongcloud: group members added", "group_id", groupID, "count", len(joinable))
+	return h.sendWebOK(ctx, msg, cmd, data)
 }
 
 // ---- removeMember ------------------------------------------------------------
@@ -226,7 +255,7 @@ func (h *systemHandler) handleGroupMine(ctx context.Context, msg NormalizedMessa
 		h.logger.Error("rongcloud: group list by user", "error", err)
 		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(groups))
+	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(groups, senderID))
 }
 
 // ---- getProfiles / getInfo ---------------------------------------------------
@@ -249,7 +278,7 @@ func (h *systemHandler) handleGroupProfiles(ctx context.Context, msg NormalizedM
 		h.logger.Error("rongcloud: group profiles", "error", err)
 		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(profiles))
+	return h.sendWebOK(ctx, msg, cmd, groupProfileViews(profiles, strings.TrimSpace(msg.FromUserID)))
 }
 
 func (h *systemHandler) handleGroupInfo(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
@@ -269,14 +298,40 @@ func (h *systemHandler) handleGroupInfo(ctx context.Context, msg NormalizedMessa
 	if len(profiles) == 0 {
 		return h.sendWebError(ctx, msg, cmd, 404, "group not found")
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupProfileView(profiles[0]))
+	return h.sendWebOK(ctx, msg, cmd, groupProfileView(profiles[0], strings.TrimSpace(msg.FromUserID)))
+}
+
+// ownerViewpoint 判定「观察者本人是否就是这个会话的群主 / 房主」。
+//
+// 群聊（getInfo/getProfiles/getMyGroups）与讨论组/聊天室（getList/getInfo/update/
+// create/setHost/setDiscussionTeam）都下发 isOwner，判定必须只有这一处实现 ——
+// 两个地方各写一遍，早晚会有一边漏掉空值判断。
+//
+// fail-closed 三条：
+//   - owner 为空 → false。老群/老聊天室的 owner 列可能是 NULL，取出来是空串；
+//     此时**不能**说「谁都不是群主」，但更**不能**说「谁都是」。客户端拿不到
+//     true 只是少一个入口（还能走服务端 403 兜底），给错了是把管理入口白送。
+//   - viewer 为空 → false。未登录、内部调用、取不到发送者时没有观察者，无从判定。
+//   - 两侧都空 → false。这一条单列出来是因为 `"" == ""` 天然成立：少了前两条的
+//     任意一条，都会把「空 owner + 空 viewer」判成 true，正好是最坏的情况。
+//
+// 两侧都先 TrimSpace：镜像列与消息头都可能带空白，一个空格就会让真群主变成
+// 非群主 —— 那正是我们要修的那类「功能看起来没了」。
+func ownerViewpoint(ownerID, viewerID string) bool {
+	owner := strings.TrimSpace(ownerID)
+	viewer := strings.TrimSpace(viewerID)
+	return owner != "" && viewer != "" && owner == viewer
 }
 
 // groupProfileViews 组装 getProfiles/getMyGroups 的数组。
-func groupProfileViews(profiles []GroupProfile) []map[string]interface{} {
+//
+// viewerID 是**观察者**（本条命令的发送者）：isOwner 是「相对视角」的字段，同一条
+// 群资料对不同调用者答案不同，所以必须逐条按同一个 viewer 判定，不能缓存也不能
+// 用群自己的 owner 字段顶替。
+func groupProfileViews(profiles []GroupProfile, viewerID string) []map[string]interface{} {
 	views := make([]map[string]interface{}, 0, len(profiles))
 	for _, profile := range profiles {
-		views = append(views, groupProfileView(profile))
+		views = append(views, groupProfileView(profile, viewerID))
 	}
 	return views
 }
@@ -286,17 +341,37 @@ func groupProfileViews(profiles []GroupProfile) []map[string]interface{} {
 // 同时给 groupName 与 name、portraitUri 与 avatar 两组别名：前端各处历史写法不
 // 一致（web 读 groupName/portraitUri，移动端 getProfiles 读 groupId|id 与
 // portraitUri|avatar），别名一份省得某一端显示空白。
-func groupProfileView(profile GroupProfile) map[string]interface{} {
+//
+// 为什么要下发 isOwner（而不是让客户端拿 ownerId 自己比）：
+//   - 群镜像的 owner_id 对老群可能是空串 —— 历史群、从旧后端迁移来的群、早期
+//     版本建出来的群都没有回填过这个字段。客户端一旦改成「ownerId === 我」的
+//     字符串比对，这些群上真正的群主会被判成非群主，于是「移除成员」入口整块
+//     消失，而「添加成员」（不判权限）还在，用户看到的就是「功能没了」。
+//   - 客户端本地还有两套 id 空间（平台 userId 与融云 imUserId），比对时得同时
+//     试两个，这本身就是服务端有确定答案的事情，不该让每个端各猜一遍。
+//
+// 重要边界：isOwner 只用于**显示侧**的开关（决定要不要把入口画出来）。真正的写
+// 操作仍由 handleGroupRemoveMember 在服务端校验（ownerID != msg.FromUserID 即
+// 403），前端不得把 isOwner 当成授权凭据 —— 它是投影，不是令牌。
+//
+// viewerID 为空（未登录、取不到发送者）时一律 isOwner=false：fail-closed。绝不
+// 能因为 owner 为空而把「没有观察者」当成「观察者就是群主」。
+func groupProfileView(profile GroupProfile, viewerID string) map[string]interface{} {
 	rounds := profile.MaxRounds
 	if rounds <= 0 {
 		rounds = defaultGroupRounds
 	}
+	// 判定只走 ownerViewpoint（群聊与聊天室共用一处实现，见其注释）。
+	isOwner := ownerViewpoint(profile.OwnerID, viewerID)
 	return map[string]interface{}{
 		"id":                profile.GroupID,
 		"groupId":           profile.GroupID,
 		"groupName":         profile.GroupName,
 		"name":              profile.GroupName,
+		// ownerId 保留镜像原值（可能是空串），不因为 isOwner 的判定而改写：
+		// 别的端/老客户端还靠它显示「群主：xxx」，抹成空会让它们更困惑。
 		"ownerId":           profile.OwnerID,
+		"isOwner":           isOwner,
 		"memberCount":       profile.MemberCount,
 		"portraitUri":       profile.PortraitURI,
 		"avatar":            profile.PortraitURI,

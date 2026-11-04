@@ -37,6 +37,16 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// 超时三个值的分工（改任何一个都要连带看另外两个）：
+//   - clawAdminDiscussionHostMinTimeout / MaxTimeout（10 / 600）是**夹逼范围**：
+//     管理端表单（clawmessenger-admin-web 的 System/DiscussionHost.tsx）与
+//     api/discussion-host.ts 的请求超时都按它夹逼，收窄会报「假超时」；
+//   - clawAdminDiscussionHostTimeoutInit（120）是「没配过超时」时的**默认值**。
+//     为什么从 60 提到 120：一次角色推荐要在主持设备上跑一整回合 LLM（十几秒到
+//     100s+），60s 会把正常但偏慢的回合判成超时，用户看到的是「转圈很久然后
+//     失败」。120s 给正常回合留出余量，仍是上限 600s 的五分之一；
+//   - 推荐链路里 timeout<=0 的兜底值见 rongcloud.recommendRolesFallbackTimeoutSeconds
+//     （同为 120，避免「没配超时」的配置比默认值更急）。
 const (
 	clawAdminDiscussionHostKey = "system_host"
 
@@ -46,17 +56,26 @@ const (
 	clawAdminDiscussionHostMaxPrompt   = 32000
 	clawAdminDiscussionHostMinTimeout  = 10
 	clawAdminDiscussionHostMaxTimeout  = 600
-	clawAdminDiscussionHostTimeoutInit = 60
+	clawAdminDiscussionHostTimeoutInit = 120
 
 	// clawAdminDiscussionHostMaxModelSegment 是 provider / model 单段的字符上限，
 	// 与设备端（xiachat-cli/src/model-catalog.ts 的 ROUTE_RE）以及 web 的
 	// segment() 一致：超过这个长度设备侧本来也解析不出 route。
 	clawAdminDiscussionHostMaxModelSegment = 128
-	// 向主持节点要一次模型目录的等待上限。目录是设备本机的快跑查询（CLI 侧还有
-	// 5 分钟缓存），8s 与 C 端浏览器的超时同值；查询接口放宽到 12s，因为那是一
-	// 次显式的人工操作，而保存路径要短——离线节点不能让「改个提示词」卡 12 秒。
-	clawAdminDiscussionHostCatalogTimeout  = 12 * time.Second
-	clawAdminDiscussionHostVerifyTimeout   = 8 * time.Second
+	// 向主持节点要一次模型目录的等待上限。
+	//
+	// 这两个值曾经是 12s / 8s（与 C 端浏览器同值）。实测不够：设备端的目录**首次**
+	// 构造要跑一次 agent 自己的列举命令 —— `openclaw models list --json` 冷启动
+	// 约 10s、`opencode models` 热启动 3–5s 未登录时能拖满 30s —— 而 CLI 的预热
+	// （run.ts 的 catalogLoader.warm()）是后台跑、不保证在请求到达前完成。落在
+	// 8s 窗口外的结果就是「节点明明有模型，管理端却只拿到一张空目录」，用户看到
+	// 的下拉框一片空白，还以为是功能坏了。
+	//
+	// 放宽到 20s / 15s：目录查询是一次显式的人工操作，多等十秒换来「下拉里真的有
+	// 东西」是划算的；保存路径仍比查询短，免得离线节点把「改个提示词」一起拖住。
+	// 前端 axios 的超时按这两个值 +5s 夹逼（见 api/discussion-host.ts）。
+	clawAdminDiscussionHostCatalogTimeout = 20 * time.Second
+	clawAdminDiscussionHostVerifyTimeout  = 15 * time.Second
 )
 
 // clawAdminModelSegmentCharset 是 provider / model 单段允许的字符集。`@` 保留在
@@ -82,6 +101,9 @@ const (
 	clawAdminModelCheckRejected   = "rejected"
 )
 
+// clawAdminCatalogReasonNoModels 是「设备答了、但一个可用模型都没有」的 reason。
+// 与 503 MODEL_CATALOG_UNAVAILABLE 分开：那一个是「问不到」，这一个「问到了、是空的」。
+const clawAdminCatalogReasonNoModels = "node_reported_no_models"
 
 // clawAdminRequiredHostCapabilities mirrors REQUIRED_HOST_CAPABILITIES in the
 // legacy discussion/system_host.py: a node advertising anything less than all
@@ -136,7 +158,6 @@ type clawAdminDiscussionHostBody struct {
 	ModelProvider            *string `json:"model_provider"`
 	Model                    *string `json:"model"`
 }
-
 
 // clawAdminDiscussionHostWorkspaceID resolves which workspace the config row
 // belongs to: the one already holding a row for this key, else whatever
@@ -772,6 +793,12 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 // 注意门控是 system:write 而不是 system:read：只读管理员不该能动用这条有副作用的通道。
 
 // clawAdminDiscussionHostCatalog 是目录接口的响应体。
+//
+// Reason 只在「设备答了、但一个可用模型都没报」时出现（node_reported_no_models）。
+// 不能让这种情形和「接口 503」共用一个出口：503 会让页面只说一句「取不到目录」，
+// 而这种情形下设备是通的、协议也是对的，缺的是设备端自己的模型清单 —— 多半是
+// 该节点的 agent 配置里只有 baseUrl、`/models` 探不通，或者 agent 没有列举命令。
+// 两者的处置完全不同（前者重试可能就好，后者要去设备上修配置），前端据此给不同文案。
 type clawAdminDiscussionHostCatalog struct {
 	ProtocolVersion int                           `json:"protocolVersion"`
 	NodeID          string                        `json:"node_id"`
@@ -779,6 +806,7 @@ type clawAdminDiscussionHostCatalog struct {
 	Providers       []clawAdminDiscussionHostProv `json:"providers"`
 	FetchedAt       string                        `json:"fetched_at"`
 	Source          string                        `json:"source"`
+	Reason          string                        `json:"reason,omitempty"`
 }
 
 type clawAdminDiscussionHostProv struct {
@@ -854,8 +882,12 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		return
 	}
 
+	// refresh=1：「重新检测」要求的强制重枚举。设备端对「缓存还新鲜」的请求会直接
+	// 回旧清单（packages/xiachat-cli 的 ModelCatalogLoader），不带这个标志的话，
+	// 用户在设备上刚改了模型、点一下「重新检测」拿到的还是旧的那份。
 	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
-		r.Context(), nodeUUIDValue, node.RongcloudUserID, clawAdminDiscussionHostCatalogTimeout)
+		r.Context(), nodeUUIDValue, node.RongcloudUserID,
+		clawAdminDiscussionHostCatalogTimeout, clawAdminCatalogRefreshRequested(r))
 	if code != "" {
 		unavailable(code, "node_id", nodeID)
 		return
@@ -867,9 +899,21 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		for _, entry := range provider.Models {
 			models = append(models, clawAdminDiscussionHostMdl{ID: entry.ID, Name: entry.Name})
 		}
+		// 没有模型的 provider 不进目录：前端把这份清单直接当下拉选项，留一个空壳
+		// 供应商只会让人选中它、然后卡在「选择供应商后必须选择模型」上 —— 而这
+		// 条校验用户永远满足不了。C 端的 normalizeCatalog 也是这么做的。
+		if len(models) == 0 {
+			continue
+		}
 		providers = append(providers, clawAdminDiscussionHostProv{
 			ID: provider.ID, Name: provider.Name, Models: models,
 		})
+	}
+	reason := ""
+	if len(providers) == 0 {
+		reason = clawAdminCatalogReasonNoModels
+		slog.Warn("claw admin: discussion host reported no usable models",
+			"node_id", nodeID, "raw_provider_count", len(catalog.Providers))
 	}
 	h.auditCatalogFetch(r, ident, nodeID, "", "source", "device",
 		"provider_count", len(providers))
@@ -880,6 +924,7 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		Providers:       providers,
 		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
 		Source:          "device",
+		Reason:          reason,
 	})
 }
 
@@ -908,8 +953,11 @@ func (h *Handler) auditCatalogFetch(
 
 // clawAdminDiscussionHostFetchCatalog 向主持节点要一次模型目录。
 // 返回空 code 表示拿到了；否则是可直接回给前端的具名错误码。
+//
+// force 语义见 NodeRequestBroker.StartModelCatalog：为 true 时设备跳过「缓存还
+// 新鲜就直接答」，当轮重新枚举。
 func (h *Handler) clawAdminDiscussionHostFetchCatalog(
-	ctx context.Context, nodeUUID pgtype.UUID, aiUserID string, timeout time.Duration,
+	ctx context.Context, nodeUUID pgtype.UUID, aiUserID string, timeout time.Duration, force bool,
 ) (rongcloud.DiscussionModelCatalog, string) {
 	if aiUserID == "" {
 		return rongcloud.DiscussionModelCatalog{}, rongcloud.NodeRequestCodeHostNotConfigured
@@ -930,21 +978,38 @@ func (h *Handler) clawAdminDiscussionHostFetchCatalog(
 		AIUserID:       aiUserID,
 		TimeoutSeconds: int(timeout / time.Second),
 	}
-	return h.RongCloudNodeRequests.FetchModelCatalog(ctx, host)
+	return h.RongCloudNodeRequests.FetchModelCatalog(ctx, host, force)
+}
+
+// clawAdminCatalogRefreshRequested 解析目录接口上的 refresh 标记。
+//
+// 接受 1/true/yes（大小写与空白都容忍）：这是运维手点的动作，多认几种写法比让
+// 他因为 "true" 不生效而反复点要好。其余一律当 false。
+func clawAdminCatalogRefreshRequested(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("refresh"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 // clawAdminDiscussionHostCheckModel 判断刚保存的模型在主持节点上是否可用。
 //
-// 三态：verified / unverified / rejected。只有「目录确实拿到了、且里面没有这个
-// model」才 rejected；离线、超时、目录为空、broker 未装配一律 unverified（放行）。
+// 三态：verified / unverified / rejected。只有「目录确实拿到了、且里面明确没有
+// 这个 model（或没有这个 provider）」才 rejected；离线、超时、目录为空、
+// provider 没上报模型清单、broker 未装配一律 unverified（放行）。
 func (h *Handler) clawAdminDiscussionHostCheckModel(
 	ctx context.Context, nodeUUID pgtype.UUID, aiUserID, provider, model string,
 ) (string, string) {
 	if model == "" {
 		return clawAdminModelCheckVerified, ""
 	}
+	// force=true：保存时的核验必须看**设备现在**的清单。设备端会拿缓存兜 20s，
+	// 而「刚在设备上加了模型、马上回后台保存」正是最典型的操作顺序 —— 用缓存核验
+	// 会把这个新模型判成 MODEL_NOT_AVAILABLE，用户永远存不上。
 	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
-		ctx, nodeUUID, aiUserID, clawAdminDiscussionHostVerifyTimeout)
+		ctx, nodeUUID, aiUserID, clawAdminDiscussionHostVerifyTimeout, true)
 	if code != "" {
 		return clawAdminModelCheckUnverified, code
 	}
@@ -953,8 +1018,17 @@ func (h *Handler) clawAdminDiscussionHostCheckModel(
 		// 读不出来），按未核验处理并让页面提示一句。
 		return clawAdminModelCheckUnverified, "empty catalog"
 	}
-	// 走到这里 provider 与 model 一定都非空（NormalizeModel 保证），所以目录里
-	// 一定能按 `provider/model` 定位到具体条目，不存在「裸 id 无法定位」的兜底。
+	// provider 在目录里、却一个模型都没上报：这与「目录全空」是同一种情形 ——
+	// 节点给不出可核验的清单，而不是「清单里没有这个模型」。自建的 OpenAI 兼容
+	// 端点常这样：模型由服务端动态给出，节点侧只报得出 provider 名。若在此拒绝，
+	// 这类节点的模型永远配不上：前端级联下拉是空列表，手填又撞 400。
+	models, providerFound := catalog.ProviderModels(provider)
+	if !providerFound {
+		return clawAdminModelCheckRejected, "provider is not available on the host node"
+	}
+	if len(models) == 0 {
+		return clawAdminModelCheckUnverified, "provider has no model list"
+	}
 	if !catalog.CatalogHasRoute(provider, model) {
 		return clawAdminModelCheckRejected, "model is not available on the host node"
 	}
@@ -1121,6 +1195,9 @@ func (h *Handler) ClawAdminDiscussionHostTestRecommendation(w http.ResponseWrite
 		RecommendationPrompt: cfg.RoleRecommendationPrompt,
 		TimeoutSeconds:       cfg.TimeoutSeconds,
 		ConfigVersion:        cfg.ConfigVersion,
+		// 「测试角色推荐」与真实推荐走同一个模型：运营在这个页面上点一次测试，
+		// 看到的速度应该就是用户实际会等的时间，不能一个用配置模型、一个用默认。
+		Model: clawAdminDiscussionHostModelRoute(cfg.ModelProvider, cfg.Model),
 	}
 
 	// 等待期间不要被服务端自己的读超时打断：设备端可能要跑完一次完整的

@@ -139,6 +139,13 @@ type relaySession struct {
 	// （hermes 长思考 90~120s，默认 60s 超时一到下一位就开跑，用户看到的
 	// 「上一位还在流式下一位已开跑」就是它）。nil 表示当前无轮可续。
 	turnExt *turnExtension
+	// targeted=true：本次中继由 @ 定向发起（speakers 是被 @ 的子集，非全员）。
+	// 语义（方案 A，2026-11-04 拍板）：
+	//  1. 定向即唯一 —— totalRounds 恒收口为 1，被 @ 的人答完即停，
+	//     其他 AI 不自动接力（想继续讨论就再发消息或再 @）。
+	//  2. 失败如实提示 —— 目标 dispatch 失败/超时时不回退全员轮转，
+	//     发占位提示后结束会话，绝不换人代答（消灭「@A 却 B 答」）。
+	targeted bool
 	// pending 是「中继进行中用户又发了消息」时排下的下一段中继。旧行为是
 	// 直接回 409「上一条消息的回应还在进行中」，用户那条消息就永远没人接
 	// ——长思考轮下尤其明显（等 3 分钟才轮到自己说话，却说不上）。
@@ -153,16 +160,26 @@ type relayPending struct {
 	requesterRCID string
 	totalRounds   int
 	contextRounds int
+	// members 是这条排队消息在入口解析好的派发成员（@ 定向已在入口完成）。
+	// nil 表示「沿用上一段的成员」（老调用方/非定向路径），保持旧行为。
+	// 不带着它，定向会话期间排队的新 @ 消息会被错派给上一段的目标
+	// （@老王 却小李答）—— 方案 A 下定向会话变多，这个错必须堵上。
+	members []relayMember
+	// targeted 与 members 配套：这条排队消息是否为定向派发。
+	targeted bool
 }
 
 // enqueueLocked 把一条用户消息排进会话待办；调用方持有 h.mu。
-func enqueueLocked(s *relaySession, userText, requesterRCID string, totalRounds, contextRounds int) {
+// members/targeted 是入口解析结果（可为 nil/false 表示沿用上一段）。
+func enqueueLocked(s *relaySession, userText, requesterRCID string, totalRounds, contextRounds int, members []relayMember, targeted bool) {
 	if s.pending == nil {
 		s.pending = &relayPending{
 			userText:      userText,
 			requesterRCID: requesterRCID,
 			totalRounds:   totalRounds,
 			contextRounds: contextRounds,
+			members:       members,
+			targeted:      targeted,
 		}
 		return
 	}
@@ -174,20 +191,35 @@ func enqueueLocked(s *relaySession, userText, requesterRCID string, totalRounds,
 	s.pending.requesterRCID = requesterRCID
 	s.pending.totalRounds = totalRounds
 	s.pending.contextRounds = contextRounds
+	// 多条排队消息拼接后，定向语义只能取**最后一条**的（与 userText 同步覆盖）：
+	// 前一条若是定向、后一条是全员，拼出来的消息按全员派发才符合直觉。
+	if members != nil {
+		s.pending.members = members
+		s.pending.targeted = targeted
+	} else {
+		s.pending.members = nil
+		s.pending.targeted = false
+	}
 }
 
-// startQueued 在当前中继收尾后接着跑排队的那条用户消息。复用同一份成员
-// 列表与房间形态（群/聊天室、议题），只把 userText/requester 换成新的。
+// startQueued 在当前中继收尾后接着跑排队的那条用户消息。复用同一份房间
+// 形态（群/聊天室、议题）；成员列表优先用 pending 携带的入口解析结果
+// （定向语义保留），nil 时回退上一段的成员（旧行为）。
 func (h *chatroomRelayHub) startQueued(ctx context.Context, prev *relaySession, p *relayPending) {
+	members := p.members
+	if members == nil {
+		members = prev.members
+	}
 	next := &relaySession{
 		chatroomRCID:  prev.chatroomRCID,
-		members:       prev.members,
+		members:       members,
 		userText:      p.userText,
 		isGroup:       prev.isGroup,
 		topic:         prev.topic,
 		requesterRCID: p.requesterRCID,
 		contextRounds: p.contextRounds,
 		totalRounds:   p.totalRounds,
+		targeted:      p.targeted,
 	}
 	h.mu.Lock()
 	h.attachContextLocked(next)
@@ -322,7 +354,12 @@ func (h *chatroomRelayHub) recordRound(key string, round relayRound) {
 
 // StartRelay 是 web 走 IM 命令（discussion/relayMessage）进来的入口：校验
 // 发起者是聊天室成员，读角色板，然后按 speaking_order 依次派发。
-func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, requesterRCID, text string) commandResult {
+//
+// mentions / mentionAll 是可选定向信号（「@ 某人」）：mentions 是融云 id 列表，
+// mentionAll=true 表示显式全员。二者都缺省时行为与「全员接力」完全一致 ——
+// 这是回归底线，老客户端不传这两个字段也绝不能改变任何派发结果。
+// 解析与回退全部在 resolveRelayDispatch 里，本函数只负责取数与回包。
+func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, requesterRCID, text string, mentions []string, mentionAll bool) commandResult {
 	if h.rt == nil || !h.rt.interactiveReady() {
 		return errRelayResult(503, "讨论服务尚未初始化")
 	}
@@ -351,7 +388,9 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	if !isMember {
 		return errRelayResult(403, "仅聊天室成员可以发起对话")
 	}
-	members := relayMembersFor(memberRows)
+	// allMembers 是参与接力的成员全集（顺序即接龙顺序）。定向只从它里面挑
+	// 子集，绝不新增、绝不重排。
+	allMembers := relayMembersFor(memberRows)
 	// 讨论组 vs 聊天室用哪个开关：这个房间**有讨论行**就是讨论组（allow_discussion），
 	// 没有就是普通聊天室（allow_chatroom）。判定口径与下面取议题用的是同一次查询，
 	// 不额外多打一次库。
@@ -369,8 +408,19 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	if len(discussions) > 0 {
 		scene = sceneDiscussion
 	}
-	perms := h.rt.agentPermissions(ctx, relayMemberIDs(members))
-	members = applyBehaviorPrompts(filterMembersByPermission(members, perms, scene), perms)
+	// 权限一次性按**全集**批量查：定向目标被筛空后要回退全员，若先按定向子集
+	// 查就没法在同一份快照里完成回退（会多打一次库，还可能读到不同的快照）。
+	perms := h.rt.agentPermissions(ctx, relayMemberIDs(allMembers))
+	// requesterRCID 就是「这次派发为谁的意图服务」：主人自己在聊天室说话时，
+	// 他自己关掉的开关不该挡住他自己的 agent（与设备端私聊的 reason:"owner" 同口径）。
+	//
+	// 定向选择 + 权限过滤 + 回退全员只有这一个实现，群聊路径共用（见
+	// resolveRelayDispatch）。resolveRelayDispatch 内部对 full/targeted/fallback
+	// 三条路径都套了 filterMembersByPermission + applyBehaviorPrompts，hotfix 侧的
+	// 权限闸门与行为准则注入语义在此完整保留。
+	members, mentionFallback, targeted := resolveRelayDispatch(
+		allMembers, mentions, mentionAll, text, perms, scene, requesterRCID,
+	)
 	if len(members) == 0 {
 		return errRelayResult(409, "该聊天室没有可发言的 AI 成员")
 	}
@@ -392,7 +442,12 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	}
 	// HTTP 请求返回后中继要继续跑：换独立 context。
 	bgCtx := context.WithoutCancel(ctx)
-	started, queued := h.StartOrQueue(bgCtx, chatroomRCID, members, text, topic, requesterRCID, int(room.MaxRounds))
+	// 定向即唯一（方案 A）：@ 谁=谁说一轮，totalRounds 收口为 1。
+	rounds := int(room.MaxRounds)
+	if targeted {
+		rounds = 1
+	}
+	started, queued := h.StartOrQueue(bgCtx, chatroomRCID, members, text, topic, requesterRCID, rounds, targeted)
 	if !started && !queued {
 		return errRelayResult(409, "当前无法发起对话，请稍后重试")
 	}
@@ -401,6 +456,10 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 		"chatroomId": chatroomRCID,
 		"speakers":   len(members),
 		"queued":     queued,
+		// mentionFallback=true：这条消息带了 @ 定向，但目标没能递出去（@ 的是
+		// 真人、被 @ 的 agent 无发言权、或 id 不存在），已按老行为回退全员。
+		// 前端不需要处理，纯诊断信号。
+		"mentionFallback": mentionFallback,
 	}}
 }
 
@@ -412,7 +471,7 @@ func errRelayResult(code int, msg string) commandResult {
 // 可以提示「上一条消息的回应还在进行中」）。contextRounds 是该房间的
 // 「AI 对话轮数」设置：每个成员的提示词最多携带这么多轮历史对话。
 func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string, contextRounds int) bool {
-	started, _ := h.StartOrQueue(ctx, chatroomRCID, members, userText, topic, requesterRCID, contextRounds)
+	started, _ := h.StartOrQueue(ctx, chatroomRCID, members, userText, topic, requesterRCID, contextRounds, false)
 	return started
 }
 
@@ -423,14 +482,14 @@ func (h *chatroomRelayHub) Start(ctx context.Context, chatroomRCID string, membe
 // 为什么要排队：群/聊天室的中继一轮要等每位成员跑完 agent（长思考 1~3 分钟），
 // 用户在等待期间发消息是极自然的动作。旧行为回 409，消息就永远没有回应，
 // 用户在 UI 上只看到「发出去了没人理」。
-func (h *chatroomRelayHub) StartOrQueue(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string, contextRounds int) (bool, bool) {
+func (h *chatroomRelayHub) StartOrQueue(ctx context.Context, chatroomRCID string, members []relayMember, userText, topic, requesterRCID string, contextRounds int, targeted bool) (bool, bool) {
 	if len(members) == 0 {
 		return false, false
 	}
 	h.mu.Lock()
 	if existing, busy := h.sessions[chatroomRCID]; busy {
 		enqueueLocked(existing, userText, requesterRCID, existing.totalRounds,
-			normalizeContextRounds(contextRounds))
+			normalizeContextRounds(contextRounds), members, targeted)
 		h.mu.Unlock()
 		return false, true
 	}
@@ -445,6 +504,7 @@ func (h *chatroomRelayHub) StartOrQueue(ctx context.Context, chatroomRCID string
 		// 轮数」（见 conversation-kind / InfoPanel 文案），把它顺带解释成
 		// 闲聊接力轮数会让同一份配置有两个互相打架的含义。
 		totalRounds: 1,
+		targeted:    targeted,
 	}
 	h.attachContextLocked(session)
 	h.sessions[chatroomRCID] = session
@@ -515,6 +575,13 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 					s.requestID = ""
 				}
 				h.mu.Unlock()
+				// 定向会话（方案 A：失败如实提示）：被 @ 的目标连命令都没收到。
+				// 发「定向失败」占位（与普通跳过文案区分，指名+引导重试）；推进
+				// 照旧 —— 多人 @ 时其余目标仍是被点名的人，不算代答；单人 @
+				// 失败后循环自然走空结束（会话 members 只含定向目标，无全员兜底）。
+				if s.targeted {
+					h.noteSkippedMember(ctx, s, &member, relayTargetFailedNote(member.roleName, "未能送达"))
+				}
 				s.index++
 				continue
 			}
@@ -560,7 +627,15 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 					// 结束信号，群里什么都不发就会永远转圈（且下一位已经开口，
 					// 用户看到的是「上一位卡住、下一位抢话」）。补一条占位。
 					if !stale {
-						h.noteSkippedMember(ctx, s, &member, relayTimeoutNote(member.roleName))
+						if s.targeted {
+							// 定向会话（方案 A）：被 @ 的目标超时未答，用定向文案
+							// 如实提示（指名+引导重试）。「不代答」由结构保证：
+							// 定向会话的 members 只含被 @ 的目标，超时后推进到
+							// 的也只是其他被点名的人，绝不出现全员轮转代答。
+							h.noteSkippedMember(ctx, s, &member, relayTargetFailedNote(member.roleName, "回答超时"))
+						} else {
+							h.noteSkippedMember(ctx, s, &member, relayTimeoutNote(member.roleName))
+						}
 					}
 					break waitLoop
 				}
@@ -809,6 +884,13 @@ func relayTimeoutNote(roleName string) string {
 
 func relayTurnFailedNote(roleName string) string {
 	return fmt.Sprintf("（%s 本轮未能发言）", roleName)
+}
+
+// relayTargetFailedNote 是 @ 定向目标失败的占位（方案 A「失败如实提示」）。
+// 与上面两条的区别：它明确告诉用户「你点名的这位没能回答」，并引导重试 ——
+// 因为定向会话失败后不会有人接话，不提示的话用户只会看到一片安静。
+func relayTargetFailedNote(roleName, reason string) string {
+	return fmt.Sprintf("（@ 的 %s %s，未能回答。请重试或换个对象 @）", roleName, reason)
 }
 
 // noteSkippedMember 广播「本轮没交出发言」的占位，并记进本轮发言（silent：
@@ -1328,6 +1410,12 @@ type agentPermission struct {
 	// 否则它们会被永久排除在所有派发之外，而用户手上没有任何可操作的入口。
 	// 已认领的节点严格按开关走，那是被分享出去、主人以为还在自己手里的那些。
 	claimed bool
+	// claimedBy 是主人（认领者）的融云 id，用于主人豁免；未认领时为空。
+	//
+	// claimed_by_user_id 存的是 claw_im_users.user_id，而它在融云侧就是 user id
+	// （见迁移 600 的列注释），所以可以直接和 requesterRCID / CreatedBy 这类融云
+	// id 做字符串比较。**不要**换成 owner_user_id：那是工作区管理员，语义完全不同。
+	claimedBy string
 }
 
 // agentPermissionSet 是一轮派发用的一份权限快照，键是融云 id。
@@ -1339,19 +1427,40 @@ type agentPermissionSet map[string]agentPermission
 
 // allows 报告 rcID 在该场景下能否被派发。
 //
-// 三种情况，语义必须分清：
+// 四种情况，语义必须分清（**判定顺序不能换**，后一条永远只在前一条不成立时才生效）：
 //   - 快照里没有这个 rc id（查不到节点行）：**不可派发**。未知就是未知，
 //     「查不到」不能等同于「没限制」。
 //   - 有节点行但没有认领者：**可派发**。没有主人就没有可点的开关，权限位对
 //     这类节点永远停在 DEFAULT false 上，按「关」处理会把它们永久踢出所有
 //     场景，而用户没有任何自救入口。
-//   - 已认领：严格按对应场景的开关判，这是「主人关掉了就不许拉它干活」的落点。
-func (s agentPermissionSet) allows(rcID string, scene agentPermissionScene) bool {
+//   - 有认领者且这次派发正是为**主人自己**服务的（actorRCID 命中）：**可派发**。
+//     与设备端私聊闸门 `reason: "owner"` 同口径 —— 开关管的是「别的账号能不能用
+//     我的 agent」，主人自己发起时不该被自己的开关挡住（否则他关掉群聊发言后，
+//     在自己建的讨论组里也开不了口，与用户预期相反）。
+//   - 已认领且发起人不是主人：严格按对应场景的开关判，这是「主人关掉了就不许
+//     拉它干活」的落点。
+//
+// actorRCID 的语义是「**这次派发是为谁的意图服务的**」，不是「谁在说话」。三个
+// 调用点分别传：
+//   - 群聊（group_relay.go）：requesterRCID，发这条群消息的人；
+//   - 聊天室（chatroom_relay.go）：requesterRCID，发起闲聊的人；
+//   - 讨论组 v3 正式轮次（discussion_interactive.go）：d.CreatedBy，讨论组的创建者。
+//     用创建者而不是「本轮谁触发」：v3 没有「发消息的发起人」这个角色，轮次由系统
+//     按 speaking_order 推进（甚至由上一轮发言的 AI 触发），而「这是主人自己的局」
+//     最稳定的信号就是他建的组。用「谁触发」的话，第二轮的触发者是 AI，主人豁免
+//     会在中途莫名失效，表现为「第 1 轮能说、第 2 轮不说了」。
+//
+// actorRCID 为空表示「拿不到发起人」：**不豁免**，照常按开关判。缺参数不是放行
+// 理由，fail-closed 在这里优先于「尽量派发」。
+func (s agentPermissionSet) allows(rcID string, scene agentPermissionScene, actorRCID string) bool {
 	perm, ok := s[rcID]
 	if !ok {
 		return false
 	}
 	if !perm.claimed {
+		return true
+	}
+	if actorRCID != "" && perm.claimedBy != "" && perm.claimedBy == actorRCID {
 		return true
 	}
 	switch scene {
@@ -1481,12 +1590,20 @@ func (rt *discussionRuntime) agentPermissions(ctx context.Context, rcIDs []strin
 	}
 	fetched := make(agentPermissionSet, len(rows))
 	for _, row := range rows {
+		// 只在 Valid 时取字符串：pgtype.Text 的零值是 {String:"",Valid:false}，
+		// 但历史的 TEXT 列可能是空串而不是 NULL，两者都要当「没有主人」处理，
+		// 所以统一 TrimSpace 后再判空。
+		claimedBy := ""
+		if row.ClaimedByUserID.Valid {
+			claimedBy = strings.TrimSpace(row.ClaimedByUserID.String)
+		}
 		fetched[row.RongcloudUserID] = agentPermission{
 			allowGroup:      row.AllowGroup,
 			allowChatroom:   row.AllowChatroom,
 			allowDiscussion: row.AllowDiscussion,
 			behaviorPrompt:  row.BehaviorPrompt,
 			claimed:         row.ClaimedByUserID.Valid && row.ClaimedByUserID.String != "",
+			claimedBy:       claimedBy,
 		}
 	}
 	storeAgentPermissions(now, misses, fetched)
@@ -1500,10 +1617,13 @@ func (rt *discussionRuntime) agentPermissions(ctx context.Context, rcIDs []strin
 
 // filterMembersByPermission 丢掉该场景下无权限的成员，保持原顺序（接龙顺序即
 // 发言顺序，重排会改变「接住谁的话」）。
-func filterMembersByPermission(members []relayMember, perms agentPermissionSet, scene agentPermissionScene) []relayMember {
+//
+// actorRCID 是「这次派发为谁的意图服务」，原样透传给 allows 做主人豁免判定；
+// 传空串表示拿不到发起人，此时不豁免（见 allows 的说明）。
+func filterMembersByPermission(members []relayMember, perms agentPermissionSet, scene agentPermissionScene, actorRCID string) []relayMember {
 	out := make([]relayMember, 0, len(members))
 	for _, member := range members {
-		if !perms.allows(member.rcID, scene) {
+		if !perms.allows(member.rcID, scene, actorRCID) {
 			continue
 		}
 		out = append(out, member)

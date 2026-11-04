@@ -975,6 +975,46 @@ func (q *Queries) GetRongCloudUserByWorkspaceAndID(ctx context.Context, arg GetR
 	return i, err
 }
 
+const getRongCloudUsersByRongCloudIDs = `-- name: GetRongCloudUsersByRongCloudIDs :many
+SELECT id, workspace_id, rongcloud_user_id, name, portrait_uri, token_encrypted, is_system_reserved, is_ai_node, node_type, created_at, updated_at FROM rongcloud_user WHERE rongcloud_user_id = ANY($1::text[])
+`
+
+// 批量按融云 id 取镜像用户（user/getProfiles 的数据侧）。`::text[]` 的写法与
+// 同文件 ListRongCloudNodePermissionsByRcUserIDs 一致 —— sqlc 对 `ANY(@ids::text[])`
+// 生成 `[]string` 入参，与 pgx 的数组绑定兼容。调用方负责去重；缺失的 id 不返回行，
+// handler 层要为它们补占位条目（前端靠 userId 对齐 map，缺键等于白等）。
+func (q *Queries) GetRongCloudUsersByRongCloudIDs(ctx context.Context, rongcloudUserIds []string) ([]RongcloudUser, error) {
+	rows, err := q.db.Query(ctx, getRongCloudUsersByRongCloudIDs, rongcloudUserIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RongcloudUser{}
+	for rows.Next() {
+		var i RongcloudUser
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.RongcloudUserID,
+			&i.Name,
+			&i.PortraitUri,
+			&i.TokenEncrypted,
+			&i.IsSystemReserved,
+			&i.IsAiNode,
+			&i.NodeType,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRongCloudChatroomMembers = `-- name: ListRongCloudChatroomMembers :many
 SELECT id, chatroom_id, node_id, member_type, role_name, role_instructions, capabilities, model, speaking_order, enabled, discussion_model, created_at, updated_at, member_id, nickname, portrait_uri FROM rongcloud_chatroom_member WHERE chatroom_id = $1 ORDER BY speaking_order ASC NULLS LAST, created_at ASC
 `

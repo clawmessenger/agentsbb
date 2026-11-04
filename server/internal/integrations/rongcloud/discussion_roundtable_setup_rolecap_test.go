@@ -118,9 +118,11 @@ func TestSetupRecommendCapsRolesAtFive(t *testing.T) {
 	}
 }
 
-func TestSetupRecommendRoleCapFollowsCandidateCount(t *testing.T) {
-	// 候选比上限少时必须按候选数下发：固定下发 5 会让「只有 3 台设备」的用户
-	// 收到 5 个角色，多出来的角色绑不上设备，confirm 整单被拒。
+func TestSetupRecommendRolePoolIgnoresCandidateCount(t *testing.T) {
+	// 角色池（形态 A）下角色数只由产品口径决定，与在线候选设备数无关：
+	// 只有 3 台设备时同样请设备推荐 5 个角色 —— 多出来的角色进角色池，等用户
+	// 之后把 agent 加进来再分配。旧口径「min(上限, 候选数)」会让只有 1 台在线
+	// 设备的用户永远只能拿到 1 个角色。
 	captured, _, _ := captureSetupRecommend(t, 3)
 	if captured == nil {
 		t.Fatalf("broker 没有发出角色推荐请求（发送端未被调用）")
@@ -130,8 +132,28 @@ func TestSetupRecommendRoleCapFollowsCandidateCount(t *testing.T) {
 		t.Fatalf("推荐请求缺 params：%#v", captured)
 	}
 	maxRoles, _ := params["max_roles"].(float64)
-	if maxRoles != 3 {
-		t.Fatalf("3 台候选时 max_roles = %v, want 3（min(上限, 候选数)）", maxRoles)
+	if maxRoles != float64(recommendRoleCountCap) {
+		t.Fatalf("3 台候选时 max_roles = %v, want %d（角色池与设备数解耦）",
+			maxRoles, recommendRoleCountCap)
+	}
+}
+
+func TestSetupRecommendWithoutCandidatesStillAsks(t *testing.T) {
+	// 除主持设备外一台候选都没有时，旧实现直接 fail(NO_ELIGIBLE_USER_DEVICES)，
+	// 连请求都不发。角色池口径下这是合法的起始状态：先把角色定下来，用户再往
+	// 组里加 agent —— 推荐这一步本来就不需要知道角色将来跑在哪台设备上。
+	captured, f, discussionID := captureSetupRecommend(t, 0)
+	if captured == nil {
+		t.Fatalf("没有候选设备时仍应下发推荐请求（角色不属于任何设备）")
+	}
+	if got, _ := captured["action"].(string); got != recommendRolesAction {
+		t.Fatalf("command action = %q, want %q", got, recommendRolesAction)
+	}
+	// 必须**不是** NO_ELIGIBLE_USER_DEVICES 那张失败卡：请求已经发出去了，
+	// 失败只可能来自发送端本身。
+	events := f.eventTypes(t, discussionID)
+	if !hasEvent(events, setupEventRecommendFailed) {
+		t.Fatalf("发送失败后应落 %s 事件；当前事件: %v", setupEventRecommendFailed, events)
 	}
 }
 
@@ -197,5 +219,48 @@ func TestActionRecommendRolesCapsRolesAtFive(t *testing.T) {
 	// 发送失败 → 命令回 503 且码是 broker 的失败码（证明真的走了这一次往返）。
 	if result.code != 503 {
 		t.Fatalf("发送失败时命令应回 503，got %d %s", result.code, result.message)
+	}
+}
+
+// 角色池口径下，「还没分配到 agent 的角色」是合法状态：角色只对议题负责，
+// 什么时候落给哪台设备由用户在确认前决定。confirm 必须跳过它们，而不是把整单
+// 判成非法 —— 否则用户只分配了两个角色就点开始，会收到一句看不懂的 400。
+func TestParseSetupConfirmRolesSkipsUnassignedRoles(t *testing.T) {
+	roles, rErr := parseSetupConfirmRoles(CommandContent{Params: map[string]interface{}{
+		"roles": []interface{}{
+			map[string]interface{}{"role_id": "role-a", "role_name": "甲", "role_prompt": "甲的人设", "node_id": "node-1"},
+			map[string]interface{}{"role_id": "role-b", "role_name": "乙", "role_prompt": "乙的人设", "node_id": ""},
+			map[string]interface{}{"role_id": "role-c", "role_name": "丙", "role_prompt": "丙的人设", "node_id": "node-2"},
+		},
+	}})
+	if rErr != nil {
+		t.Fatalf("未分配的角色不该让整单失败: %s", rErr.Code)
+	}
+	if len(roles) != 2 {
+		t.Fatalf("已分配角色数 = %d, want 2（乙没分配，应被跳过）", len(roles))
+	}
+	if roles[0].NodeID != "node-1" || roles[1].NodeID != "node-2" {
+		t.Fatalf("保留的角色不对: %#v", roles)
+	}
+	// speaking_order 必须重排成恰好 0..n-1：跳过中间那个角色后不能留洞，
+	// 下游按它排序并逐位比对序号。
+	for index, role := range roles {
+		if role.SpeakingOrder != index {
+			t.Fatalf("speaking_order 留了洞：roles[%d].SpeakingOrder=%d，应重排为 0..n-1",
+				index, role.SpeakingOrder)
+		}
+	}
+}
+
+// 一个都没分配就确认：没有任何成员能参与讨论，必须拒绝而不是静默开一个空组。
+func TestParseSetupConfirmRolesRejectsAllUnassigned(t *testing.T) {
+	_, rErr := parseSetupConfirmRoles(CommandContent{Params: map[string]interface{}{
+		"roles": []interface{}{
+			map[string]interface{}{"role_id": "role-a", "role_name": "甲", "role_prompt": "甲的人设", "node_id": ""},
+			map[string]interface{}{"role_id": "role-b", "role_name": "乙", "role_prompt": "乙的人设", "node_id": ""},
+		},
+	}})
+	if rErr == nil {
+		t.Fatalf("全部未分配时应拒绝确认")
 	}
 }

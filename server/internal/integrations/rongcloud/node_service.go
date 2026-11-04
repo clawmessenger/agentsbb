@@ -652,6 +652,20 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 			"created_at":      n.CreatedAt.Time,
 			"updated_at":      n.UpdatedAt.Time,
 		}
+		// 讨论组的「显示侧」：这台 agent 能不能被我拉进讨论组。
+		//
+		// 归属按融云好友边算，好友边里既有我自己的 agent，也有别人分享过来的 ——
+		// 后者能不能进讨论组，取决于**它主人的** allow_discussion，而我通过
+		// `/api/claw/nodes/{id}/permissions` 查不到（非主人一律 403）。不下发这个
+		// 标记，前端就只能把它列进候选，用户选完再被服务端闸门剔掉，最终看到的是
+		// 「角色推荐失败：没有可用于讨论的在线设备」（候选池被权限过滤成空集），
+		// 既没指向权限也没指向设备，是纯粹的死胡同。
+		//
+		// 判据见 discussionJoinBlockedFlag（discussion_join_gate.go）：显示侧、
+		// 候选池、confirm 三处共用 nodeDiscussionJoinAllowed，不另写等价 if。
+		if discussionJoinBlockedFlag(n, userID) {
+			record["discussionJoinBlocked"] = true
+		}
 		// Expose the machine's ops node to the client so the device detail
 		// can still offer the 运维 entry point without listing the ops node.
 		if opsRC, ok := opsByMachine[n.MachineID]; ok && opsRC != "" {
@@ -727,6 +741,26 @@ func (s *NodeService) UpdateUserProfile(ctx context.Context, id pgtype.UUID, nam
 // ListUserFriends returns a claw/IM user's RongCloud friend list mapped to the
 // legacy UserInfo shape the web client's contact list expects. This backs the
 // HTTP /api/user/friends fallback the frontend calls alongside the IM SDK.
+//
+// `ownerId` / `ownerName` 只对**节点**（agent）好友出现：联系人列表把人与
+// agent 混在一起平铺，用户看不出「这几个智能体是东风的」。归属的真相是融云
+// 好友边（owner → node 的单向边），本地投影是 rongcloud_node.claimed_by_user_id
+// （migrations/600）。这里一次 SELECT 批量读投影，**绝不能对每个 agent 好友各
+// 反查一次**（那是 O(N) 次 /friend/get.json）。投影缺失（老数据尚未自愈）时
+// 干脆不带这两个键：前端会退回「不分组」，而不是把 agent 硬塞到某个真人下面。
+//
+// `groupJoinBlocked` 只在「这个 agent 的主人不是我、且主人关掉了群聊权限」时为
+// true —— 也就是把它拉进群必然会被加入侧闸门逐人拒绝的那些人。前端拿它把候选
+// 名单里的人直接剔掉（用户的要求：不显示、也不提示）。
+//
+// 为什么判定放在服务端：GET /api/claw/nodes/{id}/permissions 对非主人一律 403
+// （behaviorPrompt 刻意不公开），前端根本没有查别人权限的通道。判定所依据的
+// 两个事实（claimed_by_user_id、allow_group）本来就在这一条 SELECT 里，顺手
+// 算完不会多一次 I/O。
+//
+// 为什么复用 decideAgentJoin 而不是就地写一份等价 if：加入侧的判据（尤其是
+// 「主人豁免」「未认领放行」这两条）必须与显示侧逐字一致，两份实现迟早分叉，
+// 分叉的表现就是「列表里有它、点确认却被拒」这种无法解释的组合。
 func (s *NodeService) ListUserFriends(ctx context.Context, rongCloudUserID string) ([]map[string]interface{}, error) {
 	if s.client == nil {
 		return nil, errors.New("rongcloud: API client not configured")
@@ -735,20 +769,161 @@ func (s *NodeService) ListUserFriends(ctx context.Context, rongCloudUserID strin
 	if err != nil {
 		return nil, err
 	}
+	ids := make([]string, 0, len(friends))
+	for _, f := range friends {
+		if id := strings.TrimSpace(f.UserID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	owners := s.friendOwnerProjection(ctx, ids)
+	// 哪些好友「连拉都拉不进群」：显示侧据此把它们从候选名单里剔掉。
+	//
+	// owners 是投影结果，拿不到时是空 map（无 DBTX / 查询失败，见
+	// friendOwnerProjection 的降级分支），groupJoinBlockedIDs 于是返回空集 =
+	// 「一个都不标记」= 不过滤。显示侧 fail-open 是可以接受的：真实加入由加入侧
+	// 闸门 fail-closed 兜底，表现为加入时被逐人点名拒绝（带 reason），并不比现在
+	// 更差。反过来若因为「权限读不到」就把整个好友列表回 5xx，用户连正常好友都
+	// 看不到 —— 拿次要信息的重要性去否决主功能，是最糟的取舍。
+	blocked := groupJoinBlockedIDs(ids, owners, rongCloudUserID)
 	list := make([]map[string]interface{}, 0, len(friends))
 	for _, f := range friends {
 		nickname := f.Name
 		if nickname == "" {
 			nickname = f.UserID
 		}
-		list = append(list, map[string]interface{}{
+		record := map[string]interface{}{
 			"userId":      f.UserID,
 			"username":    f.UserID,
 			"nickname":    nickname,
 			"portraitUri": f.PortraitURI,
-		})
+		}
+		// 自己认领自己的情况（owner == 好友本人）没有分组意义，只是噪声。
+		if owner, ok := owners[f.UserID]; ok && owner.id != "" && owner.id != f.UserID {
+			record["ownerId"] = owner.id
+			if owner.name != "" {
+				record["ownerName"] = owner.name
+			}
+		}
+		// 前端按「有且为 true」判断，所以只在被拦时才打这个键 —— 给每个好友都
+		// 带上 false 会让回包变大，也容易让前端把「缺键」和「false」当成两种语义。
+		if blocked[f.UserID] {
+			record["groupJoinBlocked"] = true
+		}
+		list = append(list, record)
 	}
 	return list, nil
+}
+
+// groupJoinBlockedIDs 把「好友候选 + 节点归属/权限投影 + 当前登录账号」翻成
+// 「不该出现在候选名单里的 id 集合」。
+//
+// 抽成纯函数是为了可测：ListUserFriends 本身要真融云 + 真 DBTX 才能跑，而真正
+// 值得钉住的是这条映射（谁的 agent 在什么开关下该消失），不是 I/O。
+//
+// 判定**完全**交给加入侧的 decideAgentJoin —— 这里只做两件它不做的事：
+//   1. 把投影（只有已认领的行）翻成 perms；未认领的不进 map，于是被它当成
+//      真人放行，正好等于加入侧「未认领放行」的口径。
+//   2. 把 (allowed, rejected) 的两拨拆成「要不要标记」的集合。
+//
+// viewerRCID 是当前登录账号的融云 id（= claw_im_users.user_id）。空串时直接返回
+// 空集：这时 decideAgentJoin 会按「拿不到发起人」不做主人豁免，照常按开关判，
+// 于是我会亲眼看到自己名下、自己关了群聊开关的 agent 从候选名单里消失，而它们
+// 其实是我有权拉的。加入侧对空 inviterID 取 fail-closed 是对的（宁可拒一次），
+// 显示侧不该跟着 fail-closed：藏东西的代价是「我明明有却找不到」，且没有任何
+// 提示可循。生产路径上 RongCloudUserID 来自认证，不会为空，这里是防御性分支。
+func groupJoinBlockedIDs(friendIDs []string, owners map[string]friendOwner, viewerRCID string) map[string]bool {
+	if len(friendIDs) == 0 || len(owners) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(viewerRCID) == "" {
+		return nil
+	}
+	perms := make(map[string]agentJoinPermission, len(owners))
+	for id, owner := range owners {
+		claimedBy := strings.TrimSpace(owner.id)
+		if claimedBy == "" {
+			// 未认领：投影本身已经过滤掉了，这里再挡一次是为了防止将来有人放宽
+			// 那条 SQL 的 WHERE 时，把一个「claimedBy 空」的条目塞进 perms 里 ——
+			// decideAgentJoin 会把 claimedBy 空的条目也当放行，结果一样，但语义
+			// 上「进了 perms 就代表它是被认领的 agent」这条不变式会先破掉。
+			continue
+		}
+		perms[id] = agentJoinPermission{claimedBy: claimedBy, allowGroup: owner.allowGroup}
+	}
+	if len(perms) == 0 {
+		return nil
+	}
+	_, rejected := decideAgentJoin(friendIDs, perms, viewerRCID)
+	if len(rejected) == 0 {
+		return nil
+	}
+	blocked := make(map[string]bool, len(rejected))
+	for _, r := range rejected {
+		blocked[r.UserID] = true
+	}
+	return blocked
+}
+
+// friendOwner is the claimant of one node: 认领者的融云 id + 展示名，
+// 外加主人给的群聊开关（allow_group，migrations/607）。
+type friendOwner struct {
+	id   string
+	name string
+	// allowGroup 是 rongcloud_node.allow_group：主人是否允许这个 agent 进别人的
+	// 群聊。列是 BOOLEAN NOT NULL DEFAULT false，所以零值 false 就意味着「关」，
+	// 不需要额外的 Valid 判断。
+	allowGroup bool
+}
+
+// friendOwnerProjection batch-reads rongcloud_node.claimed_by_user_id for the
+// given node ids, plus the claimant's display name for the group header the
+// contact list draws when that owner is not itself a contact, plus the
+// claimant's 群聊开关 (allow_group) for the join-candidate filter.
+//
+// 读投影而不是反查好友边：反查是每个 C 端账号一次 /friend/get.json，放在
+// 「打开通讯录」这条最高频的路径上会把页面拖死。投影未命中就当作「不知道」，
+// 前端退化为不分组 —— 归属不会答错，只是暂时不展示分组。
+func (s *NodeService) friendOwnerProjection(ctx context.Context, nodeRCIDs []string) map[string]friendOwner {
+	out := make(map[string]friendOwner, len(nodeRCIDs))
+	if len(nodeRCIDs) == 0 {
+		return out
+	}
+	dbtx := s.claimStore()
+	if dbtx == nil {
+		// 没注入 DBTX（单测 / 未接线的实例）：静默跳过，好友列表照常可用。
+		return out
+	}
+	rows, err := dbtx.Query(ctx, `
+		SELECT n.rongcloud_user_id,
+		       n.claimed_by_user_id,
+		       n.allow_group,
+		       COALESCE(NULLIF(u.nickname, ''), NULLIF(u.username, ''), '') AS owner_name
+		FROM rongcloud_node n
+		LEFT JOIN claw_im_users u ON u.user_id = n.claimed_by_user_id
+		WHERE n.rongcloud_user_id = ANY($1)
+		  AND n.claimed_by_user_id IS NOT NULL
+		  AND n.claimed_by_user_id <> ''`, nodeRCIDs)
+	if err != nil {
+		s.log().Debug("rongcloud: read friend owners failed", "error", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeRC, ownerRC, ownerName string
+		var allowGroup bool
+		if err := rows.Scan(&nodeRC, &ownerRC, &allowGroup, &ownerName); err != nil {
+			s.log().Debug("rongcloud: scan friend owner failed", "error", err)
+			return out
+		}
+		if nodeRC == "" || ownerRC == "" {
+			continue
+		}
+		out[nodeRC] = friendOwner{id: ownerRC, name: ownerName, allowGroup: allowGroup}
+	}
+	if err := rows.Err(); err != nil {
+		s.log().Debug("rongcloud: iterate friend owners failed", "error", err)
+	}
+	return out
 }
 
 // BackfillFriendsOptions tunes BackfillAgentFriends.
@@ -1566,13 +1741,20 @@ func LegacyDefaultPortraitURIs() []string {
 	return append([]string(nil), legacyDefaultPortraitURIs...)
 }
 
-// DefaultUserPortrait 返回统一默认头像 URL。CLAW_DEFAULT_PORTRAIT_URI 覆盖优先
-// （自建域名 / CDN），否则用统一图源 DefaultUserPortraitURI。
+// DefaultUserPortrait 返回统一默认头像 URL。优先级：后台「系统配置 → 品牌图片」
+// override > CLAW_DEFAULT_PORTRAIT_URI env（自建域名 / CDN）> 统一图源
+// DefaultUserPortraitURI。
+//
+// override 排在最前是因为它是运营在后台点出来的操作；env 往往是很久以前部署时
+// 留下的，让 env 盖住后台会让「后台换了图、线上没变」这种最难查的故障重演。
 //
 // 这里刻意不再按 MULTICA_PUBLIC_URL 拼旧静态路径：线上只要设了它，就会继续把
 // 1.9 KB 的旧灰人形图推给融云。也不再有单独的 AI 节点头像 env —— 那会让
 // 「AI 一张图、真人另一张图」的漂移重开。
 func DefaultUserPortrait() string {
+	if override := CurrentBrandingOverrides().userPortrait(); override != "" {
+		return override
+	}
 	if v := strings.TrimSpace(os.Getenv("CLAW_DEFAULT_PORTRAIT_URI")); v != "" {
 		return v
 	}

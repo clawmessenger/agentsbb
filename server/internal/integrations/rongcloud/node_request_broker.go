@@ -54,6 +54,13 @@ type NodeRequestHost struct {
 	RecommendationPrompt string
 	TimeoutSeconds       int
 	ConfigVersion        int
+	// Model 是主持节点在后台配的模型 route（`provider/slug`），空串 = 不指定、
+	// 沿用设备默认模型。
+	//
+	// 推荐的耗时几乎全在设备端那一次 agent 回合里：3 段 120 字人设 + 一层 JSON
+	// 的短任务，旗舰模型要二三十秒，快模型 2-3 秒。不改配置的话这里恒空，
+	// 运营在「讨论主持 AI 模型」里选的东西对推荐不生效，只能干等默认模型。
+	Model string
 }
 
 // Public error codes the admin page is allowed to see. Mirrors
@@ -65,6 +72,10 @@ const (
 	NodeRequestCodeHostOffline       = "SYSTEM_HOST_OFFLINE"
 	NodeRequestCodeRecommendTimeout  = "ROLE_RECOMMENDATION_TIMEOUT"
 	NodeRequestCodeRecommendInvalid  = "ROLE_RECOMMENDATION_INVALID"
+	// NodeRequestCodeRecommendEmpty 是「设备在跑，但这轮什么都没产出」：
+	// 模型返回空（detail.reason=empty-output），实测 1s 内就回。与 INVALID
+	// 分开是因为处置动作不同 —— 用户要换主持模型，而不是点重试。
+	NodeRequestCodeRecommendEmpty = "ROLE_RECOMMENDATION_EMPTY"
 	// 模型目录往返的失败码（管理端「供应商 → 模型」选择器用）。
 	NodeRequestCodeCatalogTimeout = "MODEL_CATALOG_TIMEOUT"
 	NodeRequestCodeCatalogInvalid = "MODEL_CATALOG_INVALID"
@@ -98,6 +109,11 @@ const (
 	// return. Shared with the admin handler so the request and the validation
 	// agree on the ceiling.
 	RecommendRolesMaxRoles = 8
+
+	// nodeErrorDetailMaxChars 是设备端自证信息进日志的长度上限（按 rune 算）。
+	// 设备端的 sample 已经是 400 字符内的单行片段，这里再兜一层：detail 是任意
+	// JSON，不该由它决定日志行有多长。
+	nodeErrorDetailMaxChars = 500
 )
 
 type pendingNodeRequest struct {
@@ -171,6 +187,12 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 	}
 	if style != "" {
 		params["style"] = style
+	}
+	// 只在配了模型时才下发这个键：老 CLI 不认识未知键（忽略即可），但把一个空串
+	// 发过去会让它把「没指定」当成「指定了空模型」—— 设备端据非空判定，空串会被
+	// 它自己过滤掉，这里不发更明确。
+	if model := strings.TrimSpace(host.Model); model != "" {
+		params["model"] = model
 	}
 
 	content, err := json.Marshal(map[string]interface{}{
@@ -317,7 +339,13 @@ type DiscussionModelEntry struct {
 }
 
 // StartModelCatalog records a pending catalog request and sends it to the host.
-func (b *NodeRequestBroker) StartModelCatalog(ctx context.Context, host NodeRequestHost) (string, string) {
+//
+// force=true 表示「别拿缓存糊弄我」：管理端点「重新检测」时用。设备端据此跳过
+// 「缓存还新鲜就直接答」的判定（packages/xiachat-cli 的 ModelCatalogLoader.load），
+// 当轮重新枚举本机模型。老设备不认这个键、行为与从前一致，所以它可以随时下发。
+func (b *NodeRequestBroker) StartModelCatalog(
+	ctx context.Context, host NodeRequestHost, force bool,
+) (string, string) {
 	if host.AIUserID == "" {
 		return "", NodeRequestCodeHostNotConfigured
 	}
@@ -328,14 +356,19 @@ func (b *NodeRequestBroker) StartModelCatalog(ctx context.Context, host NodeRequ
 		timeout = 60 * time.Second
 	}
 
-	// 设备的 `parseModelCatalogRequest` 只认这四个键，多一个键它也不拒（它不
-	// 做键集白名单），但保持与 web 逐字节同构能省掉一次联调排查。
-	content, err := json.Marshal(map[string]interface{}{
+	// 设备的 `parseModelCatalogRequest` 只认这几个键，多一个键它也不拒（它不
+	// 做键集白名单），但保持与 web 逐字节同构能省掉一次联调排查 —— 所以
+	// refresh 只在真的要强制时才出现，普通请求的报文与历史版本逐字节一致。
+	payload := map[string]interface{}{
 		"msg_type":        catalogRequestMsgType,
 		"protocolVersion": catalogProtocolVersion,
 		"requestId":       requestID,
 		"timestamp":       b.now().UnixMilli(),
-	})
+	}
+	if force {
+		payload["refresh"] = true
+	}
+	content, err := json.Marshal(payload)
 	if err != nil {
 		return "", NodeRequestCodeCatalogInvalid
 	}
@@ -414,8 +447,10 @@ func (b *NodeRequestBroker) AwaitModelCatalog(ctx context.Context, requestID str
 //
 // 它**只是**一次尽力而为的往返：调用方（管理端保存/目录查询）必须自己决定
 // 「拿不到目录」时是否降级，而不是把这个错误当致命错误——主持节点常常离线。
-func (b *NodeRequestBroker) FetchModelCatalog(ctx context.Context, host NodeRequestHost) (DiscussionModelCatalog, string) {
-	requestID, code := b.StartModelCatalog(ctx, host)
+func (b *NodeRequestBroker) FetchModelCatalog(
+	ctx context.Context, host NodeRequestHost, force bool,
+) (DiscussionModelCatalog, string) {
+	requestID, code := b.StartModelCatalog(ctx, host, force)
 	if code != "" {
 		return DiscussionModelCatalog{}, code
 	}
@@ -613,17 +648,36 @@ func (c DiscussionModelCatalog) CatalogHasRoute(provider, model string) bool {
 	if provider == "" || model == "" {
 		return false
 	}
-	for _, candidate := range c.Providers {
-		if candidate.ID != provider {
-			continue
-		}
-		for _, entry := range candidate.Models {
-			if entry.ID == model {
-				return true
-			}
+	models, found := c.ProviderModels(provider)
+	if !found {
+		return false
+	}
+	for _, entry := range models {
+		if entry.ID == model {
+			return true
 		}
 	}
 	return false
+}
+
+// ProviderModels 返回目录里该 provider 声明的模型清单，以及这个 provider 是否
+// 出现在目录中。
+//
+// 两者必须分开返回，调用方要靠它区分两种完全不同的「查不到」：
+//   - provider 不在目录里 → 明确不存在，可以拒绝；
+//   - provider 在、模型清单却是空的 → 节点没上报（自建 OpenAI 兼容端点的模型
+//     常由服务端动态给出，节点侧只报得出 provider 名），这是「没有信息」而不是
+//     「信息说没有」，据此拒绝会让这类节点的模型永远配不上。
+func (c DiscussionModelCatalog) ProviderModels(provider string) ([]DiscussionModelEntry, bool) {
+	if provider == "" {
+		return nil, false
+	}
+	for _, candidate := range c.Providers {
+		if candidate.ID == provider {
+			return candidate.Models, true
+		}
+	}
+	return nil, false
 }
 
 // AcceptResponse hands an inbound node `command_result` to the broker. It
@@ -684,12 +738,18 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 
 	// 设备回的原文必须留痕：对外只暴露两个码（TIMEOUT / INVALID），没有这条
 	// 日志时「设备卡住」「模型报错」「应答格式坏」在服务端看起来完全一样。
+	//
+	// detail 是设备端新版回执里的自证字段（payload.detail = {reason, sample}）：
+	// reason 是稳定短标识（no-json / speaking-order-not-permutation …），sample
+	// 是模型原文的单行片段。它只进日志，**不参与任何判定** —— 两个对外错误码的
+	// 语义不变，旧设备不带 detail 时这一行与过去完全一致。
 	b.logger.Warn("role recommendation: node reported an error",
 		"request_id", result.RequestID,
 		"node", senderID,
-		"error", result.Payload["error"])
+		"error", result.Payload["error"],
+		"detail", nodeErrorDetail(result.Payload["detail"]))
 
-	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"]), nil)
+	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"], result.Payload["detail"]), nil)
 	return true
 }
 
@@ -898,7 +958,7 @@ func roleOrder(value interface{}) (int, bool) {
 // 它们过去全部落到 INVALID，前端于是把「主持设备 300 秒没产出」显示成
 // 「角色推荐失败，请重试」—— 与真正的原因（设备端智能体卡住 / 模型不可用）
 // 差着一整个排查方向，用户只能反复点重试。
-func mapNodeError(value interface{}) string {
+func mapNodeError(value interface{}, detail interface{}) string {
 	text, _ := value.(string)
 	lower := strings.ToLower(strings.TrimSpace(text))
 	switch lower {
@@ -908,5 +968,49 @@ func mapNodeError(value interface{}) string {
 	if strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") {
 		return NodeRequestCodeRecommendTimeout
 	}
+	// 设备端自证说这一轮**什么都没产出**（reason=empty-output，raw 为空串）。
+	//
+	// 它必须和「答案不合协议」分开：后者重试一下很可能就好了，而空产出意味着
+	// 这个模型当前根本不能用 —— 用户要做的是换主持模型，不是反复点重试。
+	// 2026-10-30 现场：主持模型被换成 opencode/beam-free 后，每次都在 0.9s 内
+	// 空手而归，界面却只说「内容无法解析」，排查方向整个跑偏。
+	if nodeErrorReason(detail) == "empty-output" {
+		return NodeRequestCodeRecommendEmpty
+	}
 	return NodeRequestCodeRecommendInvalid
+}
+
+// nodeErrorReason 取设备端自证里的 reason 短标识（payload.detail.reason）。
+// 设备端 1.3.14 起才有这个字段，旧设备或结构不符时返回空串。
+func nodeErrorReason(value interface{}) string {
+	object, ok := value.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	text, _ := object["reason"].(string)
+	return strings.TrimSpace(text)
+}
+
+// nodeErrorDetail 把设备端随错误应答带回的自证信息（payload.detail）压成一行
+// 日志字段。
+//
+// 不做结构断言：新版是 {reason, sample}，旧版根本没有这个键，将来也可能加字段。
+// 能 JSON 序列化就原样记，序列化不了退回 fmt.Sprint；按 rune 截断到
+// nodeErrorDetailMaxChars，免得一段模型原文把日志行撑爆。它**只**用于日志。
+func nodeErrorDetail(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	text := ""
+	if encoded, err := json.Marshal(value); err == nil {
+		text = string(encoded)
+	} else {
+		text = fmt.Sprint(value)
+	}
+	trimmed := strings.TrimSpace(text)
+	runes := []rune(trimmed)
+	if len(runes) > nodeErrorDetailMaxChars {
+		return string(runes[:nodeErrorDetailMaxChars]) + "…"
+	}
+	return trimmed
 }

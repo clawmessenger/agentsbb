@@ -809,6 +809,15 @@ func (h *Handler) ClawAdminSystemConfigPut(w http.ResponseWriter, r *http.Reques
 		clawAdminFail(w, 400, "JSON object is required")
 		return
 	}
+	// branding 里的相对路径必须在落库前补成绝对 URL：服务端写融云的那条链路
+	// （建群 / 建聊天室 / 回填脚本）没有 request 上下文，读的时候补不出 host。
+	// 归一化失败就保持原样交给下面的通用逻辑，不在这里报错 —— 否则后台改不了
+	// 一条历史脏数据。
+	if key == brandingConfigKey {
+		if normalized, ok := normalizeBrandingConfigJSON(body.ConfigValue, brandingPublicBaseURL(r)); ok {
+			body.ConfigValue = normalized
+		}
+	}
 	// config 列为 jsonb：value 可能是 JSON 文档，也可能纯文本（包成 {"value": ...}）。
 	var cfgJSON []byte
 	if json.Valid([]byte(body.ConfigValue)) {
@@ -840,6 +849,11 @@ func (h *Handler) ClawAdminSystemConfigPut(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	h.clawAdminAudit(r, ident, "admin_system_config_update", "system_config", key, nil)
+	// 存完立即刷新进程内投影：否则要等重启才写对融云的头像 URL，运营在后台
+	// 换了图、手机端却要等下一次发布才变。
+	if key == brandingConfigKey {
+		h.ApplyBranding(r.Context(), brandingPublicBaseURL(r))
+	}
 	clawAdminOK(w, map[string]interface{}{
 		"config_key": key, "config_value": body.ConfigValue,
 	})

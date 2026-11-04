@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -44,15 +46,54 @@ func roundtableReadyResponse(request db.RongcloudRoundtableCreateRequest) map[st
 
 // ownedAndEligibleNodes 对齐 _owned_and_eligible_nodes。归属按融云好友边。
 func (s *roundtableCreationService) ownedAndEligibleNodes(ctx context.Context, userID string, host roundtableHostConfig) (map[string]bool, map[string]db.RongcloudNode) {
+	owned, eligible, _ := s.ownedAndEligibleNodesWithStats(ctx, userID, host)
+	return owned, eligible
+}
+
+// nodePresenceStats 记录一次候选解析里「在线探测」那一段的观测值。
+//
+// 存在的理由只有一个：成功路径过去完全不打日志（只有失败打），一次 20 秒的
+// 推荐事后无法判断时间花在 presence、broker 往返还是落库上。stats 由候选解析
+// 一路带到 recommendForSetupBatch 的成功日志里，和总耗时、角色数打在同一行。
+type nodePresenceStats struct {
+	// nodes 是实际发起在线探测的设备数（已跳过 node_id 为空、能力不全和 host 自己）。
+	nodes int
+	// online 是探测结果为在线的设备数。
+	online int
+	// duration 是整段并发探测的墙钟耗时。
+	duration time.Duration
+}
+
+// nodePresenceQueryConcurrency 限制一轮候选解析里同时在飞的 presence 请求数。
+//
+// 候选上限是 8 台（RecommendRolesMaxRoles），正常永远打不满；设一个上限是为了
+// 兜住「一个用户名下几十台设备」的极端情况 —— 几十个并发打到融云
+// /user/checkOnline.json 会被限流，反而比串行更慢。
+const nodePresenceQueryConcurrency = 8
+
+// ownedAndEligibleNodesWithStats 是 ownedAndEligibleNodes 的观测版：
+// 除了归属表和可用表，还回一段 presence 耗时统计。
+//
+// 三件事按「纯内存判断 → 并发探测 → 顺序落表」拆开：
+//  1. 归属（融云好友边）来自 nodeOwner，一次查询；
+//  2. 能力位、host 排除都是内存判断，先做完，**只对真的还需要探测的设备**发
+//     presence 请求（原始实现是「先探测再判能力」，host 自己和能力不全的设备也
+//     白问一次）；
+//  3. presence 探测并发执行，结果写进与设备列表等长的切片、按索引定位 ——
+//     **顺序天然稳定**，候选顺序不会因为并发而随机化（roleCandidateNodes 依赖
+//     这个顺序来做「没给 node_ids 时排序截断」）。
+func (s *roundtableCreationService) ownedAndEligibleNodesWithStats(ctx context.Context, userID string, host roundtableHostConfig) (map[string]bool, map[string]db.RongcloudNode, nodePresenceStats) {
 	owned := map[string]bool{}
 	eligible := map[string]db.RongcloudNode{}
+	var stats nodePresenceStats
 	if s.nodeOwner == nil {
-		return owned, eligible
+		return owned, eligible, stats
 	}
 	nodes, err := s.nodeOwner(ctx, userID)
 	if err != nil {
-		return owned, eligible
+		return owned, eligible, stats
 	}
+	probe := make([]db.RongcloudNode, 0, len(nodes))
 	for _, node := range nodes {
 		if node.NodeID == "" {
 			continue
@@ -60,13 +101,40 @@ func (s *roundtableCreationService) ownedAndEligibleNodes(ctx context.Context, u
 		owned[node.NodeID] = true
 		// 在线判定走融云 presence（见 node_presence.go），不能读 deploy_status：
 		// 那列在 Go 侧无人写入，恒为 offline，会让可选设备永远为空。
-		if nodeIsOnline(ctx, s.client, node) &&
-			len(missingCapabilities(node.Capabilities, roundtableRequiredRoleCaps)) == 0 &&
-			node.NodeID != host.nodeID {
-			eligible[node.NodeID] = node
+		if len(missingCapabilities(node.Capabilities, roundtableRequiredRoleCaps)) != 0 {
+			continue
 		}
+		if node.NodeID == host.nodeID {
+			continue
+		}
+		probe = append(probe, node)
 	}
-	return owned, eligible
+	online := make([]bool, len(probe))
+	startedAt := time.Now()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, nodePresenceQueryConcurrency)
+	for index := range probe {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			// 信号量放在 goroutine 里而不是发射前：发射侧阻塞会让整个循环变成
+			// 半串行（一次只能起 8 个），这里让 wg 统一等全部完成。
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			online[index] = nodeIsOnline(ctx, s.client, probe[index])
+		}(index)
+	}
+	wg.Wait()
+	stats.duration = time.Since(startedAt)
+	stats.nodes = len(probe)
+	for index, node := range probe {
+		if !online[index] {
+			continue
+		}
+		stats.online++
+		eligible[node.NodeID] = node
+	}
+	return owned, eligible, stats
 }
 
 // roleCandidateNodes 解析本轮角色推荐的候选设备，对齐 Python
@@ -102,7 +170,7 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 			}
 		}
 		if len(out) == 0 {
-			return nil, "NO_ELIGIBLE_USER_DEVICES"
+			return nil, codeNoEligibleUserDevices
 		}
 		return out, ""
 	}
@@ -111,7 +179,7 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 		ids = append(ids, nodeID)
 	}
 	if len(ids) == 0 {
-		return nil, "NO_ELIGIBLE_USER_DEVICES"
+		return nil, codeNoEligibleUserDevices
 	}
 	// 没给 node_ids 时集合来自 map，必须排序：同一份配置两次调用要给出同一份推荐。
 	sort.Strings(ids)
@@ -121,10 +189,77 @@ func roleCandidateNodes(eligible map[string]db.RongcloudNode, requested []string
 	return ids, ""
 }
 
-// roleCandidateNodesFor 取候选设备的运行时封装（查归属 + 在线判定）。
+// roleCandidateNodesFor 取候选设备的运行时封装（查归属 + 在线判定 + 权限闸门）。
+//
+// 权限闸门放在**候选池**这一层，而不是只在 confirm 拦：写进推荐卡的角色必须是
+// 用户真能确认的。只拦 confirm 的后果是「推荐成功 → 点开始 → 整单 400」，用户
+// 只会一路重试，且界面上没有任何东西显示哪台设备有问题。
+//
+// 闸门剔空之后还必须说清「为什么空」：候选池有两种空法 —— 设备都不在线，或者
+// 有设备但主人关了讨论组权限。两者的下一步动作完全相反（去启动设备 vs 去让
+// 主人开开关），过去都折进 NO_ELIGIBLE_USER_DEVICES 的「没有可用的在线设备」，
+// 于是一个明明在线、只是没权限的 agent 会把用户引去反复重启设备。
 func (s *roundtableCreationService) roleCandidateNodesFor(ctx context.Context, userID string, host roundtableHostConfig, requested []string, requestedGiven bool) ([]string, string) {
-	_, eligible := s.ownedAndEligibleNodes(ctx, userID, host)
-	return roleCandidateNodes(eligible, requested, requestedGiven)
+	ids, code, _ := s.roleCandidateNodesForWithStats(ctx, userID, host, requested, requestedGiven)
+	return ids, code
+}
+
+// roleCandidateNodesForWithStats 同 roleCandidateNodesFor，额外回一段 presence
+// 耗时统计，给推荐成功日志用（见 recommendForSetupBatch）。
+func (s *roundtableCreationService) roleCandidateNodesForWithStats(ctx context.Context, userID string, host roundtableHostConfig, requested []string, requestedGiven bool) ([]string, string, nodePresenceStats) {
+	_, eligible, stats := s.ownedAndEligibleNodesWithStats(ctx, userID, host)
+	allowed, blocked := filterDiscussionJoinNodes(eligible, userID)
+	ids, code := roleCandidateNodes(allowed, requested, requestedGiven)
+	if code == codeNoEligibleUserDevices && permissionExplainsEmpty(eligible, blocked, requested, requestedGiven) {
+		return nil, codeNoPermittedUserDevices, stats
+	}
+	return ids, code, stats
+}
+
+// roleCandidateNodesObservation 是形态 A（前端不传 node_ids）专用的观测口径：
+// 角色池形态下候选探测不是致命条件（角色不绑设备），但成功/失败日志仍要带
+// presence 观测值（节点数 / 在线数 / 耗时），否则「推荐慢」没有锚点。它永远
+// 不返回失败码 —— 调用方拿到零值也照常继续。
+func (s *roundtableCreationService) roleCandidateNodesObservation(ctx context.Context, userID string, host roundtableHostConfig) nodePresenceStats {
+	_, _, stats := s.ownedAndEligibleNodesWithStats(ctx, userID, host)
+	return stats
+}
+
+// 候选池为空的两种原因码。字面量集中在这里，避免同一串在三处拼错。
+const (
+	codeNoEligibleUserDevices  = "NO_ELIGIBLE_USER_DEVICES"
+	codeNoPermittedUserDevices = "NO_PERMITTED_USER_DEVICES"
+)
+
+// permissionExplainsEmpty 判断「候选池空」是不是权限造成的。
+//
+// 只在 roleCandidateNodes 已经返回「没有可用设备」之后调用，所以这里只需回答
+// 一个问题：被闸门拦下的那批，是否**就是**本该被考虑的每一个候选。
+//
+//   - 前端给了 node_ids（选 agent / 续推）：只看交集的判定，交集里只要有一台
+//     没被拦，空集就另有原因（那台是离线/能力不足），仍按「没有在线设备」报；
+//     交集为空说明这些设备连 eligible 都没进，也与权限无关。
+//   - 前端没给 node_ids（首推，服务端自选）：eligible 全被拦才算权限问题。
+//
+// 两处都要求 blocked 非空：没有拦过任何一台就不可能怪到权限头上。
+func permissionExplainsEmpty(eligible, blocked map[string]db.RongcloudNode, requested []string, requestedGiven bool) bool {
+	if len(blocked) == 0 {
+		return false
+	}
+	if requestedGiven {
+		sawEligible := false
+		for _, nodeID := range requested {
+			if _, ok := eligible[nodeID]; !ok {
+				continue
+			}
+			sawEligible = true
+			if _, denied := blocked[nodeID]; !denied {
+				return false
+			}
+		}
+		return sawEligible
+	}
+	return len(eligible) > 0 && len(blocked) == len(eligible)
 }
 
 // ensureChatroom 对齐 _ensure_chatroom：融云侧建房 + DB 行 + owner/host 成员行。

@@ -20,6 +20,7 @@ import {
   openclawGatewayLockFailure,
   openclawTurnHealth,
   parseOpenclawJsonOutput,
+  parseStreamJsonLine,
   resolveWindowsShim,
   runAgentTurn,
   splitModelRoute,
@@ -176,16 +177,130 @@ describe("buildAgentArgs", () => {
 
   // kimi 必须走 -p：不带参数直接 spawn 的是交互式 TUI，Windows 上拿不到
   // console 时会以 `No Windows console found` 退出（生产事故实证）。
-  it("kimi 走 -p 非交互入口（裸 kimi 是 TUI，无 console 会直接退出）", () => {
-    expect(buildAgentArgs("kimi", "hi")).toEqual(["-p", "hi", "--output-format", "text"]);
+  // 升级到 stream-json 后正文走逐行事件流（官方：thinking 不写 JSONL，思考
+  // 预期为空——正文流升级，不虚构思考）。
+  it("kimi 走 -p + stream-json（不再是 text 整包，也不回退 stdin/TUI）", () => {
+    expect(buildAgentArgs("kimi", "hi")).toEqual(["-p", "hi", "--output-format", "stream-json"]);
     // 不注入 --model：kimi 的 -m 只认它自己的模型别名，不认 provider/model 路由。
     expect(buildAgentArgs("kimi", "hi", "quukk/glm-5.2")).toEqual([
-      "-p", "hi", "--output-format", "text",
+      "-p", "hi", "--output-format", "stream-json",
+    ]);
+    // 超长 prompt 退回 stdin 模式：kimi -p 的 argv 与 stdin 二选一，stdin 形态
+    // 下它把管道读到 EOF 当 prompt（不会挂起）。
+    expect(buildAgentArgs("kimi", "a".repeat(8001))).toEqual([]);
+  });
+
+  // qwen（Qwen Code 0.25.3）：-p 是官方「附到 stdin 输入之后」的形态，argv 与
+  // stdin 兼容；事件流必须带 --include-partial-messages，否则 thinking_delta /
+  // text_delta 都不上报（实测抓取确认）。--model 仍由 buildModelArgs 的 qwen
+  // 分支注入裸 slug。
+  it("qwen 走 -p + stream-json 事件流（思考流数据源），--model 注入裸 slug", () => {
+    expect(buildAgentArgs("qwen", "hi")).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--include-partial-messages",
+    ]);
+    expect(buildAgentArgs("qwen", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--include-partial-messages",
+      "--model", "glm-5.2",
+    ]);
+    // 超长 prompt 退回 stdin 模式：qwen 的 -p 明确兼容 stdin 输入，两种形态都能答。
+    expect(buildAgentArgs("qwen", "a".repeat(8001))).toEqual([]);
+    expect(buildAgentArgs("qwen", "a".repeat(8000))).toEqual([
+      "-p", "a".repeat(8000), "--output-format", "stream-json", "--include-partial-messages",
+    ]);
+  });
+
+  // ── B 类十家 argv 形态（2026-11-04 批量接入）──────────────────────────────
+  // cursor-agent：官方 headless 形态 `-p <prompt> --output-format stream-json`
+  // （cursor.com/docs/cli/headless）。不注入 --model：抓包 init 的 model 是
+  // "Auto"，模型走 cursor 账户配置。
+  it("cursor-agent 走 -p + stream-json，不注入 --model", () => {
+    expect(buildAgentArgs("cursor-agent", "hi")).toEqual([
+      "-p", "hi", "--output-format", "stream-json",
+    ]);
+    expect(buildAgentArgs("cursor-agent", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi", "--output-format", "stream-json",
+    ]);
+    expect(buildAgentArgs("cursor-agent", "a".repeat(8001))).toEqual([]);
+  });
+
+  // codebuddy：Claude Code fork，argv 完整对齐上游 codebuddy.go:38-44
+  // （-p + stream-json 双向 + --verbose）。--model 不走 argv（只认自家 id），
+  // 走 CODEBUDDY_MODEL env；buildModelArgs 只保留 --port 0。
+  it("codebuddy 走 -p + stream-json 双向 + --verbose（--port 0 防端口冲突）", () => {
+    expect(buildAgentArgs("codebuddy", "hi")).toEqual([
+      "-p", "hi",
+      "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+      "--port", "0",
+    ]);
+    expect(buildAgentArgs("codebuddy", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi",
+      "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+      "--port", "0",
+    ]);
+  });
+
+  // pi / omp：上游 buildPiArgs（pi.go:980-1029）的一次性形态
+  // `-p --mode json`，prompt 官方走 stdin 管道（pi.go:421）；--model 整段
+  // 透传（pi.go:1001-1010，GH #7300：拆 provider 反而是硬错误）。
+  it("pi / omp 走 -p --mode json（prompt 留 stdin），--model 整段透传", () => {
+    expect(buildAgentArgs("pi", "hi")).toEqual(["-p", "--mode", "json"]);
+    expect(buildAgentArgs("pi", "hi", "anthropic/claude-sonnet-5")).toEqual([
+      "-p", "--mode", "json", "--model", "anthropic/claude-sonnet-5",
+    ]);
+    // omp 是 pi 协议家族的衍生（builtin_runtimes.go:86-100），同形。
+    expect(buildAgentArgs("omp", "hi", "anthropic/claude-sonnet-5")).toEqual([
+      "-p", "--mode", "json", "--model", "anthropic/claude-sonnet-5",
+    ]);
+    // prompt 不进 argv：超长或超短都一样——pi 的 prompt 永远在 stdin。
+    expect(buildAgentArgs("pi", "a".repeat(9000))).toEqual([]);
+  });
+
+  // traecli：一次性 `exec [PROMPT] --json`（docs.trae.cn）。不引入 ACP 会话
+  // 管理；不注入 --model（官方参数表没有模型选择旗标）。
+  it("traecli 走 exec --json 一次性入口", () => {
+    expect(buildAgentArgs("traecli", "hi")).toEqual(["exec", "hi", "--json"]);
+    expect(buildAgentArgs("traecli", "hi", "quukk/glm-5.2")).toEqual(["exec", "hi", "--json"]);
+  });
+
+  // qodercli / qoderclicn：官方 `-p --output-format stream-json`
+  // （docs.qoder.com/cli/run-in-scripts）。CN 二进制同 backend，argv 共享。
+  it("qodercli / qoderclicn 走 -p + stream-json（同 backend 同 argv）", () => {
+    expect(buildAgentArgs("qodercli", "hi")).toEqual([
+      "-p", "hi", "--output-format", "stream-json",
+    ]);
+    expect(buildAgentArgs("qoderclicn", "hi")).toEqual([
+      "-p", "hi", "--output-format", "stream-json",
+    ]);
+    expect(buildAgentArgs("qodercli", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi", "--output-format", "stream-json",
+    ]);
+  });
+
+  // dsh：argv 只有启动旗标（--profile multica --stdio），prompt 与模型都在
+  // stdin 的 execute 命令帧里（版本化 JSONL 协议，dsh.go:54-64）。
+  it("dsh 走 --profile multica --stdio（prompt/模型在 stdin 命令帧）", () => {
+    expect(buildAgentArgs("dsh", "hi")).toEqual(["--profile", "multica", "--stdio"]);
+    expect(buildAgentArgs("dsh", "hi", "deepseek/dsh-r2")).toEqual([
+      "--profile", "multica", "--stdio",
+    ]);
+    // dsh 没有 argv prompt 形态：超长 prompt 也走同一条 stdin 命令帧路径，
+    // 不会有「回退裸 stdin」的降级形态差。
+    expect(buildAgentArgs("dsh", "a".repeat(9000))).toEqual([]);
+  });
+
+  // agy：上游 buildAntigravityArgs（antigravity.go:780-785）的一次性形态，
+  // --dangerously-skip-permissions 与上游同款（聊天场景没有交互确认通道）。
+  it("agy 走 -p + stream-json + 跳权限（--model 透传）", () => {
+    expect(buildAgentArgs("agy", "hi")).toEqual([
+      "-p", "hi", "--dangerously-skip-permissions", "--output-format", "stream-json",
+    ]);
+    expect(buildAgentArgs("agy", "hi", "gemini-3-pro")).toEqual([
+      "-p", "hi", "--dangerously-skip-permissions", "--output-format", "stream-json",
+      "--model", "gemini-3-pro",
     ]);
   });
 
   it("returns [] for agents without a strategy", () => {
-    expect(buildAgentArgs("codebuddy", "hi")).toEqual([]);
     expect(buildAgentArgs("grok", "hi")).toEqual([]);
   });
 
@@ -240,10 +355,34 @@ describe("splitModelRoute / buildModelArgs", () => {
     expect(buildModelArgs("claude", undefined)).toEqual([]);
   });
 
+  // B 类十家的模型注入面（2026-11-04 批量接入）：每一家都按证据钉住——
+  // 不认路由的（cursor/kimi）不注入，认整段的（pi/omp）整段透传，
+  // 模型在 stdin 协议帧里的（dsh）argv 返回空。
+  it("B 类新 CLI 的模型注入面逐家钉住（不猜参数名）", () => {
+    // cursor-agent：模型跟随 cursor 账户配置（抓包 init model="Auto"）
+    expect(buildModelArgs("cursor-agent", "p/m")).toEqual([]);
+    // traecli / qodercli / qoderclicn：官方参数表没有模型旗标，不注入
+    expect(buildModelArgs("traecli", "p/m")).toEqual([]);
+    expect(buildModelArgs("qodercli", "p/m")).toEqual([]);
+    expect(buildModelArgs("qoderclicn", "p/m")).toEqual([]);
+    // pi / omp：--model 整段透传（pi.go:1001-1010，拆 provider 反而报错）
+    expect(buildModelArgs("pi", "anthropic/claude-sonnet-5"))
+      .toEqual(["--model", "anthropic/claude-sonnet-5"]);
+    expect(buildModelArgs("omp", "anthropic/claude-sonnet-5"))
+      .toEqual(["--model", "anthropic/claude-sonnet-5"]);
+    // dsh：模型在 stdin 的 execute 命令帧（{provider,id}），argv 无 --model
+    expect(buildModelArgs("dsh", "p/m")).toEqual([]);
+    // agy：Gemini CLI 血统，--model 透传（上游 antigravity.go:786-788 同款）
+    expect(buildModelArgs("agy", "gemini-3-pro")).toEqual(["--model", "gemini-3-pro"]);
+  });
+
   it("strips the provider segment for qwen, which only takes the upstream slug", () => {
     expect(buildModelArgs("qwen", "quukk/glm-5.2")).toEqual(["--model", "glm-5.2"]);
     expect(buildModelArgs("qwen", "glm-5.2")).toEqual(["--model", "glm-5.2"]);
     expect(buildModelArgs("qwen", undefined)).toEqual([]);
+    // qwen 有了 argv 策略之后守卫不再拦它：`--model` 必须照常注入（易回归点，
+    // 别让「无策略不注入」的守卫把 stdin 时代的老事实带进 argv 时代）。
+    expect(buildAgentArgs("qwen", "hi", "quukk/glm-5.2")).toContain("glm-5.2");
   });
 
   it("never passes --model to codebuddy (it only exposes a free port)", () => {
@@ -622,6 +761,460 @@ describe("runAgentTurn", () => {
       expect(args).toContain("-p");
       expect(args).toContain("kimi-argv-prompt");
       expect(args).toContain("--output-format");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // ── qwen 思考流（feat/qwen-reasoning）回归 ────────────────────────────────
+  // 现场走查：群里 qwen 回答只有正文、没有思考内容（claude/codex/opencode/hermes
+  // 都有），根因就是 qwen 不在 STREAM_JSON_AGENTS。这组用例按 qwen 0.25.3 的
+  // 真实事件形状（本机 2026-11-04 实测抓取）钉住：argv 形态、思考/正文分道、
+  // 权威正文、argv 超长回退 stdin 仍能答。
+  const qwenTurnStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"glm-5.2","qwen_code_version":"0.25.3"}',
+    '{"type":"stream_event","uuid":"u0","session_id":"s1","parent_tool_use_id":null,"event":{"type":"goal_state","goal_state":{"v":2,"goal":null,"activity":"idle"}}}',
+    '{"type":"stream_event","uuid":"u2","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}',
+    '{"type":"stream_event","uuid":"u3","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"用户要"}}}',
+    '{"type":"stream_event","uuid":"u4","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"一个字"}}}',
+    '{"type":"stream_event","uuid":"u5","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}',
+    '{"type":"stream_event","uuid":"u8","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}}',
+    '{"type":"stream_event","uuid":"u9","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}',
+    '{"type":"stream_event","uuid":"u10","session_id":"s1","parent_tool_use_id":null,"event":{"type":"message_stop"}}',
+    '{"type":"result","subtype":"success","is_error":false,"result":"好"}',
+  ].join("\n") + "\n";
+
+  it("qwen：思考与正文分道流式回调，终值取 result 权威全文", async () => {
+    const fixture = createEchoAgentScript("qwen", { stdoutText: qwenTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qwen",
+        prompt: "只回答一个字：好",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("好");
+      expect(reasoning.join("")).toBe("用户要一个字");
+      expect(chunks.join("")).toBe("好");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("qwen：argv 形态带 -p 与 stream-json 开关（含 --model 裸 slug）", async () => {
+    const fixture = createEchoAgentScript("qwen", { recordArgs: true });
+    try {
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qwen",
+        prompt: "只回答一个字：好",
+        model: "quukk/glm-5.2",
+        timeoutMs: 30_000,
+      });
+      const args = fixture.recordedArgs();
+      expect(args).toContain("-p");
+      expect(args).toContain("stream-json");
+      expect(args).toContain("--include-partial-messages");
+      expect(args).toContain("--model");
+      expect(args).toContain("glm-5.2");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("qwen：超长 prompt 回退 stdin 模式（-p 官方兼容 stdin），解析链不降级", async () => {
+    // recordArgs 与 stdoutText 在 fixture 里互斥，argv 形态断言在上面那条用例。
+    const fixture = createEchoAgentScript("qwen", { stdoutText: qwenTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      // 超长 prompt：strategy 退回 []，走 stdin 模式（qwen -p 明确兼容 stdin 输入，
+      // 实测 `qwen -p <prompt> < /dev/null` 正常作答）。fixture 始终吐同一份
+      // JSONL，正好验证 stdin 形态下整条 stream-json 解析链原样工作。
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qwen",
+        prompt: "x".repeat(8001),
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+      });
+      // stdin 模式没有 argv 策略 → 不进 stream-json 解析，stdout 原样透传
+      // （文本形态的正文兜底），思考通道为空 —— 回退不挂、不失败，正文完整。
+      expect(out).toContain('"type":"result"');
+      expect(reasoning.join("")).toBe("");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // ── B 类十家思考流回归（2026-11-04 批量接入）──────────────────────────────
+  // cursor-agent：事件形状按**仓内真实抓包**逐字构造
+  // （server/pkg/agent/testdata/cursor-agent-2026.07.20-stream-json.jsonl，
+  // 字段零猜测）：顶层 thinking/subtype=delta 事件是思考，assistant/result
+  // 是正文与权威全文，subtype=completed 与 system/user/tool_call 全部丢弃。
+  const cursorTurnStdout = [
+    '{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/tmp","session_id":"ebb","model":"Auto","permissionMode":"default"}',
+    '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"session_id":"ebb"}',
+    '{"type":"thinking","subtype":"delta","text":"Reading notes.txt.","session_id":"ebb","timestamp_ms":1784819288883}',
+    '{"type":"thinking","subtype":"delta","text":" Running wc.","session_id":"ebb","timestamp_ms":1784819289514}',
+    '{"type":"thinking","subtype":"completed","session_id":"ebb","timestamp_ms":1784819289515}',
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"notes.txt has 3 lines."}]},"session_id":"ebb"}',
+    '{"type":"tool_call","subtype":"started","call_id":"call-1","tool_call":{"shellToolCall":{"args":{"command":"wc -l notes.txt"}}},"session_id":"ebb"}',
+    '{"type":"tool_call","subtype":"completed","call_id":"call-1","tool_call":{"shellToolCall":{"args":{"command":"wc -l notes.txt"},"result":{"success":{"stdout":"       3 notes.txt\\n"}}}},"session_id":"ebb"}',
+    '{"type":"thinking","subtype":"delta","text":"Finished.","session_id":"ebb","timestamp_ms":1784819294133}',
+    '{"type":"thinking","subtype":"completed","session_id":"ebb","timestamp_ms":1784819294133}',
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"3 lines written."}]},"session_id":"ebb"}',
+    '{"type":"result","subtype":"success","duration_ms":9679,"is_error":false,"result":"notes.txt has 3 lines.3 lines written.","session_id":"ebb"}',
+  ].join("\n") + "\n";
+
+  it("cursor-agent：思考与正文分道（真实抓包形状），未知 subtype 丢弃", async () => {
+    const fixture = createEchoAgentScript("cursor-agent", { stdoutText: cursorTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "cursor-agent",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      // 权威全文取 result.result（两段 assistant 全文的拼接，与抓包行为一致）。
+      expect(out).toBe("notes.txt has 3 lines.3 lines written.");
+      expect(reasoning.join("")).toBe("Reading notes.txt. Running wc.Finished.");
+      expect(chunks.join("")).toBe("notes.txt has 3 lines.3 lines written.");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // codebuddy：Claude Code fork，事件与 claude 完全同形（上游 codebuddy.go:414-417
+  // 的 thinking 块与 claude 分支同款）。
+  const codebuddyTurnStdout = [
+    '{"type":"system","subtype":"init","session_id":"cb1","model":"glm-5.2"}',
+    '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先查一下"}}}',
+    '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"目录结构"}}}',
+    '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"目录是 src/"}}}',
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"目录是 src/"}]}}',
+    '{"type":"result","subtype":"success","is_error":false,"result":"目录是 src/"}',
+  ].join("\n") + "\n";
+
+  it("codebuddy：claude 分支直接消化 thinking_delta（fork 同形协议）", async () => {
+    const fixture = createEchoAgentScript("codebuddy", { stdoutText: codebuddyTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "codebuddy",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("目录是 src/");
+      expect(reasoning.join("")).toBe("先查一下目录结构");
+      expect(chunks.join("")).toBe("目录是 src/");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // pi / omp：上游 pi.go:545-559 的 message_update 事件（thinking_delta /
+  // text_delta 的增量在 assistantMessageEvent.delta）。
+  const piTurnStdout = [
+    '{"type":"agent_start"}',
+    '{"type":"turn_start"}',
+    '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"想想"}}',
+    '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"再答"}}',
+    '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"答"}}',
+    '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"案"}}',
+    '{"type":"tool_execution_start","toolCallId":"tc1","toolName":"bash","args":{"command":"ls"}}',
+    '{"type":"tool_execution_end","toolCallId":"tc1","result":"file.txt"}',
+    '{"type":"turn_end","message":{"role":"assistant","model":"m","usage":{"input":1,"output":2}}}',
+  ].join("\n") + "\n";
+
+  it("pi：message_update 的 thinking_delta/text_delta 分道，tool_execution 进 activity", async () => {
+    const fixture = createEchoAgentScript("pi", { stdoutText: piTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const steps: unknown[][] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "pi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+        onActivity: (s) => { steps.push(s); },
+      });
+      // pi 没有 result 帧：终值由 extractStreamJsonFinalText 的增量聚合给出。
+      expect(out).toBe("答案");
+      expect(reasoning.join("")).toBe("想想再答");
+      expect(chunks.join("")).toBe("答案");
+      const last = steps.at(-1) as { label: string; status: string; outputDetail?: string }[];
+      expect(last?.[0]).toMatchObject({ label: "执行命令", status: "done", outputDetail: "file.txt" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("omp：与 pi 共享同一解析分支（同协议家族）", async () => {
+    const fixture = createEchoAgentScript("omp", { stdoutText: piTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "omp",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+      });
+      expect(out).toBe("答案");
+      expect(reasoning.join("")).toBe("想想再答");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // kimi：官方明示 stream-json 不写 thinking —— 升级的是**正文流**（逐字 +
+  // result 权威全文），思考通道预期为空。如实断言空思考，不虚构。
+  const kimiTurnStdout = [
+    '{"type":"system","subtype":"init","session_id":"k1","model":"kimi-for-coding"}',
+    '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}}',
+    '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"呀"}}}',
+    '{"type":"result","subtype":"success","is_error":false,"result":"你好呀"}',
+  ].join("\n") + "\n";
+
+  it("kimi：正文流升级（逐字上屏 + 权威全文），思考通道如实为空", async () => {
+    const fixture = createEchoAgentScript("kimi", { stdoutText: kimiTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("你好呀");
+      expect(chunks.join("")).toBe("你好呀");
+      expect(reasoning.join("")).toBe("");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // dsh：版本化 stdio JSONL（v=1）原生 thinking 帧；stdin 收 execute 命令帧
+  // （prompt 与模型都在命令里），stdout 帧按 dsh.go:376-434 的形状。
+  const dshTurnStdout = [
+    '{"v":1,"type":"ready","runtime":"dsh"}',
+    '{"v":1,"type":"session","session_id":"d1"}',
+    '{"v":1,"type":"thinking","content":"先想"}',
+    '{"v":1,"type":"thinking","content":"后答"}',
+    '{"v":1,"type":"text","content":"答"}',
+    '{"v":1,"type":"text","content":"案在此"}',
+    '{"v":1,"type":"tool_call","call_id":"dc1","name":"terminal","arguments":"{\\"command\\":\\"ls\\"}"}',
+    '{"v":1,"type":"tool_result","call_id":"dc1","output":"file.txt"}',
+    '{"v":1,"type":"result","status":"completed","output":"答案在此"}',
+  ].join("\n") + "\n";
+
+  it("dsh：thinking 帧进思考、text 帧进正文、execute 命令写进 stdin", async () => {
+    const fixture = createEchoAgentScript("dsh", { stdoutText: dshTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const steps: unknown[][] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "dsh",
+        prompt: "hi",
+        model: "deepseek/dsh-r2",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+        onActivity: (s) => { steps.push(s); },
+      });
+      expect(out).toBe("答案在此");
+      expect(reasoning.join("")).toBe("先想后答");
+      expect(chunks.join("")).toBe("答案在此");
+      const last = steps.at(-1) as { label: string; status: string; inputDetail?: string }[];
+      expect(last?.[0]).toMatchObject({ label: "执行命令", status: "done", inputDetail: "ls" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("dsh：stdin 收到的是 v=1 execute 命令帧（prompt 与模型在内），不是裸文本", async () => {
+    // stdoutText 与 stdin 探测共存：fixture 的 fixed-agent 只吐固定 stdout，
+    // stdin 落地进 args 文件的验证交给下面的专用 fixture（recordArgs + 裸跑）。
+    // 这里直接用 node 脚本把 stdin 原样回显，检查 execute 帧的字段。
+    const dir = mkdtempSync(join(tmpdir(), "cm-dsh-stdin-"));
+    const helper = join(dir, "dsh-stdin.cjs");
+    writeFileSync(helper, [
+      "let buf='';",
+      "process.stdin.on('data',(d)=>{buf+=d;});",
+      "process.stdin.on('end',()=>{",
+      "  process.stdout.write(buf);",
+      "  process.exit(0);",
+      "});",
+    ].join("\n"));
+    const isWin = process.platform === "win32";
+    const agentPath = join(dir, isWin ? "dsh.cmd" : "dsh");
+    if (isWin) {
+      writeFileSync(agentPath, `@echo off\r\nnode "${helper}"\r\n`, { mode: 0o755 });
+    } else {
+      writeFileSync(agentPath, `#!/bin/sh\nexec node "${helper}"\n`, { mode: 0o755 });
+    }
+    try {
+      const out = await runAgentTurn({
+        execPath: agentPath,
+        agentName: "dsh",
+        prompt: "问题正文",
+        model: "deepseek/dsh-r2",
+        timeoutMs: 30_000,
+      });
+      const frame = JSON.parse(out.trim());
+      expect(frame).toMatchObject({
+        v: 1,
+        type: "execute",
+        prompt: "问题正文",
+        model: { provider: "deepseek", id: "dsh-r2" },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // agy：上游 antigravity.go 的 stream-json 骨架（init/step_update/result），
+  // 正文在 step_update.text_delta（step_type=agent_response），权威全文在
+  // result.result.response。思考字段未实测 → 宽松匹配（置信度中）。
+  const agyTurnStdout = [
+    '{"event":"init","conversation_id":"c1","init":{"model":"gemini-3-pro"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"thinking","thinking_delta":"琢磨一下"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"答"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"案了"}}',
+    '{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"答案了"}}',
+  ].join("\n") + "\n";
+
+  it("agy：宽松思考匹配（thinking_delta）+ 正文走 text_delta + result 权威全文", async () => {
+    const fixture = createEchoAgentScript("agy", { stdoutText: agyTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "agy",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("答案了");
+      expect(reasoning.join("")).toBe("琢磨一下");
+      expect(chunks.join("")).toBe("答案了");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // traecli / qodercli：exec --json 与 stream-json 的 thought 字段待装机实测
+  // （报告三点存疑之二）→ 宽松匹配分支。fixture 按「字段名候选」构造，
+  // 断言宽松匹配命中且不误吞正文。
+  it("traecli/qodercli：宽松思考匹配命中 thinking/thought/reasoning 任一增量", () => {
+    // 直接测 parseStreamJsonLine（fixture 端到端在 chat-stream.test.ts 的
+    // 真实形状组里）。
+    expect(parseStreamJsonLine('{"type":"assistant","thought":"想着"}')).toEqual({ reasoning: "想着" });
+    expect(parseStreamJsonLine('{"type":"assistant","thinking":"想着"}')).toEqual({ reasoning: "想着" });
+    expect(parseStreamJsonLine('{"type":"assistant","reasoning":"想着"}')).toEqual({ reasoning: "想着" });
+    // 嵌套对象形态（thought:{delta/text/content}）
+    expect(parseStreamJsonLine('{"type":"assistant","thought":{"delta":"嵌套"}}'))
+      .toEqual({ reasoning: "嵌套" });
+    // 非 agent 事件（result/system/usage）即使带同名字段也不该误吞——
+    // 但宽松匹配按字段形状判断，字符串字段就是思考。真正要防的是
+    // 正文通道不被污染：text/result/agent_message 走各自精确分支。
+    expect(parseStreamJsonLine('{"type":"result","result":"正文全文"}')).toEqual({ text: "正文全文" });
+    // 空/非字符串字段不命中
+    expect(parseStreamJsonLine('{"type":"assistant","thought":""}')).toBeNull();
+    expect(parseStreamJsonLine('{"type":"assistant","thought":{"extra":1}}')).toBeNull();
+    expect(parseStreamJsonLine('{"type":"assistant"}')).toBeNull();
+  });
+
+  it("traecli：exec --json 端到端（宽松思考 + 正文提取）", async () => {
+    // exec JSONL 真实事件流骨架（官方文档自述 --json 输出事件流；thought
+    // 字段按宽松匹配兜住——装机实测后收窄字段名）。
+    const traecliTurnStdout = [
+      '{"type":"system","subtype":"init","session_id":"t1"}',
+      '{"type":"assistant","thought":"先看看文件"}',
+      '{"type":"assistant","text":"文件已读"}',
+      '{"type":"result","result":"文件已读"}',
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("traecli", { stdoutText: traecliTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "traecli",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("文件已读");
+      expect(reasoning.join("")).toBe("先看看文件");
+      expect(chunks.join("")).toBe("文件已读");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("qodercli：stream-json 端到端（claude 同形骨架 + 宽松思考）", async () => {
+    const qoderTurnStdout = [
+      '{"type":"system","subtype":"init","session_id":"q1","model":"qoder-model"}',
+      '{"type":"assistant","reasoning":"想想再答"}',
+      '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"答出来了"}}}',
+      '{"type":"result","subtype":"success","is_error":false,"result":"答出来了"}',
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("qodercli", { stdoutText: qoderTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qodercli",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("答出来了");
+      expect(reasoning.join("")).toBe("想想再答");
+      expect(chunks.join("")).toBe("答出来了");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("qoderclicn：与 qodercli 共享解析（纯注册），argv 一致", async () => {
+    const fixture = createEchoAgentScript("qoderclicn", { recordArgs: true });
+    try {
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qoderclicn",
+        prompt: "hi",
+        timeoutMs: 30_000,
+      });
+      const args = fixture.recordedArgs();
+      expect(args).toContain("-p");
+      expect(args).toContain("stream-json");
     } finally {
       fixture.cleanup();
     }

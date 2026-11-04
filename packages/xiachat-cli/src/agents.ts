@@ -186,6 +186,24 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   if (name === "hermes") {
     return route ? ["-m", route.model, "--provider", route.provider] : ["-m", model];
   }
+  // cursor-agent：抓包（testdata/cursor-agent-2026.07.20-stream-json.jsonl:1）
+  // 里 init 的 model 是 "Auto"，模型选择走 cursor 账户自己的配置；我们不认的
+  // 路由塞给它只会让它在启动时退出。不注入，模型跟随账户默认。
+  if (name === "cursor-agent") return [];
+  // traecli / qodercli / qoderclicn：官方 CLI 文档的参数表没有可注入的模型
+  // 选择参数（traecli 的模型由服务端配置；qoder 的模型走它自己的账号体系），
+  // 设备端不猜参数名。没有证据就不注入。
+  if (name === "traecli" || name === "qodercli" || name === "qoderclicn") return [];
+  // pi / omp：pi 的模型选择器原生接受 `provider/id` 与裸 id 整段透传
+  // （pi.go:1001-1010，GH #7300）——按首斜杠拆 provider 反而是硬错误
+  // （"Unknown provider"），所以整段传，不拆路由。
+  if (name === "pi" || name === "omp") {
+    return ["--model", model];
+  }
+  // dsh：协议的模型字段是 {provider,id} 对（dsh.go:36-40），JSONL 命令在
+  // stdin 里拼装（runAgentTurn 的 dsh 专用分支），argv 里没有 --model 这个
+  // 旗标——这里返回空，模型信息由 stdin 命令携带。
+  if (name === "dsh") return [];
   return ["--model", model];
 }
 
@@ -230,30 +248,40 @@ export function agentRuntimeEnv(
 // 没打补丁时它只贡献「逐字正文 + 工具过程」。
 // 其余 agent（stdin 模式、或只吐一次性 JSON 信封如 openclaw）不在此列；
 // openclaw 的信封里没有 reasoning payload（实测 2026.9.2），只有 toolSummary。
-const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode", "hermes"]);
+//
+// qwen（2026-11-04 加入）：Qwen Code 0.25.3 `-o stream-json
+// --include-partial-messages` 的事件协议与 claude 同构（thinking_delta /
+// text_delta / assistant / result），解析复用 claude 分支，无需专属映射。
+//
+// B 类十家（2026-11-04 批量接入，逐家的协议依据见 agentArgvStrategies 与
+// parseStreamJsonLine 的分支注释）：
+//   - cursor-agent：官方 stream-json 的顶层 `{"type":"thinking","subtype":
+//     "delta","text":…}` 事件，仓内真实抓包
+//     server/pkg/agent/testdata/cursor-agent-2026.07.20-stream-json.jsonl。
+//   - codebuddy：Claude Code fork，`-p --output-format stream-json --verbose`
+//     的事件形状与 claude 完全同形，解析复用 claude 分支。
+//   - pi / omp：pi 家族 `--mode json` 的 `message_update` 事件携带
+//     assistantMessageEvent {type:"thinking_delta", delta:…}（上游 pi.go:555）；
+//     omp 是同协议家族的衍生 CLI（上游 builtin_runtimes.go:86-100），共用解析。
+//   - kimi：官方文档明确 stream-json 模式「thinking 内容不写入 JSONL」——
+//     升级为逐字正文流（text 通道），思考拿不到，如实不虚构。
+//   - traecli / qodercli / qoderclicn：一次性 headless 事件流（官方文档自述
+//     支持 reasoning 输出），字段按证据优先级实现并标注置信度。
+//   - dsh：版本化 stdio JSONL 的原生 thinking 帧（上游 dsh.go:394-396）。
+//   - agy：1.1.8 起 `--output-format stream-json`；thought 字段名未实测，用
+//     宽松匹配（thinking/thought/reasoning 任一 delta 都当思考），置信度中。
+const STREAM_JSON_AGENTS = new Set([
+  "claude", "codex", "opencode", "hermes", "qwen",
+  "cursor-agent", "codebuddy", "pi", "omp", "kimi",
+  "traecli", "qodercli", "qoderclicn", "dsh", "agy",
+]);
 
 export function agentSupportsReasoning(name: string | undefined): boolean {
   return name !== undefined && STREAM_JSON_AGENTS.has(name);
 }
 
 const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
-  // kimi — `-p/--prompt` 是官方唯一「不打开 TUI」的非交互入口（kimi Command
-  // 参考原文："Run a single prompt non-interactively and stream the Assistant
-  // output to stdout. This mode does not open the TUI"）。
-  //
-  // ⚠️ 这条策略是必须的，不是优化：过去 kimi 没有策略 → buildAgentArgs 返回 []
-  // → 实际 spawn 的是**裸 `kimi`**（交互式 TUI）。TUI 在 Windows 上拿不到
-  // console 时直接退出，stderr 只有一句
-  // `No Windows console found. Are you running cmd.exe?`（生产事故实证，
-  // 设备端由 VBS 自启、没有 console，所以 100% 复现）。
-  //
-  // `--output-format` 只能与 `-p` 同用，取值 text / stream-json。这里先用
-  // text：stdout 即正文（thinking 与工具过程走 stderr），不必为此新增一个
-  // JSONL 解析器——opencode 的教训就是「拿到 JSON 却解析不了」等于没输出。
-  //
-  // 不注入 --model：kimi 的 `-m` 只认它自己的模型别名（如
-  // kimi-code/kimi-for-coding），我们这里的 `provider/model` 路由会被它拒绝。
-  kimi: (prompt) => ["-p", prompt, "--output-format", "text"],
+  // kimi 的策略在下方 qwen 之后（stream-json 升级版，含完整协议依据注释）。
   claude: (prompt, model) => [
     "-p", prompt,
     // stream-json：逐行 JSON 事件流（thinking_delta / text_delta 可解析，
@@ -305,6 +333,174 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   hermes: (prompt, model) => [
     "chat", "-q", prompt, "--oneshot", "--format", "stream-json",
     ...buildModelArgs("hermes", model),
+  ],
+  // qwen（Qwen Code 0.25.3，gemini-cli 分支）：`-p` 官方定义是「Appended to
+  // input on stdin (if any)」——argv 与 stdin 共存，不是 kimi 那种「-p 即非交互
+  // 唯一入口」的二选一。所以策略成立时 prompt 走 argv（8000 字内），超长仍可
+  // 退回 stdin 模式（buildAgentArgs 的老逻辑），两种形态都能答，不会挂起。
+  //
+  // `-o stream-json --include-partial-messages`：逐行 JSON 事件流，事件形状与
+  // claude **完全同构**（本机 0.25.3 + quukk 网关 glm-5.2 实测，2026-11-04）：
+  //   {"type":"stream_event","event":{"type":"content_block_delta",…,
+  //     "delta":{"type":"thinking_delta","thinking":"…"}}}   ← 思考流
+  //   {"type":"stream_event",…,"delta":{"type":"text_delta","text":"…"}}  ← 正文流
+  //   {"type":"assistant","message":{"content":[…]}}        ← 含 thinking/text 块
+  //   {"type":"result","result":"全文"}                     ← 权威全文
+  // 现有 parseStreamJsonLine 的 claude 分支可直接消化，无需 qwen 专属映射；
+  // 工具过程也顺带接通（content_block_start tool_use / assistant tool_use 块）。
+  //
+  // --include-partial-messages 是思考流的前置条件：不带它时 stream_event 里
+  // 只有 goal_state / message_start / message_stop 这几个壳事件，thinking_delta
+  // 与 text_delta 都不会上报（实测抓取确认）。qwen 自己还有 `-y/--yolo`，但
+  // 设备端不需要工具自动批准——聊天场景模型几乎不调工具，真实调用时它会以
+  // permission_denials 记录并继续文本回合（实测），保持默认即可。
+  //
+  // `--model` 注入仍在 buildModelArgs 的 qwen 专属分支（只收上游裸 slug），
+  // 与本策略互不干扰。
+  qwen: (prompt, model) => [
+    "-p", prompt,
+    "--output-format", "stream-json", "--include-partial-messages",
+    ...buildModelArgs("qwen", model),
+  ],
+  // cursor-agent（官方 headless：cursor.com/docs/cli/headless）：`-p <prompt>
+  // --output-format stream-json` 是官方文档的一行式非交互入口；`-p` 的 prompt
+  // 走 argv（与 claude 同形），超长时退回 stdin 模式由通用兜底接住。
+  //
+  // 事件协议字段零猜测：仓内有真实抓包
+  // server/pkg/agent/testdata/cursor-agent-2026.07.20-stream-json.jsonl ——
+  // 顶层 `{"type":"thinking","subtype":"delta","text":…}` 即思考流（cursor.go:186-203
+  // 同款消费方式），正文在 `assistant` 消息与末尾 `result`。不加
+  // --stream-partial-output：抓包证明不带它思考增量也逐条上报，正文的
+  // assistant/result 全文语义更稳（partial 模式会引入需要去重的增量正文块）。
+  // 不注入 --model：抓包显示 init 事件 model 为 "Auto"，cursor-agent 的模型
+  // 选择走它自己的账户配置，我们的 provider/model 路由它不认。
+  "cursor-agent": (prompt) => [
+    "-p", prompt,
+    "--output-format", "stream-json",
+  ],
+  // codebuddy（Claude Code fork）：argv 形状完整对齐上游 daemon
+  // （server/pkg/agent/codebuddy.go:38-61）：`-p` 非交互 + stream-json 双向 +
+  // --verbose。与 claude 完全同形的协议意味着思考解析直接复用 claude 分支。
+  //
+  // ⚠️ 不注入 --model：codebuddy 的 `--model` 只认它自己的模型 id，传裸模型名
+  // 会直接要求登录（见 buildModelArgs 的 codebuddy 分支——只保留 `--port 0`）。
+  // 模型选择继续走它专属的 CODEBUDDY_MODEL 网关 env（agentRuntimeEnv，
+  // agents.ts:192-213），argv 策略的加入不改变那条 env 链路。
+  //
+  // 不带上游的 --permission-mode bypassPermissions / --disallowedTools：聊天
+  // 场景模型几乎不调工具，设备端也没有 ACP 权限桥需要 bypass；少传参数降低
+  // 对 CLI 版本的耦合。
+  codebuddy: (prompt) => [
+    "-p", prompt,
+    "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+    ...buildModelArgs("codebuddy", undefined),
+  ],
+  // pi / omp（pi 协议家族，上游 builtin_runtimes.go:86-100 把 omp 派发给 pi
+  // backend）：上游 buildPiArgs（pi.go:980-1029）的一次性形态是
+  // `pi -p --mode json`，prompt 官方语义走 stdin 管道（"Pi reads piped stdin
+  // to EOF as its initial prompt in print/JSON mode"，pi.go:421）——这是
+  // 设备端「一次 spawn + stdin 收提示词」模型的天然契合点，不需要 ACP/RPC
+  // 长驻会话（报告 §4 的判断：`--mode rpc` 是 JSON-RPC 长驻进程，为它引入
+  // 会话生命周期管理成本过高；`--mode json` 的一次性事件流同源且够用）。
+  //
+  // 事件：`message_update` 携带 assistantMessageEvent {type:"thinking_delta",
+  // delta:…} / {type:"text_delta", delta:…}（pi.go:545-559），thinking_delta
+  // 即思考流。prompt 必须留在 stdin：pi 的 npm shim 在 Windows 上会把 argv
+  // 里的提示词重新分词（pi.go:421-425 注释），所以这条策略不携带 prompt。
+  //
+  // buildModelArgs 对 pi/omp 走默认 `--model <整个路由>`：pi 自己的解析器
+  // 接受 `provider/id` 与裸 id（pi.go:1001-1010，GH #7300——按首斜杠拆
+  // provider 反而是硬错误），所以整段透传是正确形态。
+  pi: (_prompt, model) => [
+    "-p", "--mode", "json",
+    ...buildModelArgs("pi", model),
+  ],
+  omp: (_prompt, model) => [
+    "-p", "--mode", "json",
+    ...buildModelArgs("omp", model),
+  ],
+  // kimi：官方唯一「不打开 TUI」的非交互入口是 `-p/--prompt`（kimi Command
+  // 参考原文："Run a single prompt non-interactively and stream the Assistant
+  // output to stdout. This mode does not open the TUI"）。
+  //
+  // ⚠️ 这条策略是必须的，不是优化：过去 kimi 没有策略 → buildAgentArgs 返回 []
+  // → 实际 spawn 的是**裸 `kimi`**（交互式 TUI）。TUI 在 Windows 上拿不到
+  // console 时直接退出，stderr 只有一句
+  // `No Windows console found. Are you running cmd.exe?`（生产事故实证，
+  // 设备端由 VBS 自启、没有 console，所以 100% 复现）。
+  //
+  // 把既有的 `-p` 策略从 `--output-format text` 升级为 stream-json（官方文档
+  // moonshotai.github.io/kimi-code /reference/kimi-command：`--output-format`
+  // 只能与 `-p` 同用，取值 text / stream-json）。stream-json 模式下官方明确
+  // 「thinking 内容不会写入 JSONL」（text 模式下思考走 stderr）——所以这次
+  // 升级拿到的是**逐字正文流 + result 权威全文**，思考通道在 kimi 上预期为空，
+  // 如实降级，不虚构思考。
+  //
+  // stdout 从「答完一整包」变成逐行事件后，正文增量与工具过程（activity）
+  // 全链路复用 stream-json 管线（Kimi Code 是 Claude Code 协议族的实现，
+  // 事件形状同构，claude 分支直接消化）。仍不注入 --model（它的 -m 只认自家
+  // 别名，见 buildModelArgs 的 kimi 分支）。
+  kimi: (prompt) => ["-p", prompt, "--output-format", "stream-json"],
+  // traecli：官方一次性 headless 入口是 `exec [PROMPT] --json`（docs.trae.cn
+  // cli_command-line-parameters），事件流与它的 ACP 模式同源。不为它引入
+  // `traecli acp serve` 的 ACP 会话管理（报告 §4：优先一次性 headless）。
+  //
+  // ⚠️ 置信度标注：exec JSONL 事件的 thought 字段名**待装机实测**（本机未装）。
+  // 本仓上游对 traecli 走的是 ACP（traecli.go:111），ACP 侧的思考事件
+  // `agent_thought_chunk` 有真实测试桩（traecli_test.go:55，traecli v0.120.42
+  // 真实抓包格式）。exec JSONL 的解析按「宽松匹配 thought/thinking/reasoning
+  // 增量」实现（见 parseStreamJsonLine），命中任何一种都当思考——字段名确认
+  // 后收窄即可，方向不会错。
+  traecli: (prompt) => [
+    "exec", prompt, "--json",
+  ],
+  // qodercli：官方自述 `-p <prompt> --output-format stream-json` 可在脚本里
+  // observe reasoning process（docs.qoder.com/cli/run-in-scripts +
+  // cli-reference）。上游走的是 ACP（qoder.go:22-30），stream-json 是设备端
+  // 更合算的一次性入口。
+  //
+  // ⚠️ 置信度标注：stream-json 模式的 thought 字段名**待装机实测**（官方文档
+  // 描述了能力但没给事件样例），解析同样走宽松匹配（thinking/thought/
+  // reasoning 任一 delta 都当思考），并在 system/init 后的 assistant 事件里
+  // 兼容 claude 同形的 content 块——Qoder 与 Claude Code 系出同门的形态不少，
+  // claude 分支先兜住正文。
+  qodercli: (prompt) => [
+    "-p", prompt, "--output-format", "stream-json",
+  ],
+  // qoderclicn：CN 区独立分发的同一 backend（qoder.go:34-38），argv 与解析
+  // 与 qodercli 完全共享，纯注册。
+  qoderclicn: (prompt) => [
+    "-p", prompt, "--output-format", "stream-json",
+  ],
+  // dsh（DeepSeek DSH bundle）：上游 Multica 走的是版本化 stdio JSONL 协议
+  // （DshProtocolVersion=1，dsh.go:13-30）。设备端复用同一条一次性 spawn
+  // 模型：`--profile multica --stdio` 启动、提示词作为 execute 命令写进
+  // stdin、stdout 逐行吐 JSONL 帧——thinking 帧是协议原生
+  // （dsh.go:394-396 `case "thinking": MessageThinking`）。
+  //
+  // stdin 里发 {"v":1,"type":"execute","prompt":…}：协议是「启动后等 ready
+  // 再收命令」的行式协议，不是 claude 那种裸文本 stdin。模型选择带
+  // provider/model（协议的 model 字段就是 {provider,id} 形，dsh.go:36-40），
+  // reasoning_effort 不注入（设备端没有档位选择）。
+  dsh: (_prompt, model) => [
+    "--profile", "multica", "--stdio",
+    ...buildModelArgs("dsh", model),
+  ],
+  // agy（Antigravity，Gemini CLI 血统）：上游 buildAntigravityArgs
+  // （antigravity.go:780-806）的一次性形态是
+  // `agy -p <prompt> --dangerously-skip-permissions --output-format
+  // stream-json`。1.1.8 起支持 stream-json（antigravity.go:22-24）。
+  //
+  // ⚠️ 置信度标注（报告三点存疑之一）：stream-json 事件里的思考字段名
+  // **需实测**——上游 backend 只消费了 step_update 的 text_delta 与 usage
+  // （antigravity.go:46 只有 thinking_tokens 统计），没透传思考正文。解析按
+  // 宽松匹配实现：thinking/thought/reasoning 任一 delta 事件都当思考，绝不
+  // 硬猜单一字段名。--dangerously-skip-permissions 是上游同款（聊天场景
+  // 没有交互确认通道，不传它会卡在权限询问）。
+  agy: (prompt, model) => [
+    "-p", prompt, "--dangerously-skip-permissions",
+    "--output-format", "stream-json",
+    ...buildModelArgs("agy", model),
   ],
 };
 
@@ -774,7 +970,7 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
 }
 
 // --- stream-json / JSONL 解析（claude & codex 思考流数据源）----------------
-// 两个 agent 都以「每行一个 JSON 事件」输出，思考流与正文分道。解析器是
+// 各 agent 都以「每行一个 JSON 事件」输出，思考流与正文分道。解析器是
 // 纯函数：一行进，{reasoning?, text?, result?} 出。非 JSON 行（codex 的
 // WARNING: / rmcp ERROR 行）返回 null 丢弃。
 //
@@ -799,6 +995,72 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
 // 与 claude/codex 的关键差异：它上报的是**整段 part 的全文**（同一 part 可能被
 // 反复上报），不是增量。所以解析结果带 replace/partId，由调用方按 part 去重后
 // 只发新增后缀，否则正文会成倍重复。
+// qwen（Qwen Code 0.25.3，本机 + quukk 网关 glm-5.2 实测 2026-11-04）：
+//   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"…"}}}
+//   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}}
+//   {"type":"assistant","message":{"content":[{"type":"thinking",…},{"type":"text",…}]}}
+//   {"type":"result","result":"全文"}
+// 事件形状与 claude 完全同构（gemini-cli 分支移植了同一套 content_block 协议），
+// 由上面的 claude 分支直接消化。噪声事件（system/goal_state/message_stop 等）
+// 返回 null 丢弃，与 codex 的 WARNING 行同一待遇。
+//
+// cursor-agent（官方 stream-json，仓内真实抓包
+// testdata/cursor-agent-2026.07.20-stream-json.jsonl:3-7,13-21，字段零猜测）：
+//   {"type":"thinking","subtype":"delta","text":"…"}      ← 思考流（顶层事件）
+//   {"type":"thinking","subtype":"completed"}             ← 块收尾（无正文）
+//   {"type":"assistant","message":{"content":[{"type":"text","text":"…"}]}}
+//   {"type":"result","result":"全文"}
+// 思考是**顶层**事件（不是 claude 的 content_block_delta 内嵌），subtype
+// 只有 delta 带 text；completed 与未知 subtype 一律丢弃（上游 cursor.go:186-203
+// 的 MUL-5231 教训同款：未知 subtype 静默吞掉是事故模式）。assistant 事件与
+// claude 分支同形，直接复用。
+//
+// codebuddy（Claude Code fork，上游 codebuddy.go:38-44 argv、:414-417 思考块）：
+// 与 claude 完全同形的 stream_event / assistant / result 事件，claude 分支直接
+// 消化，无需专属映射。
+//
+// pi / omp（pi 协议家族，上游 pi.go:545-559、piStreamEvent pi.go:826-854）：
+//   {"type":"agent_start"}                                ← 噪声，丢弃
+//   {"type":"turn_start"}                                 ← 噪声，丢弃
+//   {"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"…"}}
+//   {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"…"}}
+//   {"type":"tool_execution_start","toolCallId":…,"toolName":…}   ← activity
+//   {"type":"tool_execution_end",…}                       ← activity
+//   {"type":"turn_end","message":{…}}                     ← 噪声（usage 在上游消费）
+// thinking_delta / text_delta 的增量在 delta 字段（claude 是 thinking/text 字段）。
+//
+// kimi（官方文档 moonshotai.github.io/kimi-code：stream-json 模式「thinking
+// 内容不会写入 JSONL」）：只有正文事件。stream-json 的正文事件形状与 claude
+// 同构（Kimi Code 是 Claude Code 协议族的实现），text_delta 走 claude 分支；
+// result 权威全文同款。思考通道在 kimi 上预期为空——如实降级，不虚构。
+//
+// traecli（`exec <prompt> --json` 一次性 JSONL；⚠️ thought 字段待装机实测）：
+// 事件自述形状参考上游 ACP 测试桩（traecli_test.go:55，真实 v0.120.42 抓包格式
+// 的 `agent_thought_chunk`）；exec JSONL 按宽松匹配：thinking / thought /
+// reasoning 任一增增量字段都当思考。置信度中。
+//
+// qodercli / qoderclicn（`-p --output-format stream-json`；⚠️ thought 字段待
+// 装机实测，官方自述可 observe reasoning）：system/init → assistant → result
+// 的 claude 同形骨架走 claude 分支；宽松匹配兜思考。置信度中。
+//
+// dsh（版本化 stdio JSONL，DshProtocolVersion=1，上游 dsh.go:77-104 帧结构、
+// :394-396 thinking 帧）：
+//   {"v":1,"type":"ready","runtime":"dsh"}                ← 噪声，丢弃
+//   {"v":1,"type":"session","session_id":…}               ← 噪声，丢弃
+//   {"v":1,"type":"thinking","content":"…"}               ← 思考流（原生帧）
+//   {"v":1,"type":"text","content":"…"}                   ← 正文流（增量）
+//   {"v":1,"type":"tool_call","call_id":…,"name":…}       ← activity
+//   {"v":1,"type":"tool_result","call_id":…,"output":…}   ← activity
+//   {"v":1,"type":"result","output":"全文","status":…}    ← 权威全文在 output
+//
+// agy（Antigravity 1.1.8+ stream-json；⚠️ thought 字段需实测，宽松匹配）：
+//   {"event":"init","conversation_id":…,"init":{"model":…}}        ← 噪声
+//   {"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"…"}}
+//   {"event":"step_update","step_update":{…,"thought_delta"/"thinking_delta"/"reasoning_delta":"…"}}
+//   {"event":"result","result":{"response":"全文","status":"SUCCESS"}}
+// 正文在 step_update.text_delta（上游 antigravity.go:393-396 同款消费），
+// 末尾 result.response 是权威全文（antigravity.go:412）。思考字段名未实测，
+// thinking_delta / thought_delta / reasoning_delta 任一命中都当思考（置信度中）。
 export interface StreamJsonDelta {
   reasoning?: string;
   text?: string;
@@ -806,6 +1068,34 @@ export interface StreamJsonDelta {
   partId?: string;
   /** true = 本次给出的是该 part 的完整文本，调用方需自行换算增量。 */
   replace?: boolean;
+}
+
+/**
+ * 判断一行 stream-json 是否为「整轮正文快照」而非增量：claude 形 result /
+ * assistant 汇总消息 / dsh 的 result 帧。消费端（runAgentTurn）据此与已流出
+ * 的 delta 正文做前缀换算——claude/qwen/codebuddy 的 delta 流已逐字上屏，
+ * 快照再整段发会让过程气泡正文翻倍；cursor-agent / traecli 没有 text delta，
+ * 快照就是正文上屏的来源，换算逻辑对它们天然放行（streamedText 对不上时
+ * 整段发）。
+ */
+export function isTextSnapshotLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null) return false;
+  const event = parsed as Record<string, unknown>;
+  if (event.v === DSH_PROTOCOL_VERSION) return event.type === "result";
+  if (event.type === "result" && typeof event.result === "string") return true;
+  if (event.type === "assistant") {
+    const content = (event.message as Record<string, unknown> | undefined)?.content;
+    return Array.isArray(content);
+  }
+  return false;
 }
 
 export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
@@ -820,7 +1110,7 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
   if (typeof parsed !== "object" || parsed === null) return null;
   const event = parsed as Record<string, unknown>;
 
-  // --- claude ---
+  // --- claude（含 codebuddy / qwen 的同构事件）---
   if (event.type === "stream_event") {
     const inner = event.event as Record<string, unknown> | undefined;
     const delta = inner?.delta as Record<string, unknown> | undefined;
@@ -832,6 +1122,45 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
       return { text: delta.text };
     }
     return null;
+  }
+
+  // --- cursor-agent：顶层 thinking 事件（subtype=delta 才带 text）---
+  // 真实抓包 testdata/cursor-agent-2026.07.20-stream-json.jsonl:3-7,13-21：
+  // {"type":"thinking","subtype":"delta","text":"…"} / {"type":"thinking",
+  // "subtype":"completed"}（无 text）。completed 与未知 subtype 一律丢弃
+  // ——上游 cursor.go:194-203（MUL-5231）的结论：未知 subtype 静默折叠进
+  // 思考正是那场事故的根源。
+  if (event.type === "thinking" && event.subtype === "delta") {
+    return typeof event.text === "string" ? { reasoning: event.text } : null;
+  }
+
+  // --- claude 同形的 result / assistant 快照（cursor-agent / traecli / qoder）---
+  // result 是**权威全文**（整轮正文）。cursor-agent / traecli 家族没有 text
+  // delta 流，这是正文上屏的来源之一；claude/qwen/codebuddy 的 delta 已逐字
+  // 上屏，重复由消费端的快照换算吸收（isTextSnapshotLine 判定，见消费端）。
+  if (event.type === "result" && typeof event.result === "string" && event.result) {
+    return { text: event.result };
+  }
+  if (event.type === "assistant") {
+    // traecli 形状：正文/思考在 assistant 事件的顶层字段（无 message.content）。
+    const message = event.message as Record<string, unknown> | undefined;
+    const content = message?.content;
+    if (Array.isArray(content)) {
+      const textParts = content
+        .filter((block): block is Record<string, unknown> =>
+          typeof block === "object" && block !== null
+          && (block as Record<string, unknown>).type === "text")
+        .map((block) => (block as { text?: unknown }).text);
+      if (textParts.length > 0 && textParts.every((t) => typeof t === "string")) {
+        const joined = (textParts as string[]).join("");
+        if (joined) return { text: joined };
+      }
+    } else if (typeof event.text === "string" && event.text) {
+      // 顶层 text（traecli exec --json）；thought/thinking/reasoning 不在这里
+      // ——落到下方宽松思考匹配。
+      return { text: event.text };
+    }
+    // 无快照正文可取的 assistant 事件（含 qwen 的 thinking 块汇总）继续下落。
   }
 
   // --- codex ---
@@ -846,6 +1175,72 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     }
     return null;
   }
+
+  // --- pi / omp：message_update.assistantMessageEvent ---
+  // 上游 pi.go:545-559：thinking_delta / text_delta 的增量都在 delta 字段。
+  if (event.type === "message_update") {
+    const inner = event.assistantMessageEvent as Record<string, unknown> | undefined;
+    if (!inner) return null;
+    if (inner.type === "thinking_delta" && typeof inner.delta === "string") {
+      return { reasoning: inner.delta };
+    }
+    if (inner.type === "text_delta" && typeof inner.delta === "string") {
+      return { text: inner.delta };
+    }
+    return null;
+  }
+
+  // --- dsh：版本化 stdio JSONL（DshProtocolVersion=1）---
+  // 上游 dsh.go:77-104 的帧结构；thinking/text 帧的正文在 content 字段，
+  // result 帧的权威全文在 output 字段。version 不等于 1 的帧整行丢弃
+  // （dsh.go:377-379 同款：协议版本不符直接报错，这里静默丢弃等价降级）。
+  if (event.v === DSH_PROTOCOL_VERSION) {
+    if (event.type === "thinking" && typeof event.content === "string") {
+      return { reasoning: event.content };
+    }
+    if (event.type === "text" && typeof event.content === "string") {
+      return { text: event.content };
+    }
+    if (event.type === "result" && typeof event.output === "string" && event.output) {
+      return { text: event.output };
+    }
+    return null;
+  }
+
+  // --- agy：event 字段判型（不是 type）---
+  // 上游 antigravity.go:364-416：init / step_update / result 三种事件，
+  // 正文在 step_update.text_delta（step_type=agent_response 才是回答），
+  // 权威全文在 result.result.response。思考字段未实测，宽松匹配
+  // thinking_delta / thought_delta / reasoning_delta（置信度中）。
+  if (event.event === "step_update") {
+    const step = event.step_update as Record<string, unknown> | undefined;
+    if (!step) return null;
+    // 思考字段（thinking/thought/reasoning 任一 delta）优先判定：思考 step 的
+    // step_type 形状未实测（候选有 "thinking" 等），不能拿 agent_response 闸门
+    // 把它挡掉——正文通道才需要 step_type 收口。
+    const thought = dshLooseThoughtDelta(step);
+    if (thought !== undefined) return { reasoning: thought };
+    // 非 agent_response 的 step（工具执行等）不进正文通道（工具走 activity）。
+    if (step.step_type !== "agent_response") return null;
+    if (typeof step.text_delta === "string" && step.text_delta) {
+      return { text: step.text_delta };
+    }
+    return null;
+  }
+  if (event.event === "result") {
+    // 正文提取由 extractStreamJsonFinalText 的 agy 分支拿 result.response，
+    // 这里不产出增量（终态事件；过程流的正文已由 step_update 增量上屏）。
+    return null;
+  }
+
+  // --- 宽松思考匹配（traecli exec --json / qodercli stream-json）---
+  // ⚠️ 两家的 thought 字段名都待装机实测（报告三点存疑之二），这里按
+  // 「thinking / thought / reasoning 任一增量字段」宽松匹配，命中即思考。
+  // 证据优先级：官方文档描述 > 上游源码 > 合理推断；字段确认后收窄。
+  // 这条分支放在**最后**：claude/codex/opencode/pi/cursor 等已被上面精确
+  // 分支消化的事件绝不会误入。
+  const loose = parseLooseThoughtLine(event);
+  if (loose) return loose;
 
   // --- hermes ---
   // 形状：{"type":"text","text":"…"}（增量，无 part）/ {"type":"tool_use",…} /
@@ -877,6 +1272,43 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
   return null;
 }
 
+// dsh 协议版本（上游 server/pkg/agent/dsh.go 的 DshProtocolVersion=1）。
+// 解析器只消化 v=1 的帧，版本不符整行丢弃。
+const DSH_PROTOCOL_VERSION = 1;
+
+// traecli / qodercli / agy 共用的宽松思考匹配：事件对象上任一已知思考字段
+// （thinking / thought / reasoning 及其 _delta 后缀变体）带非空字符串即视为
+// 思考增量。只认「值是字符串」的字段——对象形状（part 包装等）走各家的精确
+// 分支，这里绝不猜。
+function parseLooseThoughtLine(event: Record<string, unknown>): StreamJsonDelta | null {
+  const candidates = [event.delta, event.text, event.content];
+  for (const field of ["thinking", "thought", "reasoning"]) {
+    const value = event[field];
+    if (typeof value === "string" && value) return { reasoning: value };
+    // 嵌套对象形态：{thinking:{delta:"…"}} / {thought:{text:"…"}}——字段名
+    // 待实测，两种最常见的内嵌键都探测。
+    if (typeof value === "object" && value !== null) {
+      const nested = value as Record<string, unknown>;
+      for (const inner of candidates) {
+        if (typeof inner === "string" && inner) return { reasoning: inner };
+      }
+      const nestedDelta = nested.delta ?? nested.text ?? nested.content;
+      if (typeof nestedDelta === "string" && nestedDelta) return { reasoning: nestedDelta };
+    }
+  }
+  return null;
+}
+
+// agy step_update 里的宽松思考匹配：thinking_delta / thought_delta /
+// reasoning_delta 任一非空字符串都当思考增量。
+function dshLooseThoughtDelta(step: Record<string, unknown>): string | undefined {
+  for (const field of ["thinking_delta", "thought_delta", "reasoning_delta"]) {
+    const value = step[field];
+    if (typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
+
 // 从 stream-json 全量 stdout 提取最终正文（claude 优先 result.result / 最长
 // assistant 文本；codex 聚合 agent_message；opencode 按 part 顺序拼 text part）。
 // 空时返回 undefined 走兜底。
@@ -889,6 +1321,15 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
   let hermesResult: string | undefined;
   // opencode 的正文按 part 分片上报，同一 part 可能重复出现 → 以 id 去重、保序。
   const opencodeTexts = new Map<string, string>();
+  // dsh 的 text 帧是增量（content 字段），result 帧的权威全文在 output 字段。
+  const dshDeltas: string[] = [];
+  let dshResult: string | undefined;
+  // agy 的 step_update.text_delta 是增量，result.result.response 是权威全文。
+  const agyDeltas: string[] = [];
+  let agyResult: string | undefined;
+  // pi/omp 的 message_update.assistantMessageEvent.delta 是增量（无 result 帧，
+  // 终值就是增量拼接）。
+  const piDeltas: string[] = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) continue;
@@ -916,6 +1357,37 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
     // hermes 的 result 事件用 text 字段（claude 用 result），且总在最后一条。
     if (event.type === "result" && typeof event.text === "string") {
       hermesResult = event.text;
+    }
+    // dsh：v=1 的帧才有意义；text 帧增量、result 帧权威全文在 output。
+    if (event.v === DSH_PROTOCOL_VERSION) {
+      if (event.type === "text" && typeof event.content === "string" && event.content) {
+        dshDeltas.push(event.content);
+      }
+      if (event.type === "result" && typeof event.output === "string") {
+        dshResult = event.output;
+      }
+    }
+    // agy：event 字段判型；step_update 的正文增量（只认 agent_response step），
+    // result 的权威全文在 result.response。
+    if (event.event === "step_update") {
+      const step = event.step_update as Record<string, unknown> | undefined;
+      if (step && step.step_type === "agent_response"
+        && typeof step.text_delta === "string" && step.text_delta) {
+        agyDeltas.push(step.text_delta);
+      }
+    }
+    // pi/omp：message_update 的正文增量（thinking_delta 不是正文）。
+    if (event.type === "message_update") {
+      const inner = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (inner?.type === "text_delta" && typeof inner.delta === "string" && inner.delta) {
+        piDeltas.push(inner.delta);
+      }
+    }
+    if (event.event === "result") {
+      const result = event.result as Record<string, unknown> | undefined;
+      if (result && typeof result.response === "string") {
+        agyResult = result.response;
+      }
     }
     if (event.type === "assistant") {
       const message = event.message as Record<string, unknown> | undefined;
@@ -946,6 +1418,21 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
   if (opencodeTexts.size > 0) {
     const oc = [...opencodeTexts.values()].join("").trim();
     if (oc.length > 0) return oc;
+  }
+  if (dshResult !== undefined && dshResult.trim().length > 0) return dshResult;
+  if (dshDeltas.length > 0) {
+    const dh = dshDeltas.join("");
+    if (dh.trim().length > 0) return dh;
+  }
+  if (agyResult !== undefined && agyResult.trim().length > 0) return agyResult;
+  if (agyDeltas.length > 0) {
+    const ay = agyDeltas.join("");
+    if (ay.trim().length > 0) return ay;
+  }
+  // pi/omp：无 result 帧，增量拼接即终值。
+  if (piDeltas.length > 0) {
+    const pi = piDeltas.join("");
+    if (pi.trim().length > 0) return pi;
   }
   const joined = texts.join("\n").trim();
   return joined.length > 0 ? joined : undefined;
@@ -1827,6 +2314,20 @@ function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
         if (delta.text !== undefined) emitPart("text", delta.partId, delta.text);
         return;
       }
+      if (delta.text !== undefined && isTextSnapshotLine(flushed)) {
+        // 快照语义：与已流出的 delta 正文做前缀换算。全等（qwen/codebuddy 的
+        // result 与 delta 流相同）→ 丢弃；延伸（result 含 delta 之后的更多内容）
+        // → 补后缀；快照是已流出正文的子串（cursor 分段 assistant 快照）→
+        // 丢弃；完全不同（delta 流缺席，cursor/traecli）→ 整段发。
+        if (delta.text === streamedText) return;
+        if (streamedText && delta.text.startsWith(streamedText)) {
+          pushText(delta.text.slice(streamedText.length));
+          return;
+        }
+        if (streamedText && streamedText.startsWith(delta.text)) return;
+        pushText(delta.text);
+        return;
+      }
       if (delta.reasoning !== undefined) deliverReasoning(delta.reasoning);
       if (delta.text !== undefined) pushText(delta.text);
     };
@@ -1985,6 +2486,9 @@ function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
                 + "跑一次 scripts/patch-hermes-reasoning.py（hermes 升级会被覆盖）",
               );
             }
+            // kimi 官方明示 stream-json 不写 thinking（text 模式思考走 stderr）：
+            // 升级到 stream-json 拿的是逐字正文 + 权威全文，思考通道预期为空，
+            // 静默属正常——只有拿得到却没拿到才值得留痕。
             // 非流式路径：stdout 本身就是回答（信封型另有上面那条分支），缓冲
             // 上限即回答长度上限，保持「按字节截断」的老语义；流式路径的正文
             // 是解析出来的，所以缓冲满了也照样给出完整正文（见上一条分支）。
@@ -2010,7 +2514,28 @@ function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
       // The agent may exit before reading all stdin (EPIPE); the close
       // handler reports the real outcome.
     });
-    if (argvMode) {
+    if (argvMode && opts.agentName !== "dsh") {
+      child.stdin.end();
+    } else if (opts.agentName === "dsh") {
+      // dsh 的 stdin 不是裸文本：版本化 stdio JSONL 协议要求写入
+      // {"v":1,"type":"execute",…} 命令帧（上游 dshExecuteCommand，
+      // dsh.go:54-64）。协议说 dsh 启动后先打 ready 帧再收命令——这里是
+      // 简化：一次性管道写入后立即关，dsh 会在 ready 后按行消化缓冲里的
+      // 命令。模型选择随命令携带（provider/model 整段路由）。
+      //
+      // 超长 prompt 也落在这里：dsh 没有 argv prompt 形态（策略不带 prompt），
+      // stdin 是唯一入口，天然没有 8000 字上限问题。
+      const route = opts.model ? splitModelRoute(opts.model) : null;
+      const execute = {
+        v: DSH_PROTOCOL_VERSION,
+        type: "execute",
+        request_id: `cm-${Date.now()}`,
+        cwd: opts.cwd ?? "",
+        prompt: opts.prompt,
+        ...(route ? { model: { provider: route.provider, id: route.model } } : {}),
+        mcp_servers: [],
+      };
+      child.stdin.write(JSON.stringify(execute) + "\n");
       child.stdin.end();
     } else {
       child.stdin.write(opts.prompt);

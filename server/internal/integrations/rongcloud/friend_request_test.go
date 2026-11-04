@@ -170,6 +170,8 @@ type friendEdgeRecorder struct {
 	paths    []string
 	replies  []map[string]interface{}
 	// friends 是 /friend/get.json 回的关系（双向边的两端都会在列表里）。
+	// 这是**全局种子**，对所有 userId 生效（老用例的写法），新用例用 links 记录
+	// 每个用户真实的出边。
 	friends []string
 	// alreadyFriends 里的 "user->target" 会被 /friend/add.json 回 25460
 	// （融云对已存在的边就是这么回的），用来钉「本来就存在的边不该被撤」。
@@ -177,6 +179,18 @@ type friendEdgeRecorder struct {
 	// failAdd 里的 "user->target" 会被 /friend/add.json 回 500（模拟建边失败），
 	// 用来钉「中途失败要回滚本次已建出的边」。
 	failAdd map[string]bool
+	// pendingAdd 里的 "user->target" 会让 /friend/add.json 回 200 + processCode
+	// 25461：申请建立了、**好友边没有建立**。这就是线上「审批回成功、请求方却
+	// 看不到拥有者」的那个假成功。
+	pendingAdd map[string]bool
+	// links 按 userId 记录真实落地的好友边。建边成功才登记，/friend/get.json 由它
+	// 回读 —— 让假融云自洽（建好的边一定查得到），也才能钉住收尾那次真实回查。
+	links map[string]map[string]bool
+	// staleListFor 里的 userId 会让 /friend/get.json 回一个**不含新边**的列表，
+	// 模拟「add 回 200 了、边却没落地」—— 只有收尾回查能发现这一态。
+	staleListFor map[string]bool
+	// failGet 里的 userId 会让 /friend/get.json 回 500（模拟回查本身失败）。
+	failGet map[string]bool
 }
 
 func newFriendEdgeServer(t *testing.T, friends ...string) (*friendEdgeRecorder, *httptest.Server) {
@@ -186,6 +200,7 @@ func newFriendEdgeServer(t *testing.T, friends ...string) (*friendEdgeRecorder, 
 		_ = r.ParseForm()
 		alreadyFriend := false
 		failedAdd := false
+		pendingAdd := false
 		rec.mu.Lock()
 		rec.paths = append(rec.paths, r.URL.Path)
 		switch r.URL.Path {
@@ -195,12 +210,20 @@ func newFriendEdgeServer(t *testing.T, friends ...string) (*friendEdgeRecorder, 
 			rec.optType = append(rec.optType, r.PostForm.Get("optType"))
 			alreadyFriend = rec.alreadyFriends[pair]
 			failedAdd = rec.failAdd[pair]
+			// optType=1 是「发申请」，本来就只产生待同意的申请、不建边；pendingAdd
+			// 用来模拟 optType=2 也被对方的「加好友验证」拦成申请。
+			pendingAdd = !alreadyFriend && !failedAdd &&
+				(rec.pendingAdd[pair] || r.PostForm.Get("optType") == friendOptTypeRequest)
+			if !alreadyFriend && !failedAdd && !pendingAdd {
+				rec.addLinkLocked(r.PostForm.Get("userId"), r.PostForm.Get("targetId"))
+			}
 		case "/friend/delete.json":
 			for _, target := range strings.Split(r.PostForm.Get("targetIds"), ",") {
 				if target = strings.TrimSpace(target); target == "" {
 					continue
 				}
 				rec.removals = append(rec.removals, r.PostForm.Get("userId")+"->"+target)
+				rec.removeLinkLocked(r.PostForm.Get("userId"), target)
 			}
 		case "/message/private/publish.json":
 			var content map[string]interface{}
@@ -213,8 +236,13 @@ func newFriendEdgeServer(t *testing.T, friends ...string) (*friendEdgeRecorder, 
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/friend/get.json":
-			list := make([]map[string]interface{}, 0, len(rec.friends))
-			for _, id := range rec.friends {
+			userID := r.PostForm.Get("userId")
+			if rec.getFails(userID) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "errorMessage": "friend service is down"})
+				return
+			}
+			list := make([]map[string]interface{}, 0)
+			for _, id := range rec.friendListOf(userID) {
 				list = append(list, map[string]interface{}{"userId": id})
 			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 200, "friendList": list})
@@ -226,7 +254,11 @@ func newFriendEdgeServer(t *testing.T, friends ...string) (*friendEdgeRecorder, 
 			if failedAdd {
 				code = 500
 			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": code})
+			body := map[string]interface{}{"code": code}
+			if pendingAdd && code == 200 {
+				body["processCode"] = friendCodePendingApproval
+			}
+			_ = json.NewEncoder(w).Encode(body)
 		case "/message/private/publish.json":
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 200, "msgUID": "uid-1"})
 		default:
@@ -236,7 +268,88 @@ func newFriendEdgeServer(t *testing.T, friends ...string) (*friendEdgeRecorder, 
 	return rec, srv
 }
 
-// markAlreadyFriends 让 /friend/add.json 对这对 (user, target) 回 25460。
+// addLinkLocked / removeLinkLocked / friendListOf / getFails 都要求调用方持有 rec.mu
+// （friendListOf / getFails 自己加锁，见下）。
+func (r *friendEdgeRecorder) addLinkLocked(userID, targetID string) {
+	if r.links == nil {
+		r.links = make(map[string]map[string]bool)
+	}
+	if r.links[userID] == nil {
+		r.links[userID] = make(map[string]bool)
+	}
+	r.links[userID][targetID] = true
+}
+
+func (r *friendEdgeRecorder) removeLinkLocked(userID, targetID string) {
+	if r.links[userID] != nil {
+		delete(r.links[userID], targetID)
+	}
+}
+
+// friendListOf 回某个用户的好友列表：全局种子 ∪ 真实落地的出边。
+// staleListFor 里的用户只回种子（模拟「边没落地」）。
+func (r *friendEdgeRecorder) friendListOf(userID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seen := make(map[string]bool)
+	list := make([]string, 0, len(r.friends)+len(r.links[userID]))
+	for _, id := range r.friends {
+		if !seen[id] {
+			seen[id] = true
+			list = append(list, id)
+		}
+	}
+	if r.staleListFor[userID] {
+		return list
+	}
+	for id := range r.links[userID] {
+		if !seen[id] {
+			seen[id] = true
+			list = append(list, id)
+		}
+	}
+	return list
+}
+
+func (r *friendEdgeRecorder) getFails(userID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failGet[userID]
+}
+
+// markPendingAdd 让 /friend/add.json 对这对 (user, target) 回 200 + processCode
+// 25461：申请建立了，好友边**没有**建立。
+func (r *friendEdgeRecorder) markPendingAdd(userID, targetID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingAdd == nil {
+		r.pendingAdd = make(map[string]bool)
+	}
+	r.pendingAdd[userID+"->"+targetID] = true
+}
+
+// markStaleFriendList 让 /friend/get.json 对 userID 回一个不含新边的列表。
+func (r *friendEdgeRecorder) markStaleFriendList(userID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.staleListFor == nil {
+		r.staleListFor = make(map[string]bool)
+	}
+	r.staleListFor[userID] = true
+}
+
+// markGetFailure 让 /friend/get.json 对 userID 回 500。
+func (r *friendEdgeRecorder) markGetFailure(userID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failGet == nil {
+		r.failGet = make(map[string]bool)
+	}
+	r.failGet[userID] = true
+}
+
+// markAlreadyFriends 让 /friend/add.json 对这对 (user, target) 回 25460，并且这条边
+// 在 user 的好友列表里查得到（融云说「已经是好友」时，列表必然有）。
 func (r *friendEdgeRecorder) markAlreadyFriends(userID, targetID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -244,6 +357,7 @@ func (r *friendEdgeRecorder) markAlreadyFriends(userID, targetID string) {
 		r.alreadyFriends = make(map[string]bool)
 	}
 	r.alreadyFriends[userID+"->"+targetID] = true
+	r.addLinkLocked(userID, targetID)
 }
 
 // markAddFailure 让 /friend/add.json 对这对 (user, target) 回 500。
@@ -831,6 +945,250 @@ func TestFriendApproveRequestKeepsTheOwnerEdgeWhenTheTwoWereAlreadyFriends(t *te
 	if got := rec.recordedRemovals(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("revoked edges = %v\nwant            %v（本来就有的人↔人好友边必须保留，"+
 			"节点边只可能由本次申请建出，照旧撤）", got, want)
+	}
+}
+
+// ---- 人际边「以为建上了、其实没建」的假成功 ----
+//
+// 这一组钉的是本链路唯一会**静默错**的地方：/friend/add.json 回 200 不等于边建好了。
+// 融云在 200 的响应体里用 processCode 区分「建上了」与「只产生了一条待对方同意的
+// 申请」（25461，权威语义见 web 端 contacts.ts:376-388）。旧实现只看顶层 code，
+// 于是审批回 success、拥有者界面显示已同意，请求方的联系人里却没有拥有者 ——
+// 三方都不知情。现在这类情况必须在回包的 ownerEdge 里如实报 pending。
+
+// wantOwnerEdge 断言审批回包里的人际边状态。
+func wantOwnerEdge(t *testing.T, reply map[string]interface{}, want string) {
+	t.Helper()
+	if reply["status"] != "success" {
+		t.Fatalf("approveRequest should still succeed, got %#v", reply)
+	}
+	data := replyData(t, reply)
+	if data["approved"] != true {
+		t.Errorf("approved = %#v, want true（人际边没建成不该把节点边也判失败）", data["approved"])
+	}
+	if got := data["ownerEdge"]; got != want {
+		t.Errorf("ownerEdge = %#v, want %q", got, want)
+	}
+}
+
+// 拥有者开着「加好友验证」：optType=2 也落到 25461 —— 200 + 只产生待同意申请。
+// 审批仍要成功（节点边是实体），但回包必须报 pending，且**不能**把这条不存在的边
+// 记进待回滚列表（撤一条不存在的边会打日志、也可能误删别人的关系）。
+func TestFriendApproveReportsPendingWhenTheOwnerEdgeOnlyBecameAnApplication(t *testing.T) {
+	rec, srv := newFriendEdgeServer(t)
+	defer srv.Close()
+	store, mem := newFriendRequestMemory()
+	handler := newFriendRequestHandler(t, srv, store, fixedOwner(testOwnerUserID))
+	rec.markPendingAdd(testOwnerUserID, testRequesterUserID)
+	rec.markPendingAdd(testRequesterUserID, testOwnerUserID)
+
+	sendWebCommand(t, handler, testRequesterUserID, "friend", "sendRequest", map[string]interface{}{"deviceNodeId": testNodeRCID})
+	sendWebCommand(t, handler, testOwnerUserID, "friend", "approveRequest", map[string]interface{}{"requestId": testRequestID})
+
+	wantOwnerEdge(t, rec.last(t), ownerEdgePending)
+	if got := mem.row(t).Status; got != friendRequestApproved {
+		t.Errorf("stored status = %d, want approved（节点边已建，申请必须批掉）", got)
+	}
+	// 节点边照建：产品语义是「把智能体加为好友」，人际边只是顺带的可见性。
+	edges := rec.recordedEdges()
+	for _, want := range []string{
+		testRequesterUserID + "->" + testNodeRCID,
+		testNodeRCID + "->" + testRequesterUserID,
+	} {
+		if !strings.Contains(strings.Join(edges, ","), want) {
+			t.Errorf("edges = %v, want the node edge %q built", edges, want)
+		}
+	}
+	// 没有任何边被撤：审批是成功的，只是人际边没落地。
+	if got := rec.recordedRemovals(); len(got) != 0 {
+		t.Errorf("revoked edges = %v, want none（没建成的边不该去撤，审批也不该回滚）", got)
+	}
+}
+
+// 更隐蔽的一半：融云连 processCode 都不给，就回 200。这时**只有**收尾那次
+// FriendIDs 回查能发现「请求方列表里没有拥有者」。
+//
+// 这条用例专门钉 completeFriendRequest 的收尾校验：把它注释掉，这例会红。
+func TestFriendApproveReportsPendingWhenRongCloudAcknowledgesWithoutAnEdge(t *testing.T) {
+	rec, srv := newFriendEdgeServer(t)
+	defer srv.Close()
+	store, mem := newFriendRequestMemory()
+	handler := newFriendRequestHandler(t, srv, store, fixedOwner(testOwnerUserID))
+	// add 回 200，但请求方的好友列表里就是没有新边。
+	rec.markStaleFriendList(testRequesterUserID)
+
+	sendWebCommand(t, handler, testRequesterUserID, "friend", "sendRequest", map[string]interface{}{"deviceNodeId": testNodeRCID})
+	sendWebCommand(t, handler, testOwnerUserID, "friend", "approveRequest", map[string]interface{}{"requestId": testRequestID})
+
+	wantOwnerEdge(t, rec.last(t), ownerEdgePending)
+	if got := mem.row(t).Status; got != friendRequestApproved {
+		t.Errorf("stored status = %d, want approved", got)
+	}
+	if got := rec.recordedRemovals(); len(got) != 0 {
+		t.Errorf("revoked edges = %v, want none", got)
+	}
+}
+
+// 正常路径：人际边建上了，回查也确实在请求方的列表里 ⇒ linked。
+func TestFriendApproveReportsLinkedWhenTheOwnerEdgeIsVerified(t *testing.T) {
+	rec, srv := newFriendEdgeServer(t)
+	defer srv.Close()
+	store, mem := newFriendRequestMemory()
+	handler := newFriendRequestHandler(t, srv, store, fixedOwner(testOwnerUserID))
+
+	sendWebCommand(t, handler, testRequesterUserID, "friend", "sendRequest", map[string]interface{}{"deviceNodeId": testNodeRCID})
+	sendWebCommand(t, handler, testOwnerUserID, "friend", "approveRequest", map[string]interface{}{"requestId": testRequestID})
+
+	wantOwnerEdge(t, rec.last(t), ownerEdgeLinked)
+	if got := mem.row(t).Status; got != friendRequestApproved {
+		t.Errorf("stored status = %d, want approved", got)
+	}
+	if got := rec.recordedRemovals(); len(got) != 0 {
+		t.Errorf("revoked edges = %v, want none", got)
+	}
+}
+
+// 两人本来就是好友（25460）：回包报 existing，且这条边不能被撤 —— 撤它等于替
+// 两个用户删好友。
+func TestFriendApproveReportsExistingWhenTheTwoWereAlreadyFriends(t *testing.T) {
+	rec, srv := newFriendEdgeServer(t)
+	defer srv.Close()
+	store, mem := newFriendRequestMemory()
+	handler := newFriendRequestHandler(t, srv, store, fixedOwner(testOwnerUserID))
+	rec.markAlreadyFriends(testOwnerUserID, testRequesterUserID)
+	rec.markAlreadyFriends(testRequesterUserID, testOwnerUserID)
+
+	sendWebCommand(t, handler, testRequesterUserID, "friend", "sendRequest", map[string]interface{}{"deviceNodeId": testNodeRCID})
+	sendWebCommand(t, handler, testOwnerUserID, "friend", "approveRequest", map[string]interface{}{"requestId": testRequestID})
+
+	wantOwnerEdge(t, rec.last(t), ownerEdgeExisting)
+	if got := mem.row(t).Status; got != friendRequestApproved {
+		t.Errorf("stored status = %d, want approved", got)
+	}
+	if got := rec.recordedRemovals(); len(got) != 0 {
+		t.Errorf("revoked edges = %v, want none（本来就有的人↔人边不能撤）", got)
+	}
+}
+
+// 回查本身报错（融云 500）：那是「不知道」，不是「没建成」—— 既不能报 linked
+// 骗人，也不能报 pending 冤枉一次可能成功的建边。回中性状态，审批照常成功。
+func TestFriendApproveReportsUnknownWhenTheFriendListCannotBeRead(t *testing.T) {
+	rec, srv := newFriendEdgeServer(t)
+	defer srv.Close()
+	store, mem := newFriendRequestMemory()
+	handler := newFriendRequestHandler(t, srv, store, fixedOwner(testOwnerUserID))
+	rec.markGetFailure(testRequesterUserID)
+
+	sendWebCommand(t, handler, testRequesterUserID, "friend", "sendRequest", map[string]interface{}{"deviceNodeId": testNodeRCID})
+	sendWebCommand(t, handler, testOwnerUserID, "friend", "approveRequest", map[string]interface{}{"requestId": testRequestID})
+
+	wantOwnerEdge(t, rec.last(t), ownerEdgeUnknown)
+	if got := mem.row(t).Status; got != friendRequestApproved {
+		t.Errorf("stored status = %d, want approved（回查失败不等于建边失败）", got)
+	}
+}
+
+// ---- /friend/add.json 的三态解析 ----
+//
+// 上一组钉的是调用方怎么用三态（ownerEdge），这一组钉三态本身：所有「假成功」的根
+// 都在这里 —— 200 只说明调用没报错，边到底建没建要看响应体里的 processCode。
+// 只靠 ownerEdge 那组是钉不住解析的：收尾的 FriendIDs 回查会掩盖「忽略 25461」这个
+// 退化（那正是假融云里 25461 不登记边、回查照样能发现，于是解析写错也全绿）。
+
+func TestAddFriendDetailedDistinguishesTheThreeOutcomes(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]interface{}
+		want friendAddOutcome
+	}{
+		{
+			// 只产生了待对方同意的申请：边**没有**建立。这是审批链路最容易假成功的一态。
+			name: "processCode 25461 is a pending application, not an edge",
+			body: map[string]interface{}{"code": 200, "processCode": friendCodePendingApproval},
+			want: friendAddPending,
+		},
+		{
+			// 对方免验证，这次直接成了好友（没有产生申请），边存在。
+			name: "processCode 25460 means the edge exists",
+			body: map[string]interface{}{"code": 200, "processCode": friendCodeAlreadyFriends},
+			want: friendAddExisting,
+		},
+		{
+			name: "a bare 200 means the edge was created",
+			body: map[string]interface{}{"code": 200},
+			want: friendAddLinked,
+		},
+		{
+			// 顶层 25460 是 postForm 眼里的业务错误，但对建边来说是「本来就存在」。
+			name: "top-level 25460 also means the edge exists",
+			body: map[string]interface{}{"code": friendCodeAlreadyFriends},
+			want: friendAddExisting,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(tc.body)
+			}))
+			defer srv.Close()
+			client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+
+			got, err := client.addFriendDetailed(context.Background(), "user-a", "user-b", "", friendOptTypeDirect)
+			if err != nil {
+				t.Fatalf("addFriendDetailed: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("outcome = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// 真实业务错误必须原样冒出来（不能被当成任何一种「成功态」）。
+func TestAddFriendDetailedReportsAPIErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 500, "errorMessage": "boom"})
+	}))
+	defer srv.Close()
+	client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+
+	if _, err := client.addFriendDetailed(context.Background(), "user-a", "user-b", "", friendOptTypeDirect); err == nil {
+		t.Fatal("addFriendDetailed should surface a business error")
+	}
+}
+
+// addFriendWithOptType 是薄封装，两返回值语义必须与加三态之前**逐字一致**：
+// 老调用方（friend_command 的客户端直加、node_service 的存量补齐/绑定设备）
+// 只看 alreadyFriends，不能因为新增了三态就被改判。
+func TestAddFriendWithOptTypeKeepsItsTwoValueSemantics(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        map[string]interface{}
+		wantAlready bool
+	}{
+		{"pending application is not an existing friend", map[string]interface{}{"code": 200, "processCode": friendCodePendingApproval}, false},
+		{"a created edge is not an existing friend", map[string]interface{}{"code": 200}, false},
+		{"25460 is an existing friend", map[string]interface{}{"code": friendCodeAlreadyFriends}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(tc.body)
+			}))
+			defer srv.Close()
+			client := newRongCloudAPIClient("key", "secret", srv.URL, srv.Client(), testLogger())
+
+			alreadyFriends, err := client.addFriendWithOptType(context.Background(), "user-a", "user-b", "", friendOptTypeDirect)
+			if err != nil {
+				t.Fatalf("addFriendWithOptType: %v", err)
+			}
+			if alreadyFriends != tc.wantAlready {
+				t.Errorf("alreadyFriends = %v, want %v", alreadyFriends, tc.wantAlready)
+			}
+		})
 	}
 }
 

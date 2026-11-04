@@ -26,6 +26,13 @@ type systemHandler struct {
 	discussionRuntime *discussionRuntime
 	// relayHub 仲裁讨论组闲聊的按序发言（chatroom_relay.go）。
 	relayHub *chatroomRelayHub
+	// voiceGate 是 service=ai 语音转写路径（ai/recognizeVoice）的 ASR 闸门，
+	// 由 registration.go 按 ChannelDeps.AsrVoiceGate 注入（HTTP 侧实时读
+	// rongcloud_system_config 的 config_key='asr' 行，fail-closed）。nil 表示
+	// 该部署未装配 = 不设闸（行为与历史完全一致）；非 nil 时返回任意 error
+	// 一律按「关闭」拒绝 —— 闸门实现只有两种返回：nil（开启放行）或哨兵
+	// 错误（关闭 / 读取失败按关闭处理）。
+	voiceGate func(ctx context.Context) error
 	// lobsterStore / friendStore / userStore 是 service=lobster / friend / user
 	// 的本地表读写（见 lobster_command.go / friend_command.go / user_command.go）。
 	// 由 registration.go 按 ChannelDeps.DB 装配；nil 表示该能力未启用（回 503，
@@ -52,6 +59,11 @@ type systemHandler struct {
 	// 这个正例必须能在没有数据库的 CI 里跑；伪造 Scan 的接收者列表会随生成代码
 	// 静默失效，比不测更危险。
 	agentNodeLookup func(ctx context.Context, rcID string) (bool, error)
+	// joinPermissionRows 是群聊加入侧闸门的权限读取接缝（group_join_gate.go）。
+	// 与 agentNodeLookup 同理：判定本身是纯函数、可以脱离数据库测，但「闸门到
+	// 底有没有接进 addMember」只能靠一条真实调用链证明，而那条链要读权限位。
+	// 生产恒为 nil（走 ListRongCloudNodePermissionsByRcUserIDs）。
+	joinPermissionRows agentJoinPermissionRows
 	// wechatAPIBase / wechatHTTPClient 供 service=user 的 wxLogin 调微信
 	// jscode2session；空值走默认域名与 8s 超时客户端（测试注入假服务）。
 	wechatAPIBase    string
@@ -192,7 +204,9 @@ func (h *systemHandler) handleChatroomCommand(ctx context.Context, msg Normalize
 		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetList(ctx, cmd, actor))
 
 	case "get", "info", "getInfo":
-		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd))
+		// getInfo 是只读、不校验身份，但 isOwner 需要观察者视角 ——
+		// 直接把发送者的融云 id 透传进去（拿不到就是空串 → isOwner=false）。
+		return h.commitResult(ctx, msg, cmd, h.actionChatroomGetInfo(ctx, cmd, strings.TrimSpace(msg.FromUserID)))
 
 	case "update":
 		actor, err := h.resolveActor(ctx, msg.FromUserID)
@@ -338,6 +352,17 @@ func (h *systemHandler) commitResult(ctx context.Context, msg NormalizedMessage,
 }
 
 func (h *systemHandler) handleAICommand(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
+	// 语音转写闸门（ai/recognizeVoice）：后台开关关闭时以 4501 asr_disabled
+	// 明确拒绝，禁止 500、禁止静默成功（设计文档 3.1）。闸门在一切业务分支
+	// （含 queries 未装配的 503）之前生效 ——「关闭 = 没有这个功能」的语义
+	// 优先于基础设施降级。getNodes 等节点管理动作不依赖 ASR，不受开关影响。
+	// nil 闸门 = 未装配 = 与历史行为一致（本 if 不触发）。
+	if cmd.Action == "recognizeVoice" && h.voiceGate != nil {
+		if err := h.voiceGate(ctx); err != nil {
+			return h.replyErr(ctx, msg, cmd, AsrDisabledCommandCode, AsrDisabledCommandMessage)
+		}
+	}
+
 	if h.queries == nil {
 		return h.sendError(ctx, msg, cmd.RequestID, "database not available")
 	}
@@ -524,7 +549,12 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		if chatroomID == "" || text == "" {
 			return h.replyErr(ctx, msg, cmd, 400, "参数不完整")
 		}
-		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartRelay(ctx, chatroomID, msg.FromUserID, text))
+		// 可选定向信号：mentions 是融云 id 列表（不存在的 id 由解析层静默忽略，
+		// 不当作 400），mentionAll 是显式「所有人」。都缺省 = 老行为全员接力。
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartRelay(
+			ctx, chatroomID, msg.FromUserID, text,
+			mentionParamIDs(cmd.Params), mentionParamAll(cmd.Params),
+		))
 	}
 
 	// relayGroupMessage 仲裁普通群组（融云 group）闲聊的按序发言：与
@@ -551,7 +581,10 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 			return h.replyErr(ctx, msg, cmd, 500, "查询群成员失败")
 		}
 		// 发起者校验用全量成员（真人发起），发言列表用 AI 过滤结果。
-		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelay(ctx, groupID, msg.FromUserID, text, allMembers, aiMembers))
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelay(
+			ctx, groupID, msg.FromUserID, text, allMembers, aiMembers,
+			mentionParamIDs(cmd.Params), mentionParamAll(cmd.Params),
+		))
 	}
 
 	actor, err := h.discussionRuntime.resolveActor(ctx, msg.FromUserID)

@@ -505,6 +505,13 @@ func (h *Handler) clawAdminRequestEmbedToken(
 
 // clawAdminSecretConfigKeys 是 rongcloud_system_config 里含密钥、
 // 不允许经通用配置接口读出的键。
+//
+// 'asr'（百度 ask/sk）也在内：sk 等同密码，只能走专属口
+// /api/admin/system/config/asr 脱敏回显（claw_asr_config.go）。没有这道闸，
+// GET /api/admin/system/config/{key} 与 List 会把 sk 明文透出。
 func clawAdminSecretConfigKeys() map[string]bool {
-	return map[string]bool{clawAdminEmbedConsoleConfigKey: true}
+	return map[string]bool{
+		clawAdminEmbedConsoleConfigKey: true,
+		asrConfigKey:                   true,
+	}
 }

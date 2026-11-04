@@ -25,6 +25,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -750,6 +752,11 @@ func (h *Handler) ClawUserFriends(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 200, 200, "", map[string]interface{}{"list": []interface{}{}})
 		return
 	}
+	// 归属投影读的是 rongcloud_node.claimed_by_user_id，要 DBTX；NodeService 在
+	// router 里只拿到 *db.Queries，按需在这里挂连接池（与绑定、节点管理同做法，
+	// 见 clawAttachNodeClaimDB）。漏了这一步，friendOwnerProjection 会静默返回
+	// 空 map —— 好友列表永远不带 ownerId，前端只能把人和智能体平铺。
+	h.clawAttachNodeClaimDB()
 	friends, err := h.RongCloudNode.ListUserFriends(r.Context(), userID)
 	if err != nil {
 		// A failed lookup must not break the client: it falls back to the IM
@@ -1250,6 +1257,35 @@ func (h *Handler) clawAttachNodeClaimDB() {
 // 靠错误码和文案区分开，node_id 于是成了可枚举的探针。
 const clawNodeOwnershipMessage = "节点不存在"
 
+// clawAgentNicknameMaxRunes 是智能体全局昵称上限，按**字符**（rune）计，与
+// im_contact_remark.remark 的 32、前端 maxLength=32 三处一致。刻意与分组名的
+// 24 不同源：昵称是「这台 agent 叫什么」，允许比分组名长一点；但两个上限
+// 已经够多，不再给昵称单独发明第三个数字。
+const clawAgentNicknameMaxRunes = 32
+
+// normalizeAgentNickname 去首尾空白后按字符数校验。中文昵称一个字三字节，
+// 用 len() 会把「写作助手专业版」这种 7 字名判超限。
+//
+// 同时拒绝控制字符（U+0000 等 Cc 类）：Go 的 http 与融云接口在这个字符上都会
+// 出异常，而本地已经写进 rongcloud_user.name 时，本地与融云的状态就分裂了。
+// 只拒 Cc 而不是「所有非 IsPrint 字符」：零宽连接符（U+200D，Cf 类）不属于
+// 控制字符，拒掉它会让 👨‍👩‍👧 这类 ZWJ 组合 emoji 昵称变成非法 —— 那是正常昵称。
+func normalizeAgentNickname(raw string) (string, bool) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", false
+	}
+	if utf8.RuneCountInString(name) > clawAgentNicknameMaxRunes {
+		return "", false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return "", false
+		}
+	}
+	return name, true
+}
+
 // ClawUpdateNode POST /api/claw/nodes/{nodeId} 旧站编辑设备资料（昵称/头像）走 HTTP，
 // 替代原 IM 通道 ai/updateNode（Go 兼容层从未实现，旧链路恒报错）。
 func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
@@ -1305,9 +1341,19 @@ func (h *Handler) ClawUpdateNode(w http.ResponseWriter, r *http.Request) {
 		clawJSON(w, 500, 500, "查询节点用户失败", nil)
 		return
 	}
-	name := req.Name
-	if name == "" {
-		name = user.Name.String
+	// name 初始值取库里的现值，而不是空串：下面只有「用户真的想改名」时才覆盖它。
+	name := user.Name.String
+	// 只有「显式传入 name」这一侧才校验；空串 / 纯空白 / 未传 = 保持原值。
+	// 这条回退路径必须原样保留：旧包（uniapp webview 里缓存的旧版、以及只说
+	// portraitUri 的换头像请求）依赖它，一旦也走校验，换头像会被 400 挡掉 ——
+	// 那是线上事故，不是体验问题。
+	if trimmed := strings.TrimSpace(req.Name); trimmed != "" {
+		validated, ok := normalizeAgentNickname(trimmed)
+		if !ok {
+			clawJSON(w, 400, 400, "昵称最多 32 个字", nil)
+			return
+		}
+		name = validated
 	}
 	portrait := req.PortraitUri
 	if portrait == "" {

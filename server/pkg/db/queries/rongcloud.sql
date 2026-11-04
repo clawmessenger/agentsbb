@@ -12,6 +12,13 @@ RETURNING *;
 -- name: GetRongCloudUserByRongCloudID :one
 SELECT * FROM rongcloud_user WHERE rongcloud_user_id = $1;
 
+-- 批量按融云 id 取镜像用户（user/getProfiles 的数据侧）。`::text[]` 的写法与
+-- 同文件 ListRongCloudNodePermissionsByRcUserIDs 一致 —— sqlc 对 `ANY(@ids::text[])`
+-- 生成 `[]string` 入参，与 pgx 的数组绑定兼容。调用方负责去重；缺失的 id 不返回行，
+-- handler 层要为它们补占位条目（前端靠 userId 对齐 map，缺键等于白等）。
+-- name: GetRongCloudUsersByRongCloudIDs :many
+SELECT * FROM rongcloud_user WHERE rongcloud_user_id = ANY(@rongcloud_user_ids::text[]);
+
 -- name: GetRongCloudUserByID :one
 SELECT * FROM rongcloud_user WHERE id = $1;
 

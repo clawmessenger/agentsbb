@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -523,10 +524,14 @@ func (rt *discussionRuntime) interactiveNext(ctx context.Context, d DiscussionRe
 		//   * 主人关掉了该 agent 的「讨论组」权限 —— 追加 permission_denied。
 		// 前端对 member_skipped 的 reason 只做长度校验（discussion-v3.ts:140），
 		// 所以新增枚举不需要前端同步发版。
+		// 主人豁免：actor 用 d.CreatedBy（讨论组创建者的融云 id）。v3 没有「发消息
+		// 的发起人」，轮次由系统按 speaking_order 推进（甚至由上一轮发言的 AI 触发），
+		// 而「这是主人自己的局」最稳定的信号就是他建的组 —— 用「谁触发」的话，
+		// 第 2 轮的触发者是 AI，豁免会在中途失效。
 		skipReason := ""
 		if !rt.interactiveMemberEnabled(ctx, d, role.MemberID) {
 			skipReason = "Member is disabled or no longer available"
-		} else if !perms.allows(role.MemberID, sceneDiscussion) {
+		} else if !perms.allows(role.MemberID, sceneDiscussion, d.CreatedBy) {
 			skipReason = "permission_denied"
 		}
 		if skipReason != "" {
@@ -963,6 +968,18 @@ func roleEntryLabel(entry map[string]interface{}) string {
 	return ""
 }
 
+// 用户插话在提示词里的两种标题：
+//
+//	interactiveOpinionHeaderFresh    本轮新收到的插话（第一次进上下文）
+//	interactiveOpinionHeaderCarried  此前已纳入过、这次是沿用（见 interactiveOpinion.alreadyApplied）
+//
+// 抽成常量是为了让用例能直接断言标题与具体内容成对出现 —— 写成内联字符串时，用例
+// 只能断言「插话原文还在」，改错文案（比如两句都写成「本轮用户插话」）也不会红。
+const (
+	interactiveOpinionHeaderFresh   = "本轮用户插话（必须纳入你的发言）："
+	interactiveOpinionHeaderCarried = "用户此前补充的意见（沿用，不要表述为用户重复强调，仍须在发言中体现）："
+)
+
 // interactiveBuildPrompt 拼出私发给设备的你的角色提示词：人设 + 本轮上下文
 // （话题/目标 + 前序发言 + 本轮用户插话 + 本轮要求）。设备端（CLI）把 role_prompt
 // 原样塞进 agent 提示词，所以插话与前序发言都是从这里进入 agent 的上下文
@@ -1007,12 +1024,37 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 	if focus := history.focusForRound(d.CurrentRound); focus != "" {
 		core = append(core, "本轮聚焦（上一轮纪要点出的问题，先回应它）："+focus)
 	}
+	// opinions 已经过 interactiveVisibleOpinions 过滤：普通成员拿到的是本轮那些，
+	// 主持人还会额外拿到「归属下一轮」的那几条（收口阶段插话时，主持人正是本轮
+	// 最后一位发言者，它必须当场读进纪要）。对主持人而言它们同样是「本轮收到的
+	// 用户插话」，所以标签沿用「本轮」不需要**按轮次**分叉，模型也不会因此误判轮次。
+	//
+	// 唯一要分叉的是「这条意见此前已经被用过」（opinion.alreadyApplied）：同一条
+	// R == N+1 的插话会进两次提示词 —— 第 N 轮收口的主持人读一次、第 N+1 轮再读
+	// 一次。两次都是「本轮用户插话（必须纳入你的发言）」时，模型会把用户这一句话
+	// 表述成「用户再次强调 / 反复要求」，观感像用户在刷屏。所以第二次起换一句
+	// 文案，把「沿用」说清楚，同时保留「仍须在发言中体现」的要求 —— 第 N+1 轮的
+	// 成员是第一次读到它，不能被一句「此前补充的」打发掉。
 	if len(opinions) > 0 {
-		lines := []string{"本轮用户插话（必须纳入你的发言）："}
+		fresh := make([]string, 0, len(opinions))
+		carried := make([]string, 0, len(opinions))
 		for _, opinion := range opinions {
-			lines = append(lines, "- "+opinion.content)
+			if opinion.alreadyApplied {
+				carried = append(carried, "- "+opinion.content)
+				continue
+			}
+			fresh = append(fresh, "- "+opinion.content)
 		}
-		core = append(core, strings.Join(lines, "\n"))
+		// 两段分开拼：同一轮里既可能有新插话、也可能有上一轮沿用下来的那条，
+		// 混在一句标题下就只能二选一。
+		if len(fresh) > 0 {
+			core = append(core, strings.Join(
+				append([]string{interactiveOpinionHeaderFresh}, fresh...), "\n"))
+		}
+		if len(carried) > 0 {
+			core = append(core, strings.Join(
+				append([]string{interactiveOpinionHeaderCarried}, carried...), "\n"))
+		}
 	}
 	coreText := strings.Join(core, "\n")
 	// 话题/目标/插话与本轮要求先占额度，剩下的才是前序发言的预算：宁可少给历史，
@@ -1187,11 +1229,25 @@ func bigramSet(text string) map[string]struct{} {
 	return set
 }
 
-// interactiveOpinion 是一条被本轮消费的用户插话：messageUID 用于回执（interjection_applied）
-// 与前端气泡对账，content 用于拼进提示词。
+// interactiveOpinion 是一条用户插话：messageUID 用于回执（interjection_applied）
+// 与前端气泡对账，content 用于拼进提示词，round 是它的**归属轮次**
+// （user_interjection 事件的 consumedFromRound）。
+//
+// 归属轮次带着走是「下一位发言者立刻可读」的前提：收口阶段插话的归属是 N+1，
+// 而此刻真正开口的是第 N 轮的主持人 —— 派发时得靠 round 才能判断「这条该不该给他」。
 type interactiveOpinion struct {
 	messageUID string
 	content    string
+	round      int
+	// alreadyApplied 表示这条插话在**更早的轮次**已经落过摄入回执
+	// （interjection_applied），也就是此前真的有人把它读进过提示词。
+	//
+	// 提示词要按它分两句文案：同一条插话会被读两次（收口阶段 R=N+1 的插话，
+	// 主持人第 N 轮收口读一次、第 N+1 轮再读一次，见 interactiveVisibleOpinions），
+	// 两次都用「本轮用户插话（必须纳入…）」时模型会把同一句表述成「用户再次强调」，
+	// 观感像用户在刷屏。判据刻意取「是否已被用过」而不是「第几次读」：回执是幂等的
+	// 且只对真正注入的那几条落，所以「有回执」等价于「此前真的读到过」。
+	alreadyApplied bool
 }
 
 // interactiveStatement 是提示词上下文里的一条已发生发言（成员发言或主持纪要）。
@@ -1309,8 +1365,13 @@ func (h interactiveHistory) lastSummaryBefore(round int) (interactiveStatement, 
 	return found, ok
 }
 
-// interactivePromptInputs 一次读回该讨论的事件流，派生出「本轮消费的用户插话」与
+// interactivePromptInputs 一次读回该讨论的事件流，派生出「用户插话」与
 // 「已发生的前序发言」。派发一轮要同时用这两样，一次拉取避免两处看到不同快照。
+//
+// 插话这里只做**粗筛**（归属轮次 ∈ {本轮, 下一轮}），真正的「给谁看」由
+// interactiveVisibleOpinions 按角色判定 —— 那个判定要 role.IsHost，而本函数
+// 不知道这次派发的是谁。粗筛保留「下一轮」是为了让收口阶段的主持人也能读到
+// （见 interactiveVisibleOpinions 的注释）。
 func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]interactiveOpinion, interactiveHistory) {
 	history := interactiveHistory{}
 	events, err := rt.repo.ListEventsAfter(context.Background(), d.DiscussionID, 0)
@@ -1321,6 +1382,16 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 	opinions := []interactiveOpinion{}
 	contributionAt := map[string]int{}
 	summaryAt := map[int]int{}
+	// appliedRoundAt 记录「该 messageUid 的摄入回执（interjection_applied）落在第几轮」。
+	// 回执的 payload 只有 messageUid / targetRequestId / replacementRequestId（v3 契约
+	// 不允许多余字段），轮次只在 v3 信封里，所以这里顺带读一次 e.V3Envelope。
+	//
+	// 为什么要轮次而不只是「有没有回执」：同一条插话在一轮之内会先后注入给多个成员
+	// （R == N 时本轮人人都该读到），第一个成员消费完就落了回执（key 不含成员）。只看
+	// 「有没有回执」的话，同轮第二个成员就会被写成「沿用」，反而削弱了「必须纳入」。
+	// 只有**更早轮次**落下的回执才说明「这条意见此前真的被读过一轮」，也才是要换文案
+	// 的那一次。
+	appliedRoundAt := map[string]int{}
 	for _, e := range events {
 		var payload map[string]interface{}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
@@ -1328,9 +1399,12 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 		}
 		switch e.EventType {
 		case "user_interjection":
-			// 插话只在被投递的那一轮生效，不跨轮重复注入（与旧后端 _context 一致）。
+			// 只留「本轮」与「下一轮」的插话：更早的轮次已经消费过，再注入就是重复；
+			// 更晚的轮次还没轮到，提前放进上下文会抢跑。是否真的注入由
+			// interactiveVisibleOpinions 按角色再判一次（下一轮的那条只给主持人）。
 			round, _ := payload["consumedFromRound"].(float64)
-			if int(round) != d.CurrentRound {
+			opinionRound := int(round)
+			if opinionRound != d.CurrentRound && opinionRound != d.CurrentRound+1 {
 				continue
 			}
 			content, _ := payload["content"].(string)
@@ -1338,7 +1412,23 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 				continue
 			}
 			uid, _ := payload["messageUid"].(string)
-			opinions = append(opinions, interactiveOpinion{messageUID: uid, content: content})
+			opinions = append(opinions, interactiveOpinion{
+				messageUID: uid, content: content, round: opinionRound,
+			})
+		case "interjection_applied":
+			// 「这条插话已经被注入过某人的提示词」的回执（见下方落回执的那段）。
+			// 只取 messageUid 与信封里的轮次，用来给更早轮次消费过的那几条换文案。
+			uid, _ := payload["messageUid"].(string)
+			if uid == "" {
+				continue
+			}
+			appliedRound := interactiveEnvelopeRound(e.V3Envelope)
+			if previous, ok := appliedRoundAt[uid]; ok && previous <= appliedRound {
+				// 同一条插话理论上只有一条回执（幂等 key 不含成员）；真出现多条时取
+				// 最早那次 —— 判断的是「第一次被用掉是哪一轮」。
+				continue
+			}
+			appliedRoundAt[uid] = appliedRound
 		case "contribution_completed":
 			round, _ := payload["round"].(float64)
 			content, _ := payload["content"].(string)
@@ -1387,7 +1477,79 @@ func (rt *discussionRuntime) interactivePromptInputs(d DiscussionRecord) ([]inte
 			history.focus[int(round)] = focus
 		}
 	}
+	// 标记「此前已被用过」：回执落在**更早**的轮次才算（同轮第一个成员消费后落的回执
+	// 不能把同轮后面的成员降级成「沿用」，那会削弱「必须纳入」）。
+	//
+	// 信封缺失（appliedRound == 0，只有手工造事件流才会出现）按「已用过」处理：这条
+	// 插话确实进过某条提示词，宁可降一档文案，也不要让模型把同一句话再说一遍。
+	for i := range opinions {
+		appliedRound, ok := appliedRoundAt[opinions[i].messageUID]
+		if !ok {
+			continue
+		}
+		if appliedRound <= 0 || appliedRound < d.CurrentRound {
+			opinions[i].alreadyApplied = true
+		}
+	}
 	return opinions, history
+}
+
+// interactiveEnvelopeRound 从 v3 信封里取 round；取不到（信封缺失/字段缺失）返回 0。
+//
+// 摄入回执 payload 按契约只能有 messageUid / targetRequestId / replacementRequestId，
+// 轮次只在信封里 —— 所以判「这条意见是哪一轮被用掉的」必须读信封。
+func interactiveEnvelopeRound(envelope json.RawMessage) int {
+	if len(envelope) == 0 {
+		return 0
+	}
+	var fields struct {
+		Round interface{} `json:"round"`
+	}
+	if err := json.Unmarshal(envelope, &fields); err != nil {
+		return 0
+	}
+	switch value := fields.Round.(type) {
+	case float64:
+		return int(value)
+	case string:
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+// interactiveVisibleOpinions 从「归属轮次 ∈ {本轮, 下一轮}」的候选插话里筛出
+// **这次派发真的该注入**的那些（纯函数，便于表驱动单测）。
+//
+// 规则（业务口径：用户插话要在「下一位发言的 agent」那里就读到，而不是白等一整轮）：
+//
+//	round == currentRound       → 注入（任何角色）
+//	round == currentRound+1     → 只注入给主持人
+//	其余                        → 不注入
+//
+// 为什么下一轮的插话要给主持人：插话发生在收口阶段（summarizing / awaiting_user，
+// 或 running 但本轮全员已说完）时，归属轮次被判成 currentRound+1（见
+// interactiveInterjectionRoundFor，那是显示与调度依据，不改）。这一刻真正下一位
+// 开口的正是主持人 —— 它要写本轮纪要/结论；如果只按「轮次相等」注入，它的
+// CurrentRound 仍是 N，round == N+1 就被跳过，用户刚说的话进不了纪要，要等到
+// 第 N+1 轮的成员才有人读到。给主持人放宽一格，插话当场就落地。
+//
+// 为什么普通成员不给下一轮：那等于**提前**注入一次、第 N+1 轮再注入一次，同一条
+// 插话会被读到两遍，模型会当成用户重复强调。所以这里刻意写成两个等值判断，
+// 而不是 round <= currentRound 之类的区间判断（区间判断会把 R=N 的插话在第 N+1 轮
+// 派发时又漏回来）。
+func interactiveVisibleOpinions(opinions []interactiveOpinion, currentRound int, isHost bool) []interactiveOpinion {
+	visible := make([]interactiveOpinion, 0, len(opinions))
+	for _, opinion := range opinions {
+		switch {
+		case opinion.round == currentRound:
+			visible = append(visible, opinion)
+		case opinion.round == currentRound+1 && isHost:
+			visible = append(visible, opinion)
+		}
+	}
+	return visible
 }
 
 // interactiveRoleNames 取角色板「rc 账号 → 展示名」，给上下文里的发言署名用。
@@ -1592,7 +1754,12 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 	requestID := uuid.NewString()
 	// 本轮被消费的用户插话 + 前序发言：同一份快照同时用于提示词拼接与回执落库，
 	// 避免重复全量拉事件，也避免两处看到不同快照。
+	//
+	// 过滤必须落在**这之后、两处消费之前**：提示词只拼真正注入的插话，
+	// interjection_applied 也只对真正注入的插话落回执 —— 否则会提前告诉前端
+	// 「已被本次发言纳入」，而提示词里其实没有它。
 	opinions, history := rt.interactivePromptInputs(d)
+	opinions = interactiveVisibleOpinions(opinions, d.CurrentRound, role.IsHost)
 	action := "assignment"
 	eventType := "assignment_created"
 	// 本轮任务按阶段协议生成，而不是一句「请给出你的分析」：首轮立论、中段交叉
@@ -1628,6 +1795,14 @@ func (rt *discussionRuntime) interactiveDispatch(ctx context.Context, d Discussi
 
 	// 插话消费回执：本轮真正注入该成员提示词的插话落 interjection_applied，
 	// 前端据此把气泡从「已接受」升级为「已纳入发言参考」。
+	//
+	// opinions 在这里已经按角色过滤过（interactiveVisibleOpinions）：只有真的写进
+	// prompt 的那几条才落回执。少了这道过滤，收口阶段主持人会把「归属下一轮」的
+	// 插话也报成已纳入，而普通成员其实还没人读到。
+	//
+	// 主持人提前消费时回执会早一轮落 —— 这是可接受的：后台**确实**已经把它写进
+	// 本轮纪要，用户看到「已纳入」是真话；第 N+1 轮的成员仍会照常读到同一条插话，
+	// 只是不再重复落回执（下面的幂等 key 保证一条插话只有一条回执）。
 	//
 	// payload 必须严格对齐 v3 契约：前端 shape 校验不允许多余字段，且要求
 	// 信封 requestId == payload.replacementRequestId，否则整条事件被判无效丢弃。
@@ -2248,7 +2423,7 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 		if !sameJSONObject(priorPayload, identity) {
 			return errResult(400, "conflicting control request identity")
 		}
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 	}
 	if version, ok := paramInt(cmd, "stateVersion", "state_version", "version"); !ok || version != d.Version {
 		return rt.versionConflictResult(ctx, d.DiscussionID)
@@ -2291,7 +2466,7 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 			return errResult(500, "写入讨论事件失败")
 		}
 		rt.interactiveBroadcast(ctx, advanced, done)
-		return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 	}
 
 	roundStarted, _, err := rt.interactiveEmit(ctx, advanced, interactiveEvent{
@@ -2339,11 +2514,15 @@ func (rt *discussionRuntime) interactiveControl(ctx context.Context, cmd Command
 	}
 	// 回包用 dispatched：角色板刚同步过，前端要立刻看到新成员在板上（版本号没变，
 	// 所以这里不存在乐观锁语义上的冲突）。
-	return okResult(discussionSnapshotView(dispatched, rt.latestArtifactPtr(ctx, dispatched.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, dispatched, rt.latestArtifactPtr(ctx, dispatched.DiscussionID)))
 }
 
-// interactiveInterject 记录一次用户插话（v3）：不重置轮次指针、不打断在跑的发言，
-// 插话只影响本轮后续 agent 的上下文（consumedFromRound = 当前轮）。
+// interactiveInterject 记录一次用户插话（v3）：不重置轮次指针、不打断在跑的发言。
+//
+// consumedFromRound 记的是「归属轮次」（running 中途 = 当前轮；收口阶段 = 下一轮）。
+// 归属轮次只决定**显示与调度**，可见性另算：轮次相等者一律可见，收口阶段的主持人
+// 还能提前读到归属下一轮的那些（见 interactiveVisibleOpinions），所以用户的话
+// 一定会在「下一位发言的 agent」那里就被读到，不会白等一整轮。
 func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd CommandContent, d DiscussionRecord, roomID pgtype.UUID, ownerRCID, actorRCID string) commandResult {
 	content := paramTrim(cmd, "content")
 	messageUID := paramTrim(cmd, "messageUid", "message_uid")
@@ -2363,7 +2542,7 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		if existing, _ := payload["content"].(string); existing != content {
 			return errResult(400, "conflicting message uid")
 		}
-		view := discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID))
+		view := rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID))
 		if round, ok := payload["consumedFromRound"].(float64); ok {
 			view["appliedRound"] = int(round)
 		}
@@ -2392,12 +2571,13 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		}
 		d = fresh
 	}
-	// 插话归属轮次：轮末与未开局时当前轮不会再派发，必须顺延到真正会被消费的轮次，
-	// 否则气泡显示「已接受」但永远无人读到。
+	// 插话归属轮次：轮末与未开局时当前轮不会再派发普通成员，必须顺延到真正会被
+	// 消费的轮次，否则气泡显示「已接受」但永远无人读到。
 	//
-	// 顺延到下一轮是**刻意的**语义（用户要的「下一个 agent 读取」），不是缺陷；
-	// 回包用 appliedRound 把真实轮次告诉前端，UI 才能提示「将在第 N 轮读到」，
-	// 而不是让用户以为当前发言者漏看了。
+	// 顺延到下一轮是**刻意的**语义，不是缺陷；回包用 appliedRound 把真实轮次告诉
+	// 前端，UI 才能提示「将在第 N 轮读到」。注意归属轮次 ≠ 最早可见轮次：收口阶段
+	// 真正下一位开口的是主持人，它会在本轮派发时就读到这条（见
+	// interactiveVisibleOpinions），所以「顺延」不会让用户真的白等一轮。
 	consumedRound := rt.interactiveInterjectionRound(ctx, d)
 	if consumedRound == 0 {
 		return errResult(409, "当前讨论已无后续轮次可承载这条意见")
@@ -2416,7 +2596,7 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 		return errResult(500, "写入插话事件失败")
 	}
 	rt.interactiveBroadcast(ctx, d, event)
-	view := discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID))
+	view := rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID))
 	view["appliedRound"] = consumedRound
 	return okResult(view)
 }
@@ -2428,7 +2608,7 @@ func (rt *discussionRuntime) interactiveInterject(ctx context.Context, cmd Comma
 // 迟到的 cancel 会把已完成的讨论倒写成 cancelled。
 func (rt *discussionRuntime) interactiveCancel(ctx context.Context, d DiscussionRecord, actorRCID, reason string) commandResult {
 	if !IsLiveDiscussionStatus(d.Status) {
-		return okResult(discussionSnapshotView(d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
+		return okResult(rt.snapshotView(ctx, d, rt.latestArtifactPtr(ctx, d.DiscussionID)))
 	}
 	advanced, err := rt.repo.AdvanceState(ctx, AdvanceDiscussionParams{
 		DiscussionID: d.DiscussionID, ExpectedVersion: d.Version,
@@ -2453,7 +2633,7 @@ func (rt *discussionRuntime) interactiveCancel(ctx context.Context, d Discussion
 	if emitErr == nil {
 		rt.interactiveBroadcast(ctx, advanced, event)
 	}
-	return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 }
 
 // interactiveRetryAcceptsStatus 报告 interactiveRetry 是否接受该讨论状态。
@@ -2520,7 +2700,7 @@ func (rt *discussionRuntime) interactiveRetry(ctx context.Context, d DiscussionR
 	if err := rt.interactiveDispatch(ctx, advanced, host, 1); err != nil {
 		return errResult(500, "重试主持人汇总失败")
 	}
-	return okResult(discussionSnapshotView(advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
+	return okResult(rt.snapshotView(ctx, advanced, rt.latestArtifactPtr(ctx, advanced.DiscussionID)))
 }
 
 // interactiveSettleActive 把该讨论仍在途的派发命令置为终结态（取消时用）。
@@ -2585,7 +2765,7 @@ func (rt *discussionRuntime) interactiveLifecycleAction(ctx context.Context, act
 		if err != nil {
 			return okResult(nil), true
 		}
-		return okResult(discussionSnapshotView(d2, nil)), true
+		return okResult(rt.snapshotView(ctx, d2, nil)), true
 	}
 	switch action {
 	case "continue":

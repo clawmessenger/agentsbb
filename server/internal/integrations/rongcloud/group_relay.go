@@ -24,7 +24,10 @@ import (
 // allMembers 用于发起者校验（真人/节点都算群成员）；aiMembers 是经节点表
 // ai_type 过滤后的发言列表（机器主节点天然排除，现行 <agent>_ 与旧 rc_node_
 // 两代 id 都不受前缀影响 —— 前缀判定在这里不可靠）。
-func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, requesterRCID, text string, allMembers, aiMembers []GroupMember) commandResult {
+//
+// mentions / mentionAll 是可选定向信号（「@ 某人」），语义与聊天室一致：只在
+// speakers 里挑子集、保持原顺序、筛空即回退全员。缺省时行为与老版本完全相同。
+func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, requesterRCID, text string, allMembers, aiMembers []GroupMember, mentions []string, mentionAll bool) commandResult {
 	if h.rt == nil || !h.rt.interactiveReady() {
 		return errRelayResult(503, "讨论服务尚未初始化")
 	}
@@ -42,14 +45,32 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 	// 一次批量查询就够（按 rc id），不按成员逐个查 —— 群成员数 × 每条消息都查
 	// 一次会把「有人说话」变成一串 N+1。
 	//
+	// 按**全集**查而不是按定向子集查：定向目标被筛空时要回退全员，回退必须
+	// 复用同一份权限快照。
+	//
 	// 全被过滤时走下面现成的 409：群还在、成员也在，只是没人有权限说话。
+	//
+	// actor = requesterRCID（发这条群消息的人）：群聊闸门同样有主人豁免 —— 主人
+	// 在自己发的消息里不该被自己关掉的开关挡住，与设备端私聊的 owner 口径一致。
 	perms := h.rt.agentPermissions(ctx, relayMemberIDs(speakers))
-	speakers = applyBehaviorPrompts(filterMembersByPermission(speakers, perms, sceneGroup), perms)
+	// 定向选择 + 权限过滤 + 回退全员与聊天室共用同一个实现。
+	// resolveRelayDispatch 内部同时完成 filterMembersByPermission（hotfix 的
+	// sceneGroup 权限闸门 + 主人豁免）与 applyBehaviorPrompts（行为准则注入），
+	// 并在定向目标被筛空时回退全员（mentionFallback=true）。
+	speakers, mentionFallback, targeted := resolveRelayDispatch(
+		speakers, mentions, mentionAll, text, perms, sceneGroup, requesterRCID,
+	)
 	if len(speakers) == 0 {
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}
 	bgCtx := context.WithoutCancel(ctx)
-	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, h.groupRelayRounds(ctx, groupID))
+	// 定向即唯一（方案 A）：@ 谁=谁说一轮，AI 对话轮数收口为 1，
+	// 不再自动接力 —— 这是本次拍板语义与旧「定向只影响先手」的核心差异。
+	rounds := h.groupRelayRounds(ctx, groupID)
+	if targeted {
+		rounds = 1
+	}
+	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, rounds, targeted)
 	if !started && !queued {
 		return errRelayResult(409, "当前无法发起对话，请稍后重试")
 	}
@@ -60,6 +81,9 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		// queued=true：上一条消息的中继还在跑，这条已排队，跑完自动接上
 		// （web 不用特别处理，但要能区分「已开始」和「已排队」）。
 		"queued": queued,
+		// mentionFallback=true：带了 @ 定向但目标没能递出去（@ 的是真人、被 @
+		// 的 agent 无群聊发言权、或 id 不存在），已回退全员接力。纯诊断信号。
+		"mentionFallback": mentionFallback,
 	}}
 }
 
@@ -87,21 +111,23 @@ func (h *chatroomRelayHub) groupRelayRounds(ctx context.Context, groupID string)
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。
 // rounds 是该群的「AI 对话轮数」设置：一次中继要跑几轮全员发言。
 func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) bool {
-	started, _ := h.StartGroupOrQueue(ctx, groupID, members, userText, requesterRCID, rounds)
+	started, _ := h.StartGroupOrQueue(ctx, groupID, members, userText, requesterRCID, rounds, false)
 	return started
 }
 
 // StartGroupOrQueue 与 StartGroup 相同，差别只在群已有中继在跑时不拒绝，
 // 而是把用户消息排进当前会话的待办（pump 收尾后自动接着跑）。见
 // chatroomRelayHub.StartOrQueue 的说明。
-func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) (bool, bool) {
+// targeted=true：定向派发（方案 A —— 轮数收口 1 + 失败不代答），随会话
+// 与排队消息一起传递。
+func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int, targeted bool) (bool, bool) {
 	if len(members) == 0 {
 		return false, false
 	}
 	total := normalizeGroupRelayRounds(rounds)
 	h.mu.Lock()
 	if existing, busy := h.sessions[groupID]; busy {
-		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds))
+		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds), members, targeted)
 		h.mu.Unlock()
 		return false, true
 	}
@@ -113,6 +139,7 @@ func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string
 		requesterRCID: requesterRCID,
 		contextRounds: normalizeContextRounds(rounds),
 		totalRounds:   total,
+		targeted:      targeted,
 	}
 	h.attachContextLocked(session)
 	h.sessions[groupID] = session

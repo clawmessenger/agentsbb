@@ -285,6 +285,50 @@ func TestDiscussionWorkflowCapabilities(t *testing.T) {
 	}
 }
 
+// TestDiscussionSystemHostStatusExposesTimeout 钉住 getSystemHostStatus 回包里的
+// timeout_seconds：C 端要靠它算「推荐等多久算可疑」的本地窗口，口径必须与
+// discussion_roundtable_setup.go 的 `WithTimeout(timeout+5s)` 一致。
+//
+// 不下发这个字段时前端只能拍死值：管理端把超时配到 120s 以上，前端就会先于
+// 服务端判死并诱导用户「重试」—— 一次多余的完整设备端 LLM 回合。
+func TestDiscussionSystemHostStatusExposesTimeout(t *testing.T) {
+	// 未配置：仍回 200，timeout_seconds 回 0 由前端按默认值兜底。
+	bare := &discussionRuntime{}
+	bareRes := bare.actionGetSystemHostStatus(context.Background())
+	if bareRes.code != 200 {
+		t.Fatalf("unconfigured status: %d", bareRes.code)
+	}
+	bareData := bareRes.data.(map[string]interface{})
+	if got, ok := bareData["timeout_seconds"]; !ok || got != 0 {
+		t.Fatalf("unconfigured timeout_seconds = %v (want 0 present)", bareData["timeout_seconds"])
+	}
+	if bareData["reason"] != "SYSTEM_HOST_NOT_CONFIGURED" {
+		t.Fatalf("unconfigured reason = %v", bareData["reason"])
+	}
+
+	// 已配置：原样下发管理端配的秒数（含 120 以上的值）。
+	for _, seconds := range []int{60, 120, 600} {
+		rt := &discussionRuntime{}
+		rt.systemHostLoader = func(context.Context) (DiscussionSystemHostConfig, bool, error) {
+			return DiscussionSystemHostConfig{
+				NodeID: "node-host", DisplayName: "系统主持人", Avatar: "a.png",
+				TimeoutSeconds: seconds,
+			}, true, nil
+		}
+		res := rt.actionGetSystemHostStatus(context.Background())
+		if res.code != 200 {
+			t.Fatalf("status: %d", res.code)
+		}
+		data := res.data.(map[string]interface{})
+		if got := data["timeout_seconds"]; got != seconds {
+			t.Fatalf("timeout_seconds = %v (want %d)", got, seconds)
+		}
+		if data["display_name"] != "系统主持人" || data["reason"] != nil {
+			t.Fatalf("status payload changed: %v", data)
+		}
+	}
+}
+
 // TestResolveActorUnknownSender 验证未知发送者报错。
 func TestResolveActorUnknownSender(t *testing.T) {
 	f := setupDiscussionFixture(t)
@@ -303,13 +347,73 @@ func TestDiscussionSnapshotViewShape(t *testing.T) {
 		Topic: "t", Goal: "g", Mode: "moderated", Status: "planning",
 		Version: 2, RoundPolicy: "legacy_capped", RoleSnapshot: []byte(`{"k":1}`),
 	}, nil)
-	for _, key := range []string{"discussionId", "chatroomId", "createdBy", "topic", "goal", "stateVersion", "roundPolicy", "roles", "status", "mode"} {
+	for _, key := range []string{"discussionId", "chatroomId", "createdBy", "topic", "goal", "stateVersion", "roundPolicy", "roles", "status", "mode", "hostNodeId"} {
 		if _, ok := v[key]; !ok {
 			t.Errorf("snapshot missing key %s", key)
 		}
 	}
 	if !strings.Contains(string(mustJSON(v)), `"stateVersion":2`) {
 		t.Error("stateVersion not serialized")
+	}
+}
+
+// TestDiscussionSnapshotViewHostNodeID hostNodeId 是新增字段：有 host 时逐字
+// 透传，没 host 时回**空串**（不是 null —— 客户端按空串判断「不排除任何设备」，
+// null 会让它多一条解析分支）。
+func TestDiscussionSnapshotViewHostNodeID(t *testing.T) {
+	rec := DiscussionRecord{DiscussionID: "d1", ChatroomID: "c1", Status: "configuring", Version: 1}
+
+	withHost := discussionSnapshotViewWithHost(rec, nil, "node-host-7")
+	if got, ok := withHost["hostNodeId"].(string); !ok || got != "node-host-7" {
+		t.Fatalf("hostNodeId = %#v (want node-host-7)", withHost["hostNodeId"])
+	}
+	if !strings.Contains(string(mustJSON(withHost)), `"hostNodeId":"node-host-7"`) {
+		t.Error("hostNodeId not serialized as camelCase string")
+	}
+
+	noHost := discussionSnapshotViewWithHost(rec, nil, "")
+	if got, ok := noHost["hostNodeId"].(string); !ok || got != "" {
+		t.Fatalf("hostNodeId = %#v (want empty string, never null)", noHost["hostNodeId"])
+	}
+	if strings.Contains(string(mustJSON(noHost)), `"hostNodeId":null`) {
+		t.Error("empty host must serialize to \"\" not null")
+	}
+	// 旧签名（无 host 上下文）同样带这个键，值恒为空串。
+	legacy := discussionSnapshotView(rec, nil)
+	if got, ok := legacy["hostNodeId"].(string); !ok || got != "" {
+		t.Fatalf("legacy view hostNodeId = %#v (want empty string)", legacy["hostNodeId"])
+	}
+}
+
+// TestDiscussionGetActiveCarriesHostNodeID getActive 的快照必须带上该聊天室行的
+// host（C 端续推的 node_ids 靠它排除主持设备）。host_node_id 是 UUID 外键，
+// 对外要换成业务 node_id（`/api/claw/nodes` 用的那套 id）。
+func TestDiscussionGetActiveCarriesHostNodeID(t *testing.T) {
+	f := setupDiscussionFixture(t)
+	ctx := context.Background()
+	actor, err := f.rt.resolveActor(ctx, f.ownerRCID)
+	if err != nil {
+		t.Fatalf("resolveActor: %v", err)
+	}
+
+	start := f.rt.actionStart(ctx, CommandContent{
+		Service: "discussion", Action: "start", WebEnvelope: true,
+		Params: discussionParams("chatroomId", f.roomRCID, "topic", "T", "goal", "G", "maxRounds", 3),
+	}, actor)
+	if start.code != 200 {
+		t.Fatalf("start: %d %s", start.code, start.message)
+	}
+
+	active := f.rt.actionGetActive(ctx, CommandContent{
+		Params: discussionParams("chatroomId", f.roomRCID),
+	}, actor)
+	if active.code != 200 {
+		t.Fatalf("getActive: %d %s", active.code, active.message)
+	}
+	snap, _ := active.data.(map[string]interface{})
+	// fixture 把聊天室的 host_node_id 指向 AI 成员节点，所以期望值就是它的业务 id。
+	if got, _ := snap["hostNodeId"].(string); got != f.memberNode.NodeID {
+		t.Fatalf("hostNodeId = %#v (want %s)", snap["hostNodeId"], f.memberNode.NodeID)
 	}
 }
 

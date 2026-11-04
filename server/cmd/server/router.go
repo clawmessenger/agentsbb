@@ -1278,6 +1278,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				// 的 sqlc 查询（新表 / 新列），所以直接给集成层一个 DBTX；
 				// *pgxpool.Pool 满足 db.DBTX。为 nil 时这三个 service 回 503。
 				DB: pool,
+				// ASR 语音转写闸门：融云命令通道 ai/recognizeVoice 的唯一服务端
+				// 入口（Web sendSystemRequest 与小程序 aiService.recognizeVoice
+				// 同源）。实时读 asr 配置行（loadAsrConfig fail-closed），关闭时
+				// 回 4501 asr_disabled；开启时零改动放行。
+				AsrVoiceGate: h.AsrGate,
 			})
 
 			// Phase 2a: construct service-layer dependencies.
@@ -1687,6 +1692,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Put("/api/claw/contact-groups/assignment", h.ClawAssignContactGroup)
 	r.Put("/api/claw/contact-groups/{id}", h.ClawUpdateContactGroup)
 	r.Delete("/api/claw/contact-groups/{id}", h.ClawDeleteContactGroup)
+	// 联系人备注（我对某人/某个 agent 的私有标注），账号级偏好，跨设备同步。
+	// 与好友列表的取数通道完全解耦 —— 理由见 internal/handler/claw_contact_remark.go
+	// 顶部第 1 条。userId 走 body 而不是路径段（不透明字符串，避免编码对齐问题）。
+	r.Get("/api/claw/contact-remarks", h.ClawListContactRemarks)
+	r.Put("/api/claw/contact-remarks", h.ClawUpdateContactRemark)
 
 	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
 	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
@@ -1730,6 +1740,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/user/binding", h.ClawUserBinding)
 	r.Post("/api/user/wechat-bind", h.ClawUserWeChatBind)
 	r.Get("/api/config/user-guide", h.ClawUserGuide)
+	// 品牌图片（默认头像 / 三张群类图 / Logo）由后台「系统配置」发布，这里公开下发。
+	// 不要求登录：登录页本身要用 Logo，且回包只是 5 个图片地址。
+	r.Get("/api/config/branding", h.ClawBranding)
+	// ASR 能力声明（语音转文字开关）：登录用户可读，不给匿名探测开关状态的口子。
+	// 回包只有 enabled + 能力标识 + 文案，永不含 ask/sk（凭据只在管理端脱敏回显）。
+	// 鉴权在 handler 内走与 /api/quota/me 同一套 Bearer(rongcloud_token) 校验。
+	r.Get("/api/config/asr", h.ClawAsrCapability)
 	r.Post("/api/im/refresh-token", h.ClawImRefreshToken)
 	// 配额与半成品列表（讨论组引导式创建与配额）：C 端预检 / 会话列表合并。
 	r.Get("/api/quota/me", h.ClawGetMyQuota)
@@ -1754,6 +1771,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)
 	r.Get("/api/admin/system/config/{key}", h.ClawAdminSystemConfigGet)
 	r.Put("/api/admin/system/config/{key}", h.ClawAdminSystemConfigPut)
+	// ASR 配置专用读写口（不走上面 {key} 通用口）：sk 是云凭据，需要脱敏回显与
+	// 「sk 留空 = 保持不变」的部分更新语义，通用 JSONB 透传做不到。鉴权与通用口
+	// 同级（handler 内 requireClawAdmin system:read / system:write），且 'asr'
+	// 行也不能经通用口读出（见 clawAdminSecretConfigKeys）。
+	r.Get("/api/admin/system/config/asr", h.ClawAdminAsrConfigGet)
+	r.Put("/api/admin/system/config/asr", h.ClawAdminAsrConfigPut)
+	// 品牌图片上传：`/api/upload-file` 要普通用户登录态、`/api/claw/node-files`
+	// 要设备凭据，后台的 admin token 两条都过不去，所以单开一条只写 branding/ 前缀的。
+	r.Post("/api/admin/branding/upload", h.ClawAdminUploadBrandingImage)
 	// 接入提示词的专用读写口：正文是纯文本，走 system/config 会被包一层
 	// {"value": ...}，后台编辑框还得自己拆，这里直接收发 text。
 	r.Get("/api/admin/onboarding-prompt", h.ClawAdminOnboardingPromptGet)
