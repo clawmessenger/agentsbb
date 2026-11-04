@@ -5,7 +5,7 @@ import type { IMTransport, InboundIMMessage, TurnRunner } from "./im.js";
 import { MessageDispatcher, planReadReceipt } from "./im.js";
 import { runAgentTurn, runAgentCommand } from "./agents.js";
 import { buildChatStreamFrame } from "./chat-stream.js";
-import { createModelCatalogLoader, parseModelCatalogRequest } from "./model-catalog.js";
+import { createModelCatalogLoader, parseAgentDefaultModelRequest, parseModelCatalogRequest } from "./model-catalog.js";
 import { decodeCommandContent } from "./protocol.js";
 import { ROLE_RECOMMEND_ACTION } from "./role-recommend.js";
 import { createAnsweredTurnStore } from "./answered-turns.js";
@@ -19,6 +19,12 @@ import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { loadPermissionSnapshot } from "./agent-permissions.js";
 import { defaultUserModelsPath, FileUserModelStore } from "./user-models.js";
+import { defaultAgentModelPath, FileAgentDefaultModelStore } from "./agent-default-model.js";
+import {
+  defaultAgentSessionsPath,
+  FileAgentSessionStore,
+  isStaleSessionError,
+} from "./agent-sessions.js";
 
 // Per-conversation FIFO. Same conversation serializes (agent busy -> queue,
 // overflow -> onBusy); different conversations run in parallel. Cross-session
@@ -147,6 +153,30 @@ export class SessionQueue {
 
 export function conversationKeyOf(msg: InboundIMMessage): string {
   return `${msg.conversationType}:${msg.targetId}`;
+}
+
+/**
+ * 一轮该用哪个模型。优先级（高 → 低）：
+ *
+ *   1. `explicit`   —— 这一轮派发显式带的：圆桌角色模型（服务端按角色配的下发）、
+ *                      私聊里该用户的 `/use-model`（im.ts 的 per-user 偏好）。
+ *   2. `deviceDefault` —— 主人在通讯录 → 智能体详情 →「默认模型」里设的，落在设备上
+ *                      （agent-default-model.ts），群聊 / 单聊 / 讨论组共用。
+ *   3. `runModel`    —— 装机时 `clawmessenger run --model X` 的启动参数。
+ *   4. 都没有 → undefined，交给 agent CLI 自己的配置。
+ *
+ * 为什么 2 压过 3：面板上的设置是用户**此刻在界面上**做的动作，比装机时的参数新。
+ * 反过来（`--model` 赢）会让「用 install-service --model 装的设备」在面板上改模型
+ * 毫无反应 —— 这正是这次要修的那个「设了没用」。
+ *
+ * 抽成纯函数是为了能被钉住：这几档的先后顺序是用户可见行为，不是实现细节。
+ */
+export function resolveTurnModel(
+  explicit: string | undefined,
+  deviceDefault: string | undefined,
+  runModel: string | undefined,
+): string | undefined {
+  return explicit ?? deviceDefault ?? runModel;
 }
 
 // RongCloud re-delivers the entire offline history on every reconnect and the
@@ -329,6 +359,10 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   // 按用户的模型偏好落盘位置（见 user-models.ts）。省略 -> 用默认位置
   // （~/.clawmessenger/user-models-<nodeId>.json）。
   userModelsPath?: string;
+  // 主人给这台 agent 设置的默认模型（覆盖默认路径，测试注入用）。
+  agentDefaultModelPath?: string;
+  // 「会话形态 + 会话 id」→ agent 原生会话 id 的落盘位置（见 agent-sessions.ts）。
+  agentSessionsPath?: string;
   // Idempotent local repair for action="recover" (main.ts passes
   // ensureOpencodeInstalled for opencode nodes). Omitted -> recover can only
   // diagnose, never install.
@@ -346,6 +380,12 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // 产出文件上传的「凭据缺失」告警只打一次（见 uploadArtifact）。
   let artifactUploadWarned = false;
 
+  // 主人给这台 agent 设置的默认对话模型（通讯录 → 智能体详情 →「默认模型」）。
+  // 群聊 / 单聊 / 讨论组三条路径共用：轮次没显式带 model 时用它兜底。
+  const agentDefaultModel = new FileAgentDefaultModelStore(
+    opts.agentDefaultModelPath ?? defaultAgentModelPath(opts.transport.getSelfUserId?.()),
+  );
+
   // Catalogue the bound agent's models up front: the web's 设备管理 → 默认模型
   // panel aborts after 8s, and `openclaw models list` alone takes ~10s cold.
   // Warm-up runs in the background so it never delays message dispatch.
@@ -359,6 +399,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         maxOutputBytes,
         cwd: opts.cwd,
       }),
+    // 面板上的"当前默认"必须显示主人设的那个值（而不是 agent CLI 自己配置里的），
+    // 否则用户改完再打开面板又看到旧值，等于告诉他"没生效"。
+    readAgentDefaultModel: () => agentDefaultModel.get(),
     logger: (message) => console.error(message),
   });
   catalogLoader.warm();
@@ -410,6 +453,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     answeredTurns,
     loadModelCatalog: (loadOpts) => catalogLoader.load(loadOpts),
     userModels,
+    agentDefaultModel,
+    onDefaultModelChanged: () => catalogLoader.invalidate(),
     probeRuntime,
     agentName: opts.agentName,
     selfUserId: opts.transport.getSelfUserId?.(),
@@ -458,7 +503,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ? opts.transport.sendMessageTo(conversationType, conversationId, objectName, content)
         : Promise.reject(new Error("transport lacks sendMessageTo")),
   });
-  // 模型优先级：**这一轮显式指定的** > `--model`（节点默认）。
+  // 模型优先级：**这一轮显式指定的** > 主人设的默认模型 > `run --model`（装机参数）
+  // > agent CLI 自身配置。
   //
   // `model` 两个来源，都是显式意图：
   //   · 圆桌轮次的 params.model —— 服务端按角色配置下发的角色级模型
@@ -467,28 +513,69 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // 原来写的是 `opts.model ?? model`，即 `clawmessenger run --model X` 会**静默
   // 压死**上面两者：设备上只要带过 `--model`，服务端给角色配的模型就永远不生效，
   // 用户在界面里换模型也看不出任何变化。默认值不该打赢显式指定，所以反过来。
+  //
+  // 第三档（agentDefaultModel）是这次补的：通讯录里设的「默认模型」过去只落在
+  // 浏览器 localStorage，再由 web 在打开单聊时补发 `/use-model`。群聊和讨论组的
+  // 轮次由服务端派发、根本不经过那条补发 —— 用户设了模型却什么变化都看不到。
+  // 现在它落在这台设备上，三条路径都能读到。
+  //
+  // 它排在 `--model` **之前**：面板上的设置是用户此刻在界面上做的动作，比装机时的
+  // 启动参数新。排在后面的话，「用 install-service --model 装的设备」在面板上改
+  // 模型依旧毫无反应 —— 正是这次要修的那个「设了没用」。`--model` 降为最后一档
+  // 兜底（仍在 agent CLI 自身配置之前）。
+  const modelForTurn = (model: string | undefined): string | undefined =>
+    resolveTurnModel(model, agentDefaultModel.get(), opts.model);
+
+  // 会话续接：同一个「会话形态 + 会话 id」的下一轮接在该 agent 上一轮的会话上
+  // （见 agent-sessions.ts）。键由 dispatcher 算好（turnSessionKey），这里只做
+  // 两件事：把上一次的会话 id 塞给 agent；把这一轮带回来的 id 存回去。
+  //
+  // 为什么必须做：设备端是「每条消息 spawn 一次 agent CLI」，不续接的话同一个
+  // 群里聊十句，agent 一句都不记得上一句 —— 用户看到的就是「每句话都是新对话」。
+  const agentSessions = new FileAgentSessionStore(
+    opts.agentSessionsPath ?? defaultAgentSessionsPath(opts.transport.getSelfUserId?.()),
+  );
+  // 会话 id 过期（agent 自己清了旧会话）必须能自愈：清记录、立刻用新会话重跑一次，
+  // 否则这台设备在这个群里会永远带着一个死 id 起步、每轮都失败。
+  const withSessionResume = async (
+    sessionKey: string | undefined,
+    run: (resumeSessionId: string | undefined) => Promise<string>,
+  ): Promise<string> => {
+    if (!sessionKey) return run(undefined);
+    const resumeSessionId = agentSessions.get(sessionKey);
+    try {
+      return await run(resumeSessionId);
+    } catch (err) {
+      if (!resumeSessionId || !isStaleSessionError(err)) throw err;
+      console.warn(`resume failed for ${sessionKey} (${resumeSessionId}); retrying with a fresh session`);
+      agentSessions.clear(sessionKey);
+      return run(undefined);
+    }
+  };
   const turns: TurnRunner = {
     runTurn: (prompt, model, sessionKey, turnOpts) =>
-      runAgentTurn({
+      withSessionResume(sessionKey, (resumeSessionId) => runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
         prompt,
-        model: model ?? opts.model,
+        model: modelForTurn(model),
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         sessionKey,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
+        ...(sessionKey ? { onSessionId: (id: string) => agentSessions.set(sessionKey, id) } : {}),
         ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
-      }),
+      })),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
     // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
     // deltas into chat_stream snapshot frames. signal lets chat_stop kill
     // the agent process instead of just muting the frames.
     runTurnStreamed: (prompt, model, onDelta, signal, sessionKey, turnOpts) =>
-      runAgentTurn({
+      withSessionResume(sessionKey, (resumeSessionId) => runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
         prompt,
-        model: model ?? opts.model,
+        model: modelForTurn(model),
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         onChunk: onDelta,
@@ -500,10 +587,12 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         onActivity: (steps) => onDelta("", undefined, steps),
         signal,
         sessionKey,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
+        ...(sessionKey ? { onSessionId: (id: string) => agentSessions.set(sessionKey, id) } : {}),
         // 行为规范走指令层（codex AGENTS.md / opencode instructions 文件），
         // 只有私聊轮次非空 —— 绝不拼进 prompt。
         ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
-      }),
+      })),
   };
   const queue = new SessionQueue({
     concurrencyPerConversation: 1,
@@ -541,6 +630,14 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     // 模型目录请求是廉价的协议查询，web 侧只等 8s。若走会话队列，一次长 agent
     // 回合（最长 120s）会把它拖过超时，或因为队列只有 1 个等待位而被直接丢弃。
     if (msg.objectName === "command" && parseModelCatalogRequest(msg.content)) {
+      void dispatcher.handle(msg, turns).catch((err: unknown) => {
+        console.error("dispatch failed:", err instanceof Error ? err.message : err);
+      });
+      return;
+    }
+    // 写默认模型同理：一次写盘 + 一条回执，绝不能排在长 agent 回合后面 —— 面板
+    // 保存后要立刻回显，丢进队列（深度 1）会被上一条消息直接挤掉。
+    if (msg.objectName === "command" && parseAgentDefaultModelRequest(msg.content)) {
       void dispatcher.handle(msg, turns).catch((err: unknown) => {
         console.error("dispatch failed:", err instanceof Error ? err.message : err);
       });

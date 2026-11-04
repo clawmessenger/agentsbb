@@ -11,8 +11,11 @@ import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePr
 import { buildAutoContinuationPrompt, classifyTurnError, describeTurnError, TurnIncompleteError } from "./turn-error.js";
 import {
   buildModelCatalogResponse,
+  buildAgentDefaultModelResponse,
   EMPTY_MODEL_CATALOG,
+  parseAgentDefaultModelRequest,
   parseModelCatalogRequest,
+  type AgentDefaultModelRequest,
   type DiscussionModelCatalog,
   type ModelCatalogRequest,
 } from "./model-catalog.js";
@@ -35,6 +38,7 @@ import {
 } from "./role-recommend.js";
 import { formatUseModelAck, parseUseModelCommand, type UseModelCommand } from "./use-model.js";
 import type { UserModelStore } from "./user-models.js";
+import type { AgentDefaultModelStore } from "./agent-default-model.js";
 import {
   behaviorPromptFor,
   decidePrivateChat,
@@ -150,6 +154,13 @@ export interface DispatcherDeps {
   // 从它取模型。省略时 `/use-model` 只回一句「本节点不支持」，不会静默吞掉
   // 命令、也不会把命令当提问送进 agent。
   userModels?: UserModelStore;
+  // 主人给这台 agent 设置的**默认对话模型**（见 agent-default-model.ts）。
+  // web 的通讯录 → 智能体详情 →「默认模型」通过 protocol v2 的
+  // discussion_agent_default_model_request 写到这里；群聊 / 单聊 / 讨论组
+  // 三条路径在轮次没显式带 model 时都用它。省略时该请求回 error，不静默吞。
+  agentDefaultModel?: AgentDefaultModelStore;
+  // 默认模型刚被改写：让模型目录缓存失效，面板保存后立刻回显新值。
+  onDefaultModelChanged?: () => void;
   // Probes / repairs this node's local agent runtime for the web's
   // 设备详情 → 一键唤醒 (see runtime-recovery.ts). Omitted -> the request is
   // still answered, with an honest probe_failed, so the browser never hangs.
@@ -539,6 +550,13 @@ export class MessageDispatcher {
       const catalogRequest = parseModelCatalogRequest(msg.content);
       if (catalogRequest) {
         await this.handleModelCatalogRequest(msg, catalogRequest);
+        return;
+      }
+      // 写「默认模型」：同样是 protocol v2 的 command 消息，形状与目录请求同族，
+      // 也必须排在 decodeCommandContent 之前（它没有 request_id/action）。
+      const defaultModelRequest = parseAgentDefaultModelRequest(msg.content);
+      if (defaultModelRequest) {
+        await this.handleAgentDefaultModelRequest(msg, defaultModelRequest);
         return;
       }
       // Same shape, same reason to match before decodeCommandContent: the
@@ -1438,6 +1456,51 @@ export class MessageDispatcher {
     this.rememberAnsweredCatalogRequest(request.requestId);
     console.log(
       `model catalog: answered ${request.requestId} in ${Date.now() - startedAt}ms (${providers} provider(s), ${models} model(s))`,
+    );
+  }
+
+  /**
+   * 写「这台 agent 的默认对话模型」（通讯录 → 智能体详情 →「默认模型」）。
+   *
+   * 为什么需要单独一条协议：面板过去只把值存进浏览器 localStorage，再由 web 在
+   * 「打开与该设备的单聊」时补发 `/use-model`。于是换浏览器就丢，而群聊 / 讨论组
+   * 的轮次由服务端派发、根本不经过那条补发 —— 用户设了模型却什么都看不见，
+   * 这就是「设置默认模型好像无用」的真身。
+   *
+   * 回执里带的是**落盘后**的真实值（null = 已清除），不是请求里的值：写失败时
+   * （只读 home / 磁盘满）面板要能显示"还是老值"，而不是假装改成功。
+   */
+  async handleAgentDefaultModelRequest(
+    msg: InboundIMMessage,
+    request: AgentDefaultModelRequest,
+  ): Promise<void> {
+    const store = this.deps.agentDefaultModel;
+    const reply = async (model: string | null, error: string | null): Promise<void> => {
+      await this.deps.send(msg.fromUserId, "command", buildAgentDefaultModelResponse(request, model, error));
+    };
+    if (!store) {
+      // 老节点 / 独立 run 模式没有这个 store：如实回一句，别让面板等到超时。
+      await reply(null, "本节点不支持设置默认模型");
+      return;
+    }
+    if (this.answeredCatalogRequests.has(request.requestId)) {
+      console.log(`default model: skipping replayed request ${request.requestId} (already answered)`);
+      return;
+    }
+    let error: string | null = null;
+    try {
+      store.set(request.model);
+      // 让目录缓存失效：面板保存完会立刻重拉目录回显，5 分钟旧缓存会把刚写进去
+      // 的值打回去，用户看到的就是"设了没生效"。
+      this.deps.onDefaultModelChanged?.();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    await reply(store.get() ?? null, error);
+    this.rememberAnsweredCatalogRequest(request.requestId);
+    console.log(
+      `default model: ${request.model === null ? "cleared" : request.model} by ${msg.fromUserId}` +
+      (error ? ` (error: ${error})` : ""),
     );
   }
 

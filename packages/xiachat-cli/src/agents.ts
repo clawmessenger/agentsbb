@@ -27,6 +27,7 @@ import {
   readAgentConfig,
   type AgentConfig,
 } from "./model-providers.js";
+import { isSessionId } from "./agent-sessions.js";
 import {
   isServeStartupFailure,
   parseServeListeningUrl,
@@ -83,6 +84,16 @@ export interface RunAgentTurnOpts {
   // 「会话形态 + 会话 id」分桶；不支持的 agent 忽略此参数。
   sessionKey?: string;
   /**
+   * 上一轮该 sessionKey 对应的 agent 原生会话 id（见 agent-sessions.ts）。
+   * 空 = 开新会话；不支持续接的 agent 会忽略它。
+   */
+  resumeSessionId?: string;
+  /**
+   * 本轮事件流里出现的 agent 会话 id（可能是新建的，也可能是续接的那个）。
+   * 调用方负责按 sessionKey 落盘，供下一轮 resume。
+   */
+  onSessionId?: (sessionId: string) => void;
+  /**
    * 本轮要注入的**行为规范**（仅私聊非空）。
    *
    * 群聊/讨论组/聊天室的行为准则由服务端拼进 role_prompt，设备端不能再注入一遍；
@@ -117,6 +128,14 @@ export interface RunAgentTurnOpts {
 export interface AgentArgvContext {
   /** 本轮处于「文件读写禁止」限制态（见 agent-permissions.ts fsRestriction）。 */
   fsRestricted?: boolean;
+  /**
+   * 上一轮该会话的 **agent 原生会话 id**：能续接的 agent 在这里接上同一个会话
+   * （见 agent-sessions.ts 的说明）。空 = 开新会话。
+   *
+   * 位置敏感：各家的续接参数必须放在它自己的子命令之后、prompt 之前，
+   * 所以注入点写在每条策略里，而不是统一拼在 argv 末尾。
+   */
+  resumeSessionId?: string;
 }
 type AgentArgvStrategy = (
   prompt: string,
@@ -282,7 +301,7 @@ export function agentSupportsReasoning(name: string | undefined): boolean {
 
 const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // kimi 的策略在下方 qwen 之后（stream-json 升级版，含完整协议依据注释）。
-  claude: (prompt, model) => [
+  claude: (prompt, model, _sessionKey, ctx) => [
     "-p", prompt,
     // stream-json：逐行 JSON 事件流（thinking_delta / text_delta 可解析，
     // 同时是思考流数据源）。--verbose 是 stream-json 的前置要求。
@@ -293,10 +312,19 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     // 设备端拿到的增量恒为 0：正文只能等整包落地由兜底回放，思考卡片则永远
     // 不出现。加上这个参数才出现 content_block_delta（text_delta/thinking_delta）。
     "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    // 会话续接：同一个群/单聊/讨论组里的下一轮接在上一条会话后面（见
+    // agent-sessions.ts）。id 由上一轮的 result/system.init 事件带回来。
+    ...(ctx?.resumeSessionId ? ["--resume", ctx.resumeSessionId] : []),
     ...buildModelArgs("claude", model),
   ],
   codex: (prompt, model, _sessionKey, ctx) => [
-    "exec", prompt,
+    // 续接要换成 `exec resume <id> <prompt>` 的子命令形态（prompt 必须跟在 id
+    // 后面）。实测 0.144.6：`codex exec resume <uuid> "hi" --json` 会被正常接受，
+    // 不存在的 id 报 `no rollout found for thread id …`（见 agent-sessions.ts 的
+    // isStaleSessionError，那条错误会被识别并自动改用新会话重跑）。
+    ...(ctx?.resumeSessionId
+      ? ["exec", "resume", ctx.resumeSessionId, prompt]
+      : ["exec", prompt]),
     // --json：JSONL 事件流（reasoning.item_start/delta 等可解析）。实测
     // codex 0.144：未信任目录需 --skip-git-repo-check；stdin 模式会挂起
     // 等输入，必须保持 argv 模式（runAgentTurn argvMode 下 stdin 已 end）。
@@ -313,9 +341,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 不传这两个参数时它只输出「格式化好的纯文本」，思考与工具步骤全都拿不到
   // ——私聊里「AI 答了但看不到它想了什么、调了什么」就是这么来的。
   // ⚠️ `--format` 是 1.19 才有的参数；更老的 opencode 收到未知参数会直接退出。
-  opencode: (prompt, model) => [
+  opencode: (prompt, model, _sessionKey, ctx) => [
     "run", prompt,
     "--format", "json", "--thinking",
+    // `-s/--session <id>`：续接该会话（`-c/--continue` 是「目录里最近一个」，
+    // 会把不同群聊串成一条，这里绝不能用）。
+    ...(ctx?.resumeSessionId ? ["-s", ctx.resumeSessionId] : []),
     ...buildModelArgs("opencode", model),
   ],
   // --session-key 把这一轮绑到「会话形态 + 会话 id」的独立会话上。不带它时
@@ -330,8 +361,10 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // （system/init → text 增量 / tool_use / tool_result → result）。旧的
   // `-z <prompt>` 只有「最后一坨正文」，工具过程与逐字上屏都拿不到，群聊里
   // 就只能等整包落地。--oneshot 保证非 TTY 下也是「答完即退」。
-  hermes: (prompt, model) => [
+  hermes: (prompt, model, _sessionKey, ctx) => [
     "chat", "-q", prompt, "--oneshot", "--format", "stream-json",
+    // 会话续接（`-r/--resume`）：hermes 的会话文件按 id 落盘，跨进程可续。
+    ...(ctx?.resumeSessionId ? ["--resume", ctx.resumeSessionId] : []),
     ...buildModelArgs("hermes", model),
   ],
   // qwen（Qwen Code 0.25.3，gemini-cli 分支）：`-p` 官方定义是「Appended to
@@ -357,9 +390,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   //
   // `--model` 注入仍在 buildModelArgs 的 qwen 专属分支（只收上游裸 slug），
   // 与本策略互不干扰。
-  qwen: (prompt, model) => [
+  qwen: (prompt, model, _sessionKey, ctx) => [
     "-p", prompt,
     "--output-format", "stream-json", "--include-partial-messages",
+    // `-r/--resume <id>`：按会话 id 续接（`-c` 是「本项目最近一个」，会串台）。
+    ...(ctx?.resumeSessionId ? ["-r", ctx.resumeSessionId] : []),
     ...buildModelArgs("qwen", model),
   ],
   // cursor-agent（官方 headless：cursor.com/docs/cli/headless）：`-p <prompt>
@@ -390,9 +425,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 不带上游的 --permission-mode bypassPermissions / --disallowedTools：聊天
   // 场景模型几乎不调工具，设备端也没有 ACP 权限桥需要 bypass；少传参数降低
   // 对 CLI 版本的耦合。
-  codebuddy: (prompt) => [
+  codebuddy: (prompt, _model, _sessionKey, ctx) => [
     "-p", prompt,
     "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+    // 会话续接：与 claude 同族（Claude Code fork），--resume 语义一致。
+    ...(ctx?.resumeSessionId ? ["--resume", ctx.resumeSessionId] : []),
     ...buildModelArgs("codebuddy", undefined),
   ],
   // pi / omp（pi 协议家族，上游 builtin_runtimes.go:86-100 把 omp 派发给 pi
@@ -1096,6 +1133,38 @@ export function isTextSnapshotLine(line: string): boolean {
     return Array.isArray(content);
   }
   return false;
+}
+
+/**
+ * 从一行 stream-json 里取出 agent 的**原生会话 id**（会话续接用，见
+ * agent-sessions.ts）。
+ *
+ * 各家字段名不同，但都稳定：
+ *   · claude / qwen / codebuddy / hermes：`{"type":"system","subtype":"init",
+ *     "session_id":"…"}`；末尾 result 事件带同一个值；
+ *   · opencode：`sessionID`（`--format json` 的 step / part 事件）；
+ *   · codex：`{"type":"thread.started","thread_id":"…"}`（本轮不启用续接，
+ *     但 id 照收，打开时不用再改解析）。
+ *
+ * 取不到或形状不合法一律返回 null：会话续接是增强，绝不能因为它影响正文解析。
+ */
+export function extractSessionId(line: string): string | null {
+  if (!line.includes("session") && !line.includes("thread")) return null;
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const event = parsed as Record<string, unknown>;
+  for (const key of ["session_id", "sessionID", "thread_id", "threadId"]) {
+    const value = event[key];
+    if (isSessionId(value)) return value;
+  }
+  return null;
 }
 
 export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
@@ -2149,6 +2218,7 @@ function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
   if (opts.agentName === "opencode" && !opts.disableServerMode && opencodeServerEnabled()) {
     const strategyArgs = buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey, {
       fsRestricted,
+      ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
     });
     if (strategyArgs.length > 0) {
       // ⚠️ fsRestricted 是本轮算出来的**局部**值，必须合并进 opts 再往下传：
@@ -2178,7 +2248,10 @@ function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
     // agent, or a prompt past the argv length cap) keeps the legacy stdin
     // invocation with the model flag as the only argument.
     const strategyArgs = opts.agentName
-      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey, { fsRestricted })
+      ? buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey, {
+        fsRestricted,
+        ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+      })
       : [];
     const argvMode = strategyArgs.length > 0;
     const agentArgs = argvMode
@@ -2292,7 +2365,23 @@ function runAgentTurnInner(opts: RunAgentTurnOpts): Promise<string> {
       if (kind === "reasoning") deliverReasoning(suffix);
       else pushText(suffix);
     };
+    // 会话续接：从事件流里捡 agent 的原生会话 id，交给调用方按 sessionKey 落盘
+    // （见 agent-sessions.ts）。init / result 事件会重复带同一个 id，这里用
+    // lastSessionId 去重 —— 否则一轮几十行输出就要回调几十次、写几十次盘。
+    let lastSessionId = opts.resumeSessionId && isSessionId(opts.resumeSessionId)
+      ? opts.resumeSessionId
+      : "";
+    const captureSessionId = (line: string): void => {
+      if (!opts.onSessionId) return;
+      const id = extractSessionId(line);
+      if (!id || id === lastSessionId) return;
+      lastSessionId = id;
+      opts.onSessionId(id);
+    };
     const emitStreamJson = (flushed: string) => {
+      // 先收会话 id：它出现在 system.init 这类没有正文的行上，一旦走下面的
+      // 「解析不出 delta 就 return」就永远捡不到了。
+      captureSessionId(flushed);
       // 工具事件先消化：同一个 JSONL 行里 tool 事件与正文不会共存（claude 的
       // tool_use 走 content_block_*，codex 走 item.*），但收尾事件的顺序不能
       // 依赖 —— 先更新步骤再发正文，用户才不会看到「正文已出、步骤还没出」。

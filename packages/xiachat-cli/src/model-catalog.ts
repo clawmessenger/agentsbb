@@ -1,4 +1,5 @@
 import { stripAnsiCodes } from "./agents.js";
+import { isModelRoute } from "./agent-default-model.js";
 import {
   probeProviderModels,
   readAgentConfig,
@@ -294,12 +295,78 @@ export function buildModelCatalogResponse(
   });
 }
 
+// 「默认对话模型」的写协议。
+//
+// 读走上面那对 request/response（目录里本来就带 defaultModel）；写必须单独一对，
+// 因为「改设置」是一个有副作用的动作，不能塞进只读查询里 —— 面板每展开一次都会
+// 发目录请求，塞进去就等于每展开一次都写一次盘，且目录刷新失败时改动去向不明。
+//
+// model 传 null = 清除，恢复 agent CLI 自身默认。
+export interface AgentDefaultModelRequest {
+  msg_type: "discussion_agent_default_model_request";
+  protocolVersion: 2;
+  requestId: string;
+  model: string | null;
+  timestamp?: number;
+}
+
+export function parseAgentDefaultModelRequest(content: string): AgentDefaultModelRequest | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+  if (record.msg_type !== "discussion_agent_default_model_request") return null;
+  if (record.protocolVersion !== 2) return null;
+  const requestId = record.requestId;
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > 128) return null;
+  const model = record.model;
+  // 只接受 null 或合法 route：写进设备的偏好必须是 runAgentTurn 真能用的形状，
+  // 否则下一轮会带着一个 agent 认不出的 --model 起来（直接退出，比不生效更糟）。
+  if (model !== null && !isModelRoute(model)) return null;
+  const timestamp = record.timestamp;
+  if (timestamp !== undefined && (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp))) {
+    return null;
+  }
+  return {
+    msg_type: "discussion_agent_default_model_request",
+    protocolVersion: 2,
+    requestId,
+    model,
+    ...(timestamp !== undefined ? { timestamp } : {}),
+  };
+}
+
+/** 写请求的回执。`model` 是**落盘后**的真实值（null = 已清除），不是请求里的值。 */
+export function buildAgentDefaultModelResponse(
+  request: AgentDefaultModelRequest,
+  model: string | null,
+  error: string | null,
+  clock: () => number = Date.now,
+): string {
+  return JSON.stringify({
+    msg_type: "discussion_agent_default_model_response",
+    protocolVersion: 2,
+    requestId: request.requestId,
+    ok: error === null,
+    model,
+    ...(error === null ? {} : { error }),
+    timestamp: clock(),
+  });
+}
+
 export interface ModelCatalogLoaderOpts {
   agentName?: string;
   runCommand: (argv: string[], timeoutMs: number, maxOutputBytes: number) => Promise<string>;
   // Reads the agent's own config (provider endpoints + configured default).
   // Defaults to the real readers; inject a stub to keep tests hermetic.
   readConfig?: (agentName: string | undefined) => AgentConfig | null;
+  // 主人给这台 agent 设置的默认模型（见 agent-default-model.ts）。它比 agent CLI
+  // 自身的 default_model 更该被回显 —— 面板上"当前默认"显示的就是用户自己设的值。
+  readAgentDefaultModel?: () => string | undefined;
   // Probes one OpenAI-compatible endpoint; `null` = unusable.
   probe?: (endpoint: ProviderEndpoint) => Promise<string[] | null>;
   logger?: (message: string) => void;
@@ -335,6 +402,8 @@ export interface ModelCatalogLoader {
   load(opts?: { force?: boolean }): Promise<DiscussionModelCatalog>;
   /** Kick off a background refresh so the first panel open is served warm. */
   warm(): void;
+  /** Drop the cached catalog (call right after the default model is rewritten). */
+  invalidate(): void;
 }
 
 const DEFAULT_MAX_STALE_MS = 20_000;
@@ -432,7 +501,11 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
   const resolveCatalog = async (): Promise<DiscussionModelCatalog> => {
     const config = readConfig(opts.agentName);
     const grouped: GroupedProviders = new Map();
-    let defaultModel = config?.defaultModel ?? null;
+    // 主人设置的默认模型压过 agent CLI 自身的 default_model：前者是显式意图，
+    // 后者只是兜底。finalizeCatalog 还会把它收口一次 —— 不在目录里的值当没设过，
+    // 免得多米诺：provider 被删了还回传一个不存在的 route，web 的 normalizeCatalog
+    // 会整包判非法，面板直接变"无可用模型"。
+    let defaultModel = opts.readAgentDefaultModel?.() ?? config?.defaultModel ?? null;
 
     // 配置文件里**显式声明**的清单先落袋：它离线、瞬时、稳定，不依赖任何一次
     // 网络往返 —— 后面 `opencode models` 失败或端点 probe 超时都不会把它冲掉。
@@ -588,6 +661,12 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
     },
     warm() {
       void refresh();
+    },
+    // 设置默认模型之后必须让缓存失效：面板保存完会立刻重拉目录回显，5 分钟内
+    // 的旧缓存会把刚写进去的值"打回去"，用户看到的就是"设了没生效"。
+    invalidate() {
+      cached = null;
+      cachedAt = 0;
     },
   };
 }
