@@ -542,3 +542,27 @@ describe("聊天室成员身份（23406 NOT_IN_CHATROOM）", () => {
     expect(planSendFailure(23408, 1)).toBe("fail");
   });
 });
+
+/**
+ * 一轮用哪个模型：显式 > 设备默认（面板设的）> 装机 --model > CLI 自身配置。
+ *
+ * 这条顺序是用户可见行为，不是实现细节：写反了就会出现「在面板上改模型毫无
+ * 反应」（`--model` 赢），或者「服务端给角色配的模型不生效」（`--model` 赢显式）。
+ */
+describe("resolveTurnModel", () => {
+  it("显式指定永远最优先（圆桌角色模型 / 私聊 per-user）", async () => {
+    const { resolveTurnModel } = await import("./run.js");
+    expect(resolveTurnModel("openai/gpt-5", "anthropic/claude-x", "kimi")).toBe("openai/gpt-5");
+  });
+
+  it("没有显式指定时，面板设的设备默认压过装机 --model", async () => {
+    const { resolveTurnModel } = await import("./run.js");
+    expect(resolveTurnModel(undefined, "anthropic/claude-x", "kimi")).toBe("anthropic/claude-x");
+  });
+
+  it("设备没设默认才回落到 --model；都没有就交给 agent CLI 自己的配置", async () => {
+    const { resolveTurnModel } = await import("./run.js");
+    expect(resolveTurnModel(undefined, undefined, "kimi")).toBe("kimi");
+    expect(resolveTurnModel(undefined, undefined, undefined)).toBeUndefined();
+  });
+});

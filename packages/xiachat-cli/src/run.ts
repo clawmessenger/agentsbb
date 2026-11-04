@@ -155,6 +155,30 @@ export function conversationKeyOf(msg: InboundIMMessage): string {
   return `${msg.conversationType}:${msg.targetId}`;
 }
 
+/**
+ * 一轮该用哪个模型。优先级（高 → 低）：
+ *
+ *   1. `explicit`   —— 这一轮派发显式带的：圆桌角色模型（服务端按角色配的下发）、
+ *                      私聊里该用户的 `/use-model`（im.ts 的 per-user 偏好）。
+ *   2. `deviceDefault` —— 主人在通讯录 → 智能体详情 →「默认模型」里设的，落在设备上
+ *                      （agent-default-model.ts），群聊 / 单聊 / 讨论组共用。
+ *   3. `runModel`    —— 装机时 `clawmessenger run --model X` 的启动参数。
+ *   4. 都没有 → undefined，交给 agent CLI 自己的配置。
+ *
+ * 为什么 2 压过 3：面板上的设置是用户**此刻在界面上**做的动作，比装机时的参数新。
+ * 反过来（`--model` 赢）会让「用 install-service --model 装的设备」在面板上改模型
+ * 毫无反应 —— 这正是这次要修的那个「设了没用」。
+ *
+ * 抽成纯函数是为了能被钉住：这几档的先后顺序是用户可见行为，不是实现细节。
+ */
+export function resolveTurnModel(
+  explicit: string | undefined,
+  deviceDefault: string | undefined,
+  runModel: string | undefined,
+): string | undefined {
+  return explicit ?? deviceDefault ?? runModel;
+}
+
 // RongCloud re-delivers the entire offline history on every reconnect and the
 // Node shim has no IndexDB for the SDK to record what it already synced. Acting
 // on each replay again re-runs agent turns for messages answered long ago — a
@@ -479,7 +503,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ? opts.transport.sendMessageTo(conversationType, conversationId, objectName, content)
         : Promise.reject(new Error("transport lacks sendMessageTo")),
   });
-  // 模型优先级：**这一轮显式指定的** > `--model`（节点启动参数）> 主人设的默认模型
+  // 模型优先级：**这一轮显式指定的** > 主人设的默认模型 > `run --model`（装机参数）
   // > agent CLI 自身配置。
   //
   // `model` 两个来源，都是显式意图：
@@ -494,8 +518,13 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // 浏览器 localStorage，再由 web 在打开单聊时补发 `/use-model`。群聊和讨论组的
   // 轮次由服务端派发、根本不经过那条补发 —— 用户设了模型却什么变化都看不到。
   // 现在它落在这台设备上，三条路径都能读到。
+  //
+  // 它排在 `--model` **之前**：面板上的设置是用户此刻在界面上做的动作，比装机时的
+  // 启动参数新。排在后面的话，「用 install-service --model 装的设备」在面板上改
+  // 模型依旧毫无反应 —— 正是这次要修的那个「设了没用」。`--model` 降为最后一档
+  // 兜底（仍在 agent CLI 自身配置之前）。
   const modelForTurn = (model: string | undefined): string | undefined =>
-    model ?? opts.model ?? agentDefaultModel.get();
+    resolveTurnModel(model, agentDefaultModel.get(), opts.model);
 
   // 会话续接：同一个「会话形态 + 会话 id」的下一轮接在该 agent 上一轮的会话上
   // （见 agent-sessions.ts）。键由 dispatcher 算好（turnSessionKey），这里只做
