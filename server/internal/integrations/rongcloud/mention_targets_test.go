@@ -225,6 +225,88 @@ func TestResolveMentionTargets(t *testing.T) {
 			wantNames:     []string{"小李"},
 			wantDirective: true,
 		},
+		// ---- 兜底误判硬化：正文里的 @ 不都是定向意图 ----
+		//
+		// 下面四组是「误判 = 少派本该发言的人」的退化场景（QA 实测复现）。每对
+		// 都是「非定向 → 无定向」+「正控：真的在 @ 时必须仍能定向」，光有前者
+		// 的话，一个「永远不认 @」的实现也能全绿。
+		{
+			name:          "邮箱里的 @ 不算定向（成员名恰好等于邮箱域名前半段）",
+			members:       mentionMembers(mentionSpec{"rc_b", "b"}, mentionSpec{"rc_wang", "老王"}),
+			text:          "发我邮箱 a@b.com",
+			wantNames:     nil,
+			wantDirective: false,
+		},
+		{
+			name:          "正控：空白后的 @b 仍定向到 b",
+			members:       mentionMembers(mentionSpec{"rc_b", "b"}, mentionSpec{"rc_wang", "老王"}),
+			text:          "@b 你好",
+			wantNames:     []string{"b"},
+			wantDirective: true,
+		},
+		{
+			name:          "URL 路径里的 @ 不算定向（成员名恰好等于路径末段）",
+			members:       base,
+			text:          "https://example.com/u/@老王",
+			wantNames:     nil,
+			wantDirective: false,
+		},
+		{
+			name:          "正控：正文里真的 @ 了老王（空白分隔）仍定向",
+			members:       base,
+			text:          "帮我看下 @老王",
+			wantNames:     []string{"老王"},
+			wantDirective: true,
+		},
+		{
+			name:          "连续 @@ 仍能定向（第二个 @ 继承第一个的合规结论）",
+			members:       mentionMembers(mentionSpec{"rc_zs", "张三"}),
+			text:          "@@张三 你来",
+			wantNames:     []string{"张三"},
+			wantDirective: true,
+		},
+		{
+			name:          "字母后的 @@ 不产生定向（第一个 @ 不合规，第二个一并跳过）",
+			members:       mentionMembers(mentionSpec{"rc_zs", "张三"}),
+			text:          "a@@张三",
+			wantNames:     nil,
+			wantDirective: false,
+		},
+		{
+			name:          "@ 在行首",
+			members:       mentionMembers(mentionSpec{"rc_zs", "张三"}),
+			text:          "@张三 你看",
+			wantNames:     []string{"张三"},
+			wantDirective: true,
+		},
+		{
+			name:          "@ 在全角括号内",
+			members:       mentionMembers(mentionSpec{"rc_zs", "张三"}),
+			text:          "（@张三）这个问题",
+			wantNames:     []string{"张三"},
+			wantDirective: true,
+		},
+		{
+			name:          "@ 紧跟在中文逗号后",
+			members:       mentionMembers(mentionSpec{"rc_zs", "张三"}),
+			text:          "？，@张三 你答",
+			wantNames:     []string{"张三"},
+			wantDirective: true,
+		},
+		{
+			name:          "@ 在换行之后",
+			members:       mentionMembers(mentionSpec{"rc_zs", "张三"}),
+			text:          "第一行\n@张三 你答",
+			wantNames:     []string{"张三"},
+			wantDirective: true,
+		},
+		{
+			name:          "同一句里邮箱之后真的 @ 了人 → 仍定向",
+			members:       mentionMembers(mentionSpec{"rc_b", "b"}, mentionSpec{"rc_wang", "老王"}),
+			text:          "发我邮箱 a@b.com ，另外 @老王 你看下",
+			wantNames:     []string{"老王"},
+			wantDirective: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -265,6 +347,18 @@ func TestExtractMentionTokens(t *testing.T) {
 		{"换行与制表", "@Tom\n@Jerry\t", []string{"Tom", "Jerry"}},
 		{"连续 @", "@@老王", []string{"老王"}},
 		{"@ 后接空格：孤立 @ 不产生 token（避免把邮箱/价格里的 @ 后半段当名字）", "@ 老王", nil},
+		{"连写两个提及（中间无分隔符）", "@老王@小李", []string{"老王", "小李"}},
+		{"行首", "@老王", []string{"老王"}},
+		{"全角括号包裹", "（@老王）", []string{"老王"}},
+		{"中文逗号后紧邻", "，@老王", []string{"老王"}},
+		{"换行后", "第一行\n@老王", []string{"老王"}},
+		{"制表符后", "第一列\t@老王", []string{"老王"}},
+		{"邮箱：@ 前是字母 → 不是定向起点", "发我邮箱 a@b.com", nil},
+		{"邮箱：@ 前是数字 → 不是定向起点", "工单 10086@qq.com", nil},
+		{"URL：@ 前是斜杠 → 不是定向起点", "https://example.com/u/@老王", nil},
+		{"URL 但 @ 前是空白 → 仍是定向（用户真的在 @）", "看这个 https://example.com/u/ @老王", []string{"老王"}},
+		{"字母后的连续 @ 一并跳过（不凭空造出定向）", "a@@老王", nil},
+		{"字母后 @ 被跳过，后面合规的 @ 照常认", "a@b.com 然后 @老王 你看", []string{"老王"}},
 		{"多个 @ 一个人两次", "@老王 @老王", []string{"老王", "老王"}},
 		{"无 @", "大家好啊", nil},
 		{"空串", "", nil},

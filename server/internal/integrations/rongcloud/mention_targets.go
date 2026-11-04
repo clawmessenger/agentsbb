@@ -184,18 +184,43 @@ func resolveMentionTargetsByName(
 
 // extractMentionTokens 切出正文里所有 @ 后面的名字。
 //
-// 处理要点：
-//   - 连续 @（「@@张三」「@ @张三」）：逐个 @ 起头，空 token 丢弃；
-//   - 中文标点/全角符号/空白/另一个 @ 都是边界；
-//   - 结尾的孤立 @ 不产生 token。
+// 两件事：判「这个 @ 是不是定向意图的起点」，再切「名字到哪结束」。
+//
+// 为什么必须判起点：正文里的 @ 不只来自定向，还来自邮箱（a@b.com）与 URL
+// （https://example.com/u/@老王）。这两种 @ 一旦被当成定向，就会把本该全员
+// 接力的消息缩小到某个成员 —— 相对「永远全员」的老行为是**退化方向**
+// （少派了本该发言的人），比多派一轮更糟。
+//
+// 起点判据（全部复用 isMentionTokenBoundary 这一套字符集合，不另造标点表）：
+//   - 行首（rune 下标为 0）；
+//   - 前一个字符是空白（unicode.IsSpace，含换行/制表/全角空格）；
+//   - 前一个字符属于 mentionTokenBoundaries（标点、括号、引号等）；
+//   - 前一个字符是 @：**沿用上一个 @ 的结论**。`@@张三` 的第一个 @ 合规但切出
+//     空 token 被丢，第二个必须继承「合规」才认得出张三；反过来 `a@@张三` 的
+//     第一个 @ 本就不合规，第二个也一并跳过（邮箱里不会凭空冒出定向）；
+//   - 紧接在上一个合规 token 之后：`@老王@小李` 这种中间没有分隔符的连写，老
+//     版本两个名字都认，硬化不能把它退化成只认一个。
+//
+// 名字边界：中文标点/全角符号/空白/另一个 @ 都终止名字；结尾的孤立 @ 不产生
+// token。
 func extractMentionTokens(text string) []string {
 	if text == "" || !strings.ContainsRune(text, mentionPrefix) {
 		return nil
 	}
 	runes := []rune(text)
 	tokens := make([]string, 0, 4)
+	// prevAtValid 是「紧邻的上一个 @ 是否合规」，只供连续 @ 继承用。
+	prevAtValid := false
+	// prevTokenEnd 是上一个合规 token 的结束下标，供「@老王@小李」连写用。
+	prevTokenEnd := -1
 	for i := 0; i < len(runes); i++ {
 		if runes[i] != mentionPrefix {
+			continue
+		}
+		allowed := mentionStartAllowed(runes, i, prevAtValid, prevTokenEnd)
+		prevAtValid = allowed
+		if !allowed {
+			// 不是定向起点（邮箱/URL 里的 @）：只跳过这个 @，继续扫后面的 @。
 			continue
 		}
 		start := i + 1
@@ -205,14 +230,35 @@ func extractMentionTokens(text string) []string {
 		}
 		if end > start {
 			tokens = append(tokens, string(runes[start:end]))
+			prevTokenEnd = end
 		}
-		// 跳到 token 末尾：紧邻的下一个 @ 会在下一轮循环里重新起头。
+		// 跳到 token 末尾：紧邻的下一个 @ 会在下一轮循环里重新判定起点。
 		i = end - 1
 	}
 	if len(tokens) == 0 {
 		return nil
 	}
 	return tokens
+}
+
+// mentionStartAllowed 报告 runes[i] 这个 @ 能否当作定向意图的起点（判据见
+// extractMentionTokens 的注释）。prevAtValid / prevTokenEnd 由调用方在扫描中
+// 维护，分别服务「连续 @ 继承」与「连写提及」。
+func mentionStartAllowed(runes []rune, i int, prevAtValid bool, prevTokenEnd int) bool {
+	if i == 0 {
+		return true
+	}
+	prev := runes[i-1]
+	if prev == mentionPrefix {
+		return prevAtValid
+	}
+	if i == prevTokenEnd {
+		return true
+	}
+	if unicode.IsSpace(prev) {
+		return true
+	}
+	return strings.ContainsRune(mentionTokenBoundaries, prev)
 }
 
 // isMentionTokenBoundary 报告 r 是否终止一个 @ 名字。
