@@ -39,6 +39,16 @@ const (
 	// groupSpeakerName 在缺昵称时回退到 id），id 里全是下划线，把它们当边界
 	// 会让「@agent_xxx」被切成「agent」，兜底解析永远失效。
 	mentionTokenBoundaries = "，。、！？：；,.!?:;…·~\"'“”‘’（）()【】[]{}「」『』《》<>"
+
+	// mentionStartBlockers 是「@ 前面出现这些字符 → 这个 @ 一定不是定向意图」
+	// 的字符集：ASCII 邮箱本地部分与域名用到的字符（字母/数字/`.`/`_`/`-`/`+`）
+	// 加上 URL 路径分隔符（`/`/`:`）。
+	//
+	// 它和 mentionTokenBoundaries 是**两个不同的问题**，不能合并：前者判「这个
+	// @ 算不算起点」，后者判「名字到哪结束」。用白名单（行首/空白/标点才放行）
+	// 会连「回复@老王」这种中文手打提及一起拒掉 —— 讨论组没有 @ 选人面板，手打
+	// 是那里唯一的 @ 途径，收窄的代价恰好落在最容易被感知的地方。
+	mentionStartBlockers = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-+/:"
 )
 
 // mentionAllTokens 是「@ 所有人」的各种写法：它们是**无定向**的信号，
@@ -184,20 +194,33 @@ func resolveMentionTargetsByName(
 
 // extractMentionTokens 切出正文里所有 @ 后面的名字。
 //
-// 两件事：判「这个 @ 是不是定向意图的起点」，再切「名字到哪结束」。
+// 两件事：判「这个 @ 是不是定向意图的起点」，再切「名字到哪结束」。这两件事
+// 用**两套不同的字符集**，因为它们回答的是不同问题：
+//   - 起点：mentionStartBlockers（这里是不是「词中间/路径中间」的 @）；
+//   - 名字结尾：mentionTokenBoundaries（名字到哪为止）。
 //
 // 为什么必须判起点：正文里的 @ 不只来自定向，还来自邮箱（a@b.com）与 URL
 // （https://example.com/u/@老王）。这两种 @ 一旦被当成定向，就会把本该全员
 // 接力的消息缩小到某个成员 —— 相对「永远全员」的老行为是**退化方向**
 // （少派了本该发言的人），比多派一轮更糟。
 //
-// 起点判据（全部复用 isMentionTokenBoundary 这一套字符集合，不另造标点表）：
-//   - 行首（rune 下标为 0）；
-//   - 前一个字符是空白（unicode.IsSpace，含换行/制表/全角空格）；
-//   - 前一个字符属于 mentionTokenBoundaries（标点、括号、引号等）；
+// 起点判据是**黑名单**：只有当 @ 前面那个字符属于 ASCII 邮箱/URL 字符时，才
+// 认定它不是定向起点；其余一律放行。
+//
+// 为什么是黑名单而不是白名单（行首/空白/标点才放行）：中文用户手打 @ 时普遍
+// 不敲空格（「回复@老王」「同意@老王，开始」），白名单会把这一类一起拒掉。而
+// 讨论组**没有 @ 选人面板**，手打是那里唯一的 @ 途径 —— 收窄恰好落在最容易被
+// 感知的地方。黑名单的口径可以直接说成「老行为 − 邮箱/URL 误判」：`回复@老王`
+// 与老版本一样能定向，`发我邮箱 a@b.com`、`https://x/u/@老王` 不再误判。
+//
+// 代价（明确接受）：`老王@小李` 这种纯文字粘连仍会定向到小李 —— 但那本来就是
+// 老版本的行为，且用户很可能真想 @ 小李，属于「多派/少派」之间的产品取舍，
+// 不在本次「堵误判」的范围内。
+//
+// 两条特例：
 //   - 前一个字符是 @：**沿用上一个 @ 的结论**。`@@张三` 的第一个 @ 合规但切出
 //     空 token 被丢，第二个必须继承「合规」才认得出张三；反过来 `a@@张三` 的
-//     第一个 @ 本就不合规，第二个也一并跳过（邮箱里不会凭空冒出定向）；
+//     第一个 @ 被黑名单拒掉，第二个也一并跳过（邮箱里不会凭空冒出定向）；
 //   - 紧接在上一个合规 token 之后：`@老王@小李` 这种中间没有分隔符的连写，老
 //     版本两个名字都认，硬化不能把它退化成只认一个。
 //
@@ -244,6 +267,10 @@ func extractMentionTokens(text string) []string {
 // mentionStartAllowed 报告 runes[i] 这个 @ 能否当作定向意图的起点（判据见
 // extractMentionTokens 的注释）。prevAtValid / prevTokenEnd 由调用方在扫描中
 // 维护，分别服务「连续 @ 继承」与「连写提及」。
+//
+// 判定顺序不能换：连续 @ 的继承必须先于黑名单（`a@@老王` 里第二个 @ 的前一
+// 字符是 `@`，本身不在黑名单里，必须靠继承拿到「上一个我拒了」这个结论），
+// 连写豁免也必须在黑名单之前（`@b@c` 里第二个 @ 前的 `b` 是黑名单字符）。
 func mentionStartAllowed(runes []rune, i int, prevAtValid bool, prevTokenEnd int) bool {
 	if i == 0 {
 		return true
@@ -255,10 +282,8 @@ func mentionStartAllowed(runes []rune, i int, prevAtValid bool, prevTokenEnd int
 	if i == prevTokenEnd {
 		return true
 	}
-	if unicode.IsSpace(prev) {
-		return true
-	}
-	return strings.ContainsRune(mentionTokenBoundaries, prev)
+	// 黑名单：@ 前面是 ASCII 邮箱/URL 字符 → 不是定向起点（a@b.com、/u/@老王）。
+	return !strings.ContainsRune(mentionStartBlockers, prev)
 }
 
 // isMentionTokenBoundary 报告 r 是否终止一个 @ 名字。

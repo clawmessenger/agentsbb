@@ -307,6 +307,30 @@ func TestResolveMentionTargets(t *testing.T) {
 			wantNames:     []string{"老王"},
 			wantDirective: true,
 		},
+		{
+			// 讨论组没有 @ 选人面板，用户就是这么手打的：不能因为硬化而失效。
+			name:          "中文紧贴 @ 仍能定向（手打主路径）",
+			members:       base,
+			text:          "回复@老王 你看下",
+			wantNames:     []string{"老王"},
+			wantDirective: true,
+		},
+		{
+			name:          "中文标点收尾紧贴 @",
+			members:       base,
+			text:          "同意@老王，开始",
+			wantNames:     []string{"老王"},
+			wantDirective: true,
+		},
+		{
+			// 纯文字粘连：等于老版本行为（定向到被 @ 者）。产品取舍已记在
+			// extractMentionTokens 的注释里，这里只钉住「不会因此 500/报错」。
+			name:          "中文粘连两个名字 → 定向到被 @ 的那个（等同老行为）",
+			members:       base,
+			text:          "老王@小李 你看",
+			wantNames:     []string{"小李"},
+			wantDirective: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -359,6 +383,16 @@ func TestExtractMentionTokens(t *testing.T) {
 		{"URL 但 @ 前是空白 → 仍是定向（用户真的在 @）", "看这个 https://example.com/u/ @老王", []string{"老王"}},
 		{"字母后的连续 @ 一并跳过（不凭空造出定向）", "a@@老王", nil},
 		{"字母后 @ 被跳过，后面合规的 @ 照常认", "a@b.com 然后 @老王 你看", []string{"老王"}},
+		// 手打中文提及：黑名单判据要保住这一类（讨论组没有 @ 选人面板，手打是
+		// 唯一途径；白名单会把它一起拒掉，是本次硬化最容易踩的坑）。
+		{"中文紧贴 @（手打最常见写法）", "回复@老王", []string{"老王"}},
+		{"中文标点收尾", "同意@老王，开始", []string{"老王"}},
+		{"@ 前是汉字且只有一个提及", "这个得问@老王", []string{"老王"}},
+		// 纯文字粘连：黑名单不拦，等于老版本行为（产品取舍，见函数注释）。
+		{"中文粘连两个名字（等同老行为）", "老王@小李", []string{"小李"}},
+		// 已知的 over-inclusion：邮箱本地部分是中文时黑名单不拦，切出域名前半段。
+		// 方向是多派不是少派，且要求恰好有成员叫这个串，故按低危记录并钉住行为。
+		{"邮箱本地部分是中文 → 会切出域名前半段（已知 over-inclusion）", "老王@163.com", []string{"163"}},
 		{"多个 @ 一个人两次", "@老王 @老王", []string{"老王", "老王"}},
 		{"无 @", "大家好啊", nil},
 		{"空串", "", nil},

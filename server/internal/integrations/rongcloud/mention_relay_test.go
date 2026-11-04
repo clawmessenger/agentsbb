@@ -108,6 +108,13 @@ func TestGroupRelayMentionDispatch(t *testing.T) {
 			text:         "发我邮箱 a@老王.com",
 			wantSpeakers: 4, wantFallback: false,
 		},
+		{
+			// 中文用户手打 @ 通常不敲空格；讨论组没有 @ 选人面板，手打是唯一
+			// 途径。硬化误判时最容易被这一条打回原形，所以端到端也钉一次。
+			name:         "正文中文紧贴 @ 仍定向（手打主路径）",
+			text:         "回复@小李 你看看",
+			wantSpeakers: 1, wantFallback: false,
+		},
 	}
 
 	for _, tc := range cases {
