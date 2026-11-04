@@ -177,6 +177,25 @@ describe("buildAgentArgs", () => {
     ]);
   });
 
+  // qwen（Qwen Code 0.25.3）：-p 是官方「附到 stdin 输入之后」的形态，argv 与
+  // stdin 兼容；事件流必须带 --include-partial-messages，否则 thinking_delta /
+  // text_delta 都不上报（实测抓取确认）。--model 仍由 buildModelArgs 的 qwen
+  // 分支注入裸 slug。
+  it("qwen 走 -p + stream-json 事件流（思考流数据源），--model 注入裸 slug", () => {
+    expect(buildAgentArgs("qwen", "hi")).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--include-partial-messages",
+    ]);
+    expect(buildAgentArgs("qwen", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--include-partial-messages",
+      "--model", "glm-5.2",
+    ]);
+    // 超长 prompt 退回 stdin 模式：qwen 的 -p 明确兼容 stdin 输入，两种形态都能答。
+    expect(buildAgentArgs("qwen", "a".repeat(8001))).toEqual([]);
+    expect(buildAgentArgs("qwen", "a".repeat(8000))).toEqual([
+      "-p", "a".repeat(8000), "--output-format", "stream-json", "--include-partial-messages",
+    ]);
+  });
+
   it("returns [] for agents without a strategy", () => {
     expect(buildAgentArgs("codebuddy", "hi")).toEqual([]);
     expect(buildAgentArgs("grok", "hi")).toEqual([]);
@@ -237,6 +256,9 @@ describe("splitModelRoute / buildModelArgs", () => {
     expect(buildModelArgs("qwen", "quukk/glm-5.2")).toEqual(["--model", "glm-5.2"]);
     expect(buildModelArgs("qwen", "glm-5.2")).toEqual(["--model", "glm-5.2"]);
     expect(buildModelArgs("qwen", undefined)).toEqual([]);
+    // qwen 有了 argv 策略之后守卫不再拦它：`--model` 必须照常注入（易回归点，
+    // 别让「无策略不注入」的守卫把 stdin 时代的老事实带进 argv 时代）。
+    expect(buildAgentArgs("qwen", "hi", "quukk/glm-5.2")).toContain("glm-5.2");
   });
 
   it("never passes --model to codebuddy (it only exposes a free port)", () => {
@@ -615,6 +637,90 @@ describe("runAgentTurn", () => {
       expect(args).toContain("-p");
       expect(args).toContain("kimi-argv-prompt");
       expect(args).toContain("--output-format");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // ── qwen 思考流（feat/qwen-reasoning）回归 ────────────────────────────────
+  // 现场走查：群里 qwen 回答只有正文、没有思考内容（claude/codex/opencode/hermes
+  // 都有），根因就是 qwen 不在 STREAM_JSON_AGENTS。这组用例按 qwen 0.25.3 的
+  // 真实事件形状（本机 2026-11-04 实测抓取）钉住：argv 形态、思考/正文分道、
+  // 权威正文、argv 超长回退 stdin 仍能答。
+  const qwenTurnStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"glm-5.2","qwen_code_version":"0.25.3"}',
+    '{"type":"stream_event","uuid":"u0","session_id":"s1","parent_tool_use_id":null,"event":{"type":"goal_state","goal_state":{"v":2,"goal":null,"activity":"idle"}}}',
+    '{"type":"stream_event","uuid":"u2","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}',
+    '{"type":"stream_event","uuid":"u3","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"用户要"}}}',
+    '{"type":"stream_event","uuid":"u4","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"一个字"}}}',
+    '{"type":"stream_event","uuid":"u5","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}',
+    '{"type":"stream_event","uuid":"u8","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}}',
+    '{"type":"stream_event","uuid":"u9","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}',
+    '{"type":"stream_event","uuid":"u10","session_id":"s1","parent_tool_use_id":null,"event":{"type":"message_stop"}}',
+    '{"type":"result","subtype":"success","is_error":false,"result":"好"}',
+  ].join("\n") + "\n";
+
+  it("qwen：思考与正文分道流式回调，终值取 result 权威全文", async () => {
+    const fixture = createEchoAgentScript("qwen", { stdoutText: qwenTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qwen",
+        prompt: "只回答一个字：好",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("好");
+      expect(reasoning.join("")).toBe("用户要一个字");
+      expect(chunks.join("")).toBe("好");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("qwen：argv 形态带 -p 与 stream-json 开关（含 --model 裸 slug）", async () => {
+    const fixture = createEchoAgentScript("qwen", { recordArgs: true });
+    try {
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qwen",
+        prompt: "只回答一个字：好",
+        model: "quukk/glm-5.2",
+        timeoutMs: 30_000,
+      });
+      const args = fixture.recordedArgs();
+      expect(args).toContain("-p");
+      expect(args).toContain("stream-json");
+      expect(args).toContain("--include-partial-messages");
+      expect(args).toContain("--model");
+      expect(args).toContain("glm-5.2");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("qwen：超长 prompt 回退 stdin 模式（-p 官方兼容 stdin），解析链不降级", async () => {
+    // recordArgs 与 stdoutText 在 fixture 里互斥，argv 形态断言在上面那条用例。
+    const fixture = createEchoAgentScript("qwen", { stdoutText: qwenTurnStdout });
+    try {
+      const reasoning: string[] = [];
+      // 超长 prompt：strategy 退回 []，走 stdin 模式（qwen -p 明确兼容 stdin 输入，
+      // 实测 `qwen -p <prompt> < /dev/null` 正常作答）。fixture 始终吐同一份
+      // JSONL，正好验证 stdin 形态下整条 stream-json 解析链原样工作。
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "qwen",
+        prompt: "x".repeat(8001),
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+      });
+      // stdin 模式没有 argv 策略 → 不进 stream-json 解析，stdout 原样透传
+      // （文本形态的正文兜底），思考通道为空 —— 回退不挂、不失败，正文完整。
+      expect(out).toContain('"type":"result"');
+      expect(reasoning.join("")).toBe("");
     } finally {
       fixture.cleanup();
     }

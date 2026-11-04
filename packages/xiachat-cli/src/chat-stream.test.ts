@@ -152,8 +152,55 @@ describe("stream-json 解析器", () => {
     // hermes 走 chat -q --format stream-json：text 增量 + tool_use/tool_result，
     // 思考事件由本机 stream_json.py 补丁接上 reasoning_callback 后才有。
     expect(agentSupportsReasoning("hermes")).toBe(true);
+    // qwen 走 -p + -o stream-json --include-partial-messages，事件与 claude 同构。
+    expect(agentSupportsReasoning("qwen")).toBe(true);
     expect(agentSupportsReasoning("openclaw")).toBe(false);
     expect(agentSupportsReasoning(undefined)).toBe(false);
+  });
+
+  // ── qwen（Qwen Code 0.25.3）───────────────────────────────────────────────
+  // 事件协议与 claude 完全同构（本机实测 2026-11-04，quukk 网关 glm-5.2）：
+  // stream_event/content_block_delta 承载 thinking_delta 与 text_delta 增量，
+  // assistant 汇总消息（含 thinking 块），result 带权威全文。下面的 fixture
+  // 按实测抓取的真实形状构造，含 qwen 特有的噪声事件（system init /
+  // goal_state / message_stop）。
+  const qwenFixtureLines = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"glm-5.2","qwen_code_version":"0.25.3"}',
+    '{"type":"stream_event","uuid":"u0","session_id":"s1","parent_tool_use_id":null,"event":{"type":"goal_state","goal_state":{"v":2,"goal":null,"activity":"idle"}}}',
+    '{"type":"stream_event","uuid":"u1","session_id":"s1","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"m1","role":"assistant","model":"glm-5.2","content":[]}}}',
+    '{"type":"stream_event","uuid":"u2","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}',
+    '{"type":"stream_event","uuid":"u3","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"用户要"}}}',
+    '{"type":"stream_event","uuid":"u4","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"一个字"}}}',
+    '{"type":"stream_event","uuid":"u5","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}',
+    '{"type":"assistant","uuid":"u6","session_id":"s1","parent_tool_use_id":null,"message":{"id":"m1","type":"message","role":"assistant","model":"glm-5.2","content":[{"type":"thinking","thinking":"用户要一个字","signature":""}],"stop_reason":null}}',
+    '{"type":"stream_event","uuid":"u7","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}',
+    '{"type":"stream_event","uuid":"u8","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}}',
+    '{"type":"stream_event","uuid":"u9","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":0}}',
+    '{"type":"stream_event","uuid":"u10","session_id":"s1","parent_tool_use_id":null,"event":{"type":"message_stop"}}',
+    '{"type":"result","subtype":"success","is_error":false,"result":"好"}',
+  ].join("\n");
+
+  it("qwen：thinking_delta / text_delta 增量分流（claude 分支复用）", () => {
+    expect(parseStreamJsonLine(
+      '{"type":"stream_event","uuid":"u3","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"用户要"}}}',
+    )).toEqual({ reasoning: "用户要" });
+    expect(parseStreamJsonLine(
+      '{"type":"stream_event","uuid":"u8","session_id":"s1","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}}',
+    )).toEqual({ text: "好" });
+    // qwen 特有噪声事件不进正文/思考通道
+    expect(parseStreamJsonLine(
+      '{"type":"system","subtype":"init","session_id":"s1","model":"glm-5.2"}',
+    )).toBeNull();
+    expect(parseStreamJsonLine(
+      '{"type":"stream_event","uuid":"u0","session_id":"s1","parent_tool_use_id":null,"event":{"type":"goal_state","goal_state":{"v":2,"goal":null,"activity":"idle"}}}',
+    )).toBeNull();
+    expect(parseStreamJsonLine(
+      '{"type":"stream_event","uuid":"u10","session_id":"s1","parent_tool_use_id":null,"event":{"type":"message_stop"}}',
+    )).toBeNull();
+  });
+
+  it("qwen：完整事件流的正文提取走 claude 的 result 通道", () => {
+    expect(extractStreamJsonFinalText(qwenFixtureLines)).toBe("好");
   });
 });
 

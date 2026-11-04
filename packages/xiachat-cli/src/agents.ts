@@ -220,7 +220,11 @@ export function agentRuntimeEnv(
 // 没打补丁时它只贡献「逐字正文 + 工具过程」。
 // 其余 agent（stdin 模式、或只吐一次性 JSON 信封如 openclaw）不在此列；
 // openclaw 的信封里没有 reasoning payload（实测 2026.9.2），只有 toolSummary。
-const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode", "hermes"]);
+//
+// qwen（2026-11-04 加入）：Qwen Code 0.25.3 `-o stream-json
+// --include-partial-messages` 的事件协议与 claude 同构（thinking_delta /
+// text_delta / assistant / result），解析复用 claude 分支，无需专属映射。
+const STREAM_JSON_AGENTS = new Set(["claude", "codex", "opencode", "hermes", "qwen"]);
 
 export function agentSupportsReasoning(name: string | undefined): boolean {
   return name !== undefined && STREAM_JSON_AGENTS.has(name);
@@ -289,6 +293,34 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   hermes: (prompt, model) => [
     "chat", "-q", prompt, "--oneshot", "--format", "stream-json",
     ...buildModelArgs("hermes", model),
+  ],
+  // qwen（Qwen Code 0.25.3，gemini-cli 分支）：`-p` 官方定义是「Appended to
+  // input on stdin (if any)」——argv 与 stdin 共存，不是 kimi 那种「-p 即非交互
+  // 唯一入口」的二选一。所以策略成立时 prompt 走 argv（8000 字内），超长仍可
+  // 退回 stdin 模式（buildAgentArgs 的老逻辑），两种形态都能答，不会挂起。
+  //
+  // `-o stream-json --include-partial-messages`：逐行 JSON 事件流，事件形状与
+  // claude **完全同构**（本机 0.25.3 + quukk 网关 glm-5.2 实测，2026-11-04）：
+  //   {"type":"stream_event","event":{"type":"content_block_delta",…,
+  //     "delta":{"type":"thinking_delta","thinking":"…"}}}   ← 思考流
+  //   {"type":"stream_event",…,"delta":{"type":"text_delta","text":"…"}}  ← 正文流
+  //   {"type":"assistant","message":{"content":[…]}}        ← 含 thinking/text 块
+  //   {"type":"result","result":"全文"}                     ← 权威全文
+  // 现有 parseStreamJsonLine 的 claude 分支可直接消化，无需 qwen 专属映射；
+  // 工具过程也顺带接通（content_block_start tool_use / assistant tool_use 块）。
+  //
+  // --include-partial-messages 是思考流的前置条件：不带它时 stream_event 里
+  // 只有 goal_state / message_start / message_stop 这几个壳事件，thinking_delta
+  // 与 text_delta 都不会上报（实测抓取确认）。qwen 自己还有 `-y/--yolo`，但
+  // 设备端不需要工具自动批准——聊天场景模型几乎不调工具，真实调用时它会以
+  // permission_denials 记录并继续文本回合（实测），保持默认即可。
+  //
+  // `--model` 注入仍在 buildModelArgs 的 qwen 专属分支（只收上游裸 slug），
+  // 与本策略互不干扰。
+  qwen: (prompt, model) => [
+    "-p", prompt,
+    "--output-format", "stream-json", "--include-partial-messages",
+    ...buildModelArgs("qwen", model),
   ],
 };
 
@@ -743,7 +775,7 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
 }
 
 // --- stream-json / JSONL 解析（claude & codex 思考流数据源）----------------
-// 两个 agent 都以「每行一个 JSON 事件」输出，思考流与正文分道。解析器是
+// 各 agent 都以「每行一个 JSON 事件」输出，思考流与正文分道。解析器是
 // 纯函数：一行进，{reasoning?, text?, result?} 出。非 JSON 行（codex 的
 // WARNING: / rmcp ERROR 行）返回 null 丢弃。
 //
@@ -768,6 +800,14 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
 // 与 claude/codex 的关键差异：它上报的是**整段 part 的全文**（同一 part 可能被
 // 反复上报），不是增量。所以解析结果带 replace/partId，由调用方按 part 去重后
 // 只发新增后缀，否则正文会成倍重复。
+// qwen（Qwen Code 0.25.3，本机 + quukk 网关 glm-5.2 实测 2026-11-04）：
+//   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"…"}}}
+//   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}}
+//   {"type":"assistant","message":{"content":[{"type":"thinking",…},{"type":"text",…}]}}
+//   {"type":"result","result":"全文"}
+// 事件形状与 claude 完全同构（gemini-cli 分支移植了同一套 content_block 协议），
+// 由上面的 claude 分支直接消化。噪声事件（system/goal_state/message_stop 等）
+// 返回 null 丢弃，与 codex 的 WARNING 行同一待遇。
 export interface StreamJsonDelta {
   reasoning?: string;
   text?: string;
