@@ -57,14 +57,20 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 	// resolveRelayDispatch 内部同时完成 filterMembersByPermission（hotfix 的
 	// sceneGroup 权限闸门 + 主人豁免）与 applyBehaviorPrompts（行为准则注入），
 	// 并在定向目标被筛空时回退全员（mentionFallback=true）。
-	speakers, mentionFallback := resolveRelayDispatch(
+	speakers, mentionFallback, targeted := resolveRelayDispatch(
 		speakers, mentions, mentionAll, text, perms, sceneGroup, requesterRCID,
 	)
 	if len(speakers) == 0 {
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}
 	bgCtx := context.WithoutCancel(ctx)
-	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, h.groupRelayRounds(ctx, groupID))
+	// 定向即唯一（方案 A）：@ 谁=谁说一轮，AI 对话轮数收口为 1，
+	// 不再自动接力 —— 这是本次拍板语义与旧「定向只影响先手」的核心差异。
+	rounds := h.groupRelayRounds(ctx, groupID)
+	if targeted {
+		rounds = 1
+	}
+	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, rounds, targeted)
 	if !started && !queued {
 		return errRelayResult(409, "当前无法发起对话，请稍后重试")
 	}
@@ -105,21 +111,23 @@ func (h *chatroomRelayHub) groupRelayRounds(ctx context.Context, groupID string)
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。
 // rounds 是该群的「AI 对话轮数」设置：一次中继要跑几轮全员发言。
 func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) bool {
-	started, _ := h.StartGroupOrQueue(ctx, groupID, members, userText, requesterRCID, rounds)
+	started, _ := h.StartGroupOrQueue(ctx, groupID, members, userText, requesterRCID, rounds, false)
 	return started
 }
 
 // StartGroupOrQueue 与 StartGroup 相同，差别只在群已有中继在跑时不拒绝，
 // 而是把用户消息排进当前会话的待办（pump 收尾后自动接着跑）。见
 // chatroomRelayHub.StartOrQueue 的说明。
-func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) (bool, bool) {
+// targeted=true：定向派发（方案 A —— 轮数收口 1 + 失败不代答），随会话
+// 与排队消息一起传递。
+func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int, targeted bool) (bool, bool) {
 	if len(members) == 0 {
 		return false, false
 	}
 	total := normalizeGroupRelayRounds(rounds)
 	h.mu.Lock()
 	if existing, busy := h.sessions[groupID]; busy {
-		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds))
+		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds), members, targeted)
 		h.mu.Unlock()
 		return false, true
 	}
@@ -131,6 +139,7 @@ func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string
 		requesterRCID: requesterRCID,
 		contextRounds: normalizeContextRounds(rounds),
 		totalRounds:   total,
+		targeted:      targeted,
 	}
 	h.attachContextLocked(session)
 	h.sessions[groupID] = session

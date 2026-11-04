@@ -338,6 +338,15 @@ func isMentionAllToken(token string) bool {
 //
 // 返回值 fallback=true 表示「带了定向但没递出去，已回退全员」，回包会带上
 // mentionFallback 便于排查（前端不用处理，纯诊断信号）。
+// resolveRelayDispatch 统一处理「全员 vs @ 定向」的成员选择。
+//
+// 返回值：
+//   - members：实际派发的成员列表（已过权限过滤 + 行为准则注入）
+//   - mentionFallback：带了定向但目标没能递出去（@ 真人/无权限/id 不存在），
+//     已回退全员 —— 纯诊断信号
+//   - targeted：本次是定向派发（speakers 为被 @ 的子集）。调用方据此实现
+//     「定向即唯一」语义：@ 谁 = 只让谁说一轮（totalRounds 收口为 1），
+//     绝不再自动接力下一轮。
 func resolveRelayDispatch(
 	allMembers []relayMember,
 	mentions []string,
@@ -346,18 +355,18 @@ func resolveRelayDispatch(
 	perms agentPermissionSet,
 	scene agentPermissionScene,
 	actorRCID string,
-) ([]relayMember, bool) {
+) ([]relayMember, bool, bool) {
 	// 全员基线先算好：无定向时直接用它，有定向但目标全被滤掉时也用它回退。
 	// 权限过滤是纯内存遍历，算一次比在回退分支里再算一次更省心。
 	full := filterMembersByPermission(allMembers, perms, scene, actorRCID)
 	targeted, directive := resolveMentionTargets(allMembers, mentions, mentionAll, text, relayMemberDisplayName)
 	if !directive {
-		return applyBehaviorPrompts(full, perms), false
+		return applyBehaviorPrompts(full, perms), false, false
 	}
 	if only := filterMembersByPermission(targeted, perms, scene, actorRCID); len(only) > 0 {
-		return applyBehaviorPrompts(only, perms), false
+		return applyBehaviorPrompts(only, perms), false, true
 	}
-	return applyBehaviorPrompts(full, perms), true
+	return applyBehaviorPrompts(full, perms), true, false
 }
 
 // mentionParamIDs 从命令参数里取结构化定向 id 列表。

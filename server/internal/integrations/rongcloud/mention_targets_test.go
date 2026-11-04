@@ -459,6 +459,7 @@ func TestResolveRelayDispatch(t *testing.T) {
 		text         string
 		wantNames    []string
 		wantFallback bool
+		wantTargeted bool
 	}{
 		{
 			name: "无 @ → 全员（老行为，回归底线）",
@@ -466,13 +467,17 @@ func TestResolveRelayDispatch(t *testing.T) {
 			// 关掉的：已认领且 allow_group=false → 被权限滤掉（与定向无关）。
 			wantNames:    []string{"老王", "小李"},
 			wantFallback: false,
+			wantTargeted: false,
 		},
 		{
-			name:         "定向命中且有权限 → 只派给目标",
+			name: "定向命中且有权限 → 只派给目标",
 			mentions:     []string{"rc_li"},
 			text:         "@小李 你来",
 			wantNames:    []string{"小李"},
 			wantFallback: false,
+			// 方案 A：定向派发的标记位 —— 调用方据此把轮数收口为 1
+			// 并启用「失败如实提示」。
+			wantTargeted: true,
 		},
 		{
 			name:     "定向目标无权限 → 回退全员（不报错）",
@@ -481,6 +486,7 @@ func TestResolveRelayDispatch(t *testing.T) {
 			// 关掉的被权限滤掉 → 定向结果为空 → 回退全员（关掉的仍不在列表里）
 			wantNames:    []string{"老王", "小李"},
 			wantFallback: true,
+			wantTargeted: false,
 		},
 		{
 			name:         "定向 id 不存在（@ 了真人）→ 回退全员 + mentionFallback",
@@ -488,6 +494,7 @@ func TestResolveRelayDispatch(t *testing.T) {
 			text:         "@张三 你看",
 			wantNames:    []string{"老王", "小李"},
 			wantFallback: true,
+			wantTargeted: false,
 		},
 		{
 			name:         "mentionAll → 全员且不带 fallback（用户就是要点名全员）",
@@ -495,16 +502,20 @@ func TestResolveRelayDispatch(t *testing.T) {
 			text:         "@所有人 开会",
 			wantNames:    []string{"老王", "小李"},
 			wantFallback: false,
+			wantTargeted: false,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, fallback := resolveRelayDispatch(
+			got, fallback, targeted := resolveRelayDispatch(
 				members, tc.mentions, tc.mentionAll, tc.text, perms, sceneGroup, "owner-y",
 			)
 			if fallback != tc.wantFallback {
 				t.Fatalf("fallback = %v, want %v (names=%v)", fallback, tc.wantFallback, mentionNames(got))
+			}
+			if targeted != tc.wantTargeted {
+				t.Fatalf("targeted = %v, want %v (names=%v)", targeted, tc.wantTargeted, mentionNames(got))
 			}
 			if names := mentionNames(got); !reflect.DeepEqual(names, tc.wantNames) {
 				t.Fatalf("names = %v, want %v", names, tc.wantNames)
@@ -528,9 +539,12 @@ func TestResolveRelayDispatchPermissionUntouched(t *testing.T) {
 		"rc_c": {claimed: false},
 	}
 	want := applyBehaviorPrompts(filterMembersByPermission(members, perms, sceneGroup, "owner-9"), perms)
-	got, fallback := resolveRelayDispatch(members, nil, false, "随便聊聊", perms, sceneGroup, "owner-9")
+	got, fallback, targeted := resolveRelayDispatch(members, nil, false, "随便聊聊", perms, sceneGroup, "owner-9")
 	if fallback {
 		t.Fatalf("无定向时不该带 mentionFallback")
+	}
+	if targeted {
+		t.Fatalf("无定向时不该带 targeted（全员接力语义不能被误标）")
 	}
 	if !reflect.DeepEqual(mentionNames(got), mentionNames(want)) {
 		t.Fatalf("names = %v, want %v", mentionNames(got), mentionNames(want))
