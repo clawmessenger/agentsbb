@@ -161,7 +161,7 @@ func TestGroupRelayPermissionGate_FiltersSpeakers(t *testing.T) {
 	}
 	allMembers := append([]GroupMember{{UserID: "rc_requester"}}, aiMembers...)
 
-	result := hub.StartGroupRelay(context.Background(), "g-perm-"+uniqueID("t"), "rc_requester", "大家好", allMembers, aiMembers)
+	result := hub.StartGroupRelay(context.Background(), "g-perm-"+uniqueID("t"), "rc_requester", "大家好", allMembers, aiMembers, nil, false)
 	if result.code != 200 {
 		t.Fatalf("relay should start, got %d (%s)", result.code, result.message)
 	}
@@ -185,7 +185,7 @@ func TestGroupRelayPermissionGate_AllDeniedIs409(t *testing.T) {
 	aiMembers := []GroupMember{{UserID: a.RongcloudUserID}, {UserID: b.RongcloudUserID}}
 	allMembers := append([]GroupMember{{UserID: "rc_requester"}}, aiMembers...)
 
-	result := hub.StartGroupRelay(context.Background(), "g-perm-all-"+uniqueID("t"), "rc_requester", "大家好", allMembers, aiMembers)
+	result := hub.StartGroupRelay(context.Background(), "g-perm-all-"+uniqueID("t"), "rc_requester", "大家好", allMembers, aiMembers, nil, false)
 	if result.code != 409 {
 		t.Fatalf("code = %d (%s), want 409", result.code, result.message)
 	}
@@ -208,7 +208,7 @@ func TestGroupRelayPermissionGate_UnclaimedStillSpeaks(t *testing.T) {
 	aiMembers := []GroupMember{{UserID: unclaimed.RongcloudUserID}}
 	allMembers := append([]GroupMember{{UserID: "rc_requester"}}, aiMembers...)
 
-	result := hub.StartGroupRelay(context.Background(), "g-perm-unclaimed-"+uniqueID("t"), "rc_requester", "hi", allMembers, aiMembers)
+	result := hub.StartGroupRelay(context.Background(), "g-perm-unclaimed-"+uniqueID("t"), "rc_requester", "hi", allMembers, aiMembers, nil, false)
 	if result.code != 200 {
 		t.Fatalf("unclaimed node must still be dispatched, got %d (%s)", result.code, result.message)
 	}
@@ -229,7 +229,7 @@ func TestRelayGate_ChatroomSceneUsesChatroomSwitch(t *testing.T) {
 	resetAgentPermissionCache()
 
 	hub := newPermHub(f.rt)
-	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊")
+	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊", nil, false)
 	if result.code != 409 {
 		t.Fatalf("chatroom scene must honour allow_chatroom=false, got %d (%s)", result.code, result.message)
 	}
@@ -269,7 +269,7 @@ func TestRelayGate_DiscussionSceneUsesDiscussionSwitch(t *testing.T) {
 	resetAgentPermissionCache()
 
 	hub := newPermHub(f.rt)
-	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊")
+	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊", nil, false)
 	if result.code != 409 {
 		t.Fatalf("discussion scene must honour allow_discussion=false, got %d (%s)", result.code, result.message)
 	}
@@ -303,7 +303,7 @@ func TestRelayGate_DiscussionSceneAllowedByDiscussionSwitch(t *testing.T) {
 	resetAgentPermissionCache()
 
 	hub := newPermHub(f.rt)
-	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊")
+	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊", nil, false)
 	if result.code != 200 {
 		t.Fatalf("allow_discussion=true must dispatch, got %d (%s)", result.code, result.message)
 	}
@@ -504,7 +504,7 @@ func TestGroupRelayPermissionGate_QueryErrorDeniesEveryone(t *testing.T) {
 	aiMembers := []GroupMember{{UserID: a.RongcloudUserID}, {UserID: b.RongcloudUserID}}
 	allMembers := append([]GroupMember{{UserID: "rc_requester"}}, aiMembers...)
 
-	result := hub.StartGroupRelay(context.Background(), "g-perm-broken-"+uniqueID("t"), "rc_requester", "hi", allMembers, aiMembers)
+	result := hub.StartGroupRelay(context.Background(), "g-perm-broken-"+uniqueID("t"), "rc_requester", "hi", allMembers, aiMembers, nil, false)
 	if result.code != 409 {
 		t.Fatalf("permission lookup failure must deny dispatch, got %d (%s)", result.code, result.message)
 	}
@@ -536,7 +536,7 @@ func TestRelayGate_RoomTypeLookupFailureIsFailClosed(t *testing.T) {
 	f.rt.repo = NewDiscussionRepository(brokenQueries(t), testLogger())
 
 	hub := newPermHub(f.rt)
-	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊")
+	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊", nil, false)
 	if result.code != 500 {
 		t.Fatalf("room type lookup failure must deny dispatch, got %d (%s)", result.code, result.message)
 	}
@@ -708,7 +708,7 @@ func TestGroupRelayPermissionGate_OwnerExemptionApplies(t *testing.T) {
 	t.Run("发起人是主人 → 放行", func(t *testing.T) {
 		hub := newPermHub(permRelayRuntime(env.queries, testLogger()))
 		result := hub.StartGroupRelay(context.Background(), "g-owner-exempt-"+uniqueID("t"),
-			ownerRC, "大家好", allMembers, aiMembers)
+			ownerRC, "大家好", allMembers, aiMembers, nil, false)
 		if result.code != 200 {
 			t.Fatalf("owner-initiated relay must pass the gate, got %d (%s)", result.code, result.message)
 		}
@@ -721,7 +721,7 @@ func TestGroupRelayPermissionGate_OwnerExemptionApplies(t *testing.T) {
 	t.Run("发起人是别人 → 仍然拒绝", func(t *testing.T) {
 		hub := newPermHub(permRelayRuntime(env.queries, testLogger()))
 		result := hub.StartGroupRelay(context.Background(), "g-owner-exempt-x-"+uniqueID("t"),
-			strangerRC, "大家好", allMembers, aiMembers)
+			strangerRC, "大家好", allMembers, aiMembers, nil, false)
 		if result.code != 409 {
 			t.Fatalf("stranger-initiated relay must stay denied, got %d (%s)", result.code, result.message)
 		}
@@ -741,7 +741,7 @@ func TestRelayGate_ChatroomOwnerExemption(t *testing.T) {
 	resetAgentPermissionCache()
 
 	hub := newPermHub(f.rt)
-	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊")
+	result := hub.StartRelay(context.Background(), f.roomRCID, f.ownerRCID, "随便聊聊", nil, false)
 	if result.code != 200 {
 		t.Fatalf("owner-initiated chatroom relay must pass the gate, got %d (%s)", result.code, result.message)
 	}

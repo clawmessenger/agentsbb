@@ -524,7 +524,12 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		if chatroomID == "" || text == "" {
 			return h.replyErr(ctx, msg, cmd, 400, "参数不完整")
 		}
-		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartRelay(ctx, chatroomID, msg.FromUserID, text))
+		// 可选定向信号：mentions 是融云 id 列表（不存在的 id 由解析层静默忽略，
+		// 不当作 400），mentionAll 是显式「所有人」。都缺省 = 老行为全员接力。
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartRelay(
+			ctx, chatroomID, msg.FromUserID, text,
+			mentionParamIDs(cmd.Params), mentionParamAll(cmd.Params),
+		))
 	}
 
 	// relayGroupMessage 仲裁普通群组（融云 group）闲聊的按序发言：与
@@ -551,7 +556,10 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 			return h.replyErr(ctx, msg, cmd, 500, "查询群成员失败")
 		}
 		// 发起者校验用全量成员（真人发起），发言列表用 AI 过滤结果。
-		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelay(ctx, groupID, msg.FromUserID, text, allMembers, aiMembers))
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelay(
+			ctx, groupID, msg.FromUserID, text, allMembers, aiMembers,
+			mentionParamIDs(cmd.Params), mentionParamAll(cmd.Params),
+		))
 	}
 
 	actor, err := h.discussionRuntime.resolveActor(ctx, msg.FromUserID)

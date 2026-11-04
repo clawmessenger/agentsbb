@@ -91,7 +91,7 @@ func TestGroupRelayPermissionGate_MixedOwners(t *testing.T) {
 	t.Run("A 发起：只剩 A 的 agent", func(t *testing.T) {
 		hub := newPermHub(permRelayRuntime(env.queries, testLogger()))
 		result := hub.StartGroupRelay(context.Background(), "g-mix-a-"+uniqueID("t"),
-			ownerA, "大家好", allMembers, aiMembers)
+			ownerA, "大家好", allMembers, aiMembers, nil, false)
 		if result.code != 200 {
 			t.Fatalf("code = %d (%s), want 200", result.code, result.message)
 		}
@@ -104,7 +104,7 @@ func TestGroupRelayPermissionGate_MixedOwners(t *testing.T) {
 	t.Run("陌生人发起：全部被拦 → 409", func(t *testing.T) {
 		hub := newPermHub(permRelayRuntime(env.queries, testLogger()))
 		result := hub.StartGroupRelay(context.Background(), "g-mix-s-"+uniqueID("t"),
-			strange, "大家好", allMembers, aiMembers)
+			strange, "大家好", allMembers, aiMembers, nil, false)
 		if result.code != 409 {
 			t.Fatalf("code = %d (%s), want 409（陌生人不能借豁免放行）", result.code, result.message)
 		}

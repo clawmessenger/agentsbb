@@ -322,7 +322,12 @@ func (h *chatroomRelayHub) recordRound(key string, round relayRound) {
 
 // StartRelay 是 web 走 IM 命令（discussion/relayMessage）进来的入口：校验
 // 发起者是聊天室成员，读角色板，然后按 speaking_order 依次派发。
-func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, requesterRCID, text string) commandResult {
+//
+// mentions / mentionAll 是可选定向信号（「@ 某人」）：mentions 是融云 id 列表，
+// mentionAll=true 表示显式全员。二者都缺省时行为与「全员接力」完全一致 ——
+// 这是回归底线，老客户端不传这两个字段也绝不能改变任何派发结果。
+// 解析与回退全部在 resolveRelayDispatch 里，本函数只负责取数与回包。
+func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, requesterRCID, text string, mentions []string, mentionAll bool) commandResult {
 	if h.rt == nil || !h.rt.interactiveReady() {
 		return errRelayResult(503, "讨论服务尚未初始化")
 	}
@@ -351,7 +356,9 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	if !isMember {
 		return errRelayResult(403, "仅聊天室成员可以发起对话")
 	}
-	members := relayMembersFor(memberRows)
+	// allMembers 是参与接力的成员全集（顺序即接龙顺序）。定向只从它里面挑
+	// 子集，绝不新增、绝不重排。
+	allMembers := relayMembersFor(memberRows)
 	// 讨论组 vs 聊天室用哪个开关：这个房间**有讨论行**就是讨论组（allow_discussion），
 	// 没有就是普通聊天室（allow_chatroom）。判定口径与下面取议题用的是同一次查询，
 	// 不额外多打一次库。
@@ -369,10 +376,17 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	if len(discussions) > 0 {
 		scene = sceneDiscussion
 	}
-	perms := h.rt.agentPermissions(ctx, relayMemberIDs(members))
+	// 权限一次性按**全集**批量查：定向目标被筛空后要回退全员，若先按定向子集
+	// 查就没法在同一份快照里完成回退（会多打一次库，还可能读到不同的快照）。
+	perms := h.rt.agentPermissions(ctx, relayMemberIDs(allMembers))
 	// requesterRCID 就是「这次派发为谁的意图服务」：主人自己在聊天室说话时，
 	// 他自己关掉的开关不该挡住他自己的 agent（与设备端私聊的 reason:"owner" 同口径）。
-	members = applyBehaviorPrompts(filterMembersByPermission(members, perms, scene, requesterRCID), perms)
+	//
+	// 定向选择 + 权限过滤 + 回退全员只有这一个实现，群聊路径共用（见
+	// resolveRelayDispatch）。
+	members, mentionFallback := resolveRelayDispatch(
+		allMembers, mentions, mentionAll, text, perms, scene, requesterRCID,
+	)
 	if len(members) == 0 {
 		return errRelayResult(409, "该聊天室没有可发言的 AI 成员")
 	}
@@ -403,6 +417,10 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 		"chatroomId": chatroomRCID,
 		"speakers":   len(members),
 		"queued":     queued,
+		// mentionFallback=true：这条消息带了 @ 定向，但目标没能递出去（@ 的是
+		// 真人、被 @ 的 agent 无发言权、或 id 不存在），已按老行为回退全员。
+		// 前端不需要处理，纯诊断信号。
+		"mentionFallback": mentionFallback,
 	}}
 }
 
