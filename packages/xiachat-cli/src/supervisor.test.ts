@@ -558,12 +558,15 @@ describe("device exe upgrade", () => {
     const polled = control.mock.calls.map((call) => call[3]);
     expect(polled.length).toBeGreaterThan(0);
     for (const payload of polled) {
-      expect(payload.installDir).toBe(expectedDir);
+      // fetchDeviceControl 的第 4 参可选：某轮调用若真没带 report，payload 是
+      // undefined，optional chaining 会让断言得到 undefined 而红 —— 与直接访问
+      // 等强度，但 tsc --noEmit 不再报 TS18048。
+      expect(payload?.installDir).toBe(expectedDir);
     }
     const reported = report.mock.calls.map((call) => call[3]);
     expect(reported.length).toBeGreaterThan(0);
     for (const payload of reported) {
-      expect(payload.installDir).toBe(expectedDir);
+      expect(payload?.installDir).toBe(expectedDir);
     }
   });
 
