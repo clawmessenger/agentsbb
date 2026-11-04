@@ -420,6 +420,64 @@ func (h *Handler) clawAdminNodeStatus(rec clawAdminNodeRecord) (string, string) 
 	return "offline", "90 秒内无心跳"
 }
 
+// clawAdminSupervisorReachable 判定「这台机器上的 supervisor 是否还在轮询控制接口」。
+//
+// 心跳是 agent 子进程每 30s 发的，不是 supervisor 发的：agent 被停止后心跳停、
+// 后台显示「离线」，但 supervisor 主进程还活着还在 10s 一拍地拉
+// /api/claw/device/control，此时的「启动」指令 10 秒内就会被执行 —— 用 agent 自身
+// 心跳回答「设备在不在线」会把这种最常见的情况说成「等设备上线后执行」，读起来
+// 像死锁（要启动它，但它得先在线）。
+//
+// 正确信号是机器维度：通过 rec.MachineID 找到同机所有节点（机器主节点 + 全部
+// agent 节点 + ops 节点），只要其中任意一个在 90s TTL 内有心跳，就说明 supervisor
+// 活着（supervisor 会拉起所有 running 的 agent，ops 节点通常是 running 的）。管理端
+// 没有设备凭据，不能走 AuthorizeDevice/AgentNodesForDevice，这里复用
+// clawAdminListNodeRecords 全表（量级 = 设备数，见该函数注释）按 machine_id 过滤。
+//
+// 兜底：machine_id 为空的旧行、或列表里找不到同机节点（并发删除等异常），回退
+// agent 自身心跳 —— 即旧语义，宁可保守也不虚报可达。
+func (h *Handler) clawAdminSupervisorReachable(ctx context.Context, rec clawAdminNodeRecord) bool {
+	if h.RongCloudNode == nil {
+		return false
+	}
+	// agent 自己在线 = supervisor 必然活着（agent 就是它拉起的子进程），
+	// 顺带省掉一次全表扫描。
+	if h.RongCloudNode.IsOnline(rec.ID) {
+		return true
+	}
+	if rec.MachineID == "" || h.DB == nil {
+		return false
+	}
+	records, err := h.clawAdminListNodeRecords(ctx)
+	if err != nil {
+		// 全表读不出来时退回 agent 自身心跳（上面刚查过为不在线），
+		// 不能断言 supervisor 在线。
+		return false
+	}
+	return clawAdminMachineSupervisorAlive(records, rec.MachineID, rec.ID, h.RongCloudNode.IsOnline)
+}
+
+// clawAdminMachineSupervisorAlive is the pure core of supervisor liveness: any
+// same-machine node heartbeating within the TTL means the machine's supervisor
+// process is up and polling. When no row matches machineID at all the answer
+// degrades to the target agent's own heartbeat (legacy semantics).
+func clawAdminMachineSupervisorAlive(records []clawAdminNodeRecord, machineID string, selfID pgtype.UUID, isOnline func(pgtype.UUID) bool) bool {
+	matched := false
+	for _, node := range records {
+		if node.MachineID != machineID {
+			continue
+		}
+		matched = true
+		if isOnline(node.ID) {
+			return true
+		}
+	}
+	if !matched {
+		return isOnline(selfID)
+	}
+	return false
+}
+
 func (h *Handler) clawAdminNodeRowFor(rec clawAdminNodeRecord, name, description, claimant, claimantName string, reserved bool, ctl clawAdminNodeControl) clawAdminNodeRow {
 	status, _ := h.clawAdminNodeStatus(rec)
 	row := clawAdminNodeRow{
@@ -814,15 +872,29 @@ func (h *Handler) clawAdminSetNodeDesiredState(w http.ResponseWriter, r *http.Re
 		"desired_state": state,
 		"version":       version,
 	})
-	// 设备不在线时指令只会挂在 rongcloud_node_control 里等 supervisor 上线轮询，
-	// 页面必须把这个区别告诉运维，否则「指令已发送」读起来像没生效。
-	_, statusDetail := h.clawAdminNodeStatus(rec)
+	// 指令真正的消费者是设备上的 supervisor（10 秒一轮的 /device/control 轮询），
+	// 它活着与否和「目标 agent 自己在不在心跳」是两回事：agent 被停掉后心跳自然
+	// 停了，但 supervisor 还在轮询，启动指令 10 秒内就会被执行。回给页面两个字段：
+	//   - supervisor_online：这台机器的 supervisor 是否可达（同机任一节点 90s 内
+	//     有心跳即视为可达）—— 决定提示文案「约 10 秒内执行」还是「挂起等上线」。
+	//   - device_online：目标 agent 自身是否在线（被停掉的 agent 为 false），供
+	//     前端区分「agent 没跑」与「机器失联」。
+	supervisorOnline := h.clawAdminSupervisorReachable(ctx, rec)
+	deliveryDetail := "设备当前不在线，指令已挂起，将在设备上线后执行"
+	if h.RongCloudNode == nil {
+		// 与 clawAdminNodeStatus 的降级口径一致：集成未配置时说明的是
+		// 「服务端读不到心跳」，不是「设备离线」。
+		deliveryDetail = "心跳表不可用，指令已记录，将在设备可观测后执行"
+	} else if supervisorOnline {
+		deliveryDetail = "设备 supervisor 在线，指令将在约 10 秒内执行"
+	}
 	clawAdminOK(w, map[string]interface{}{
-		"node_id":         rec.NodeID,
-		"desired_state":   state,
-		"version":         version,
-		"device_online":   h.RongCloudNode != nil && h.RongCloudNode.IsOnline(rec.ID),
-		"delivery_detail": statusDetail,
+		"node_id":           rec.NodeID,
+		"desired_state":     state,
+		"version":           version,
+		"device_online":     h.RongCloudNode != nil && h.RongCloudNode.IsOnline(rec.ID),
+		"supervisor_online": supervisorOnline,
+		"delivery_detail":   deliveryDetail,
 	})
 }
 
