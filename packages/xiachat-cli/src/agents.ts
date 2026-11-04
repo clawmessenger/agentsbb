@@ -102,6 +102,20 @@ export interface RunAgentTurnOpts {
    */
   behaviorPrompt?: string;
   /**
+   * 本轮的**权限身份**（缺省 = agentName）。
+   *
+   * 执行器名和身份名不是一回事：内置运维助手（`ops`）跑的是 opencode 这个
+   * 可执行文件，`agentName` 因此是 "opencode"，但它的权限身份是 "ops"。
+   * 不分开就会踩两个坑（现场 2026-11-04 22:29）：
+   *   · `FS_GATE_EXEMPT_AGENTS` 里的 ops 豁免永远命不中 —— 同机任一对话
+   *     agent 关掉读写（本机 hermes 就是 allowFs=false），整机进入限制态，
+   *     运维轮次跟着被禁；
+   *   · 限制态下会走 opencode 的**对话用派生配置**（permission.bash=deny、
+   *     tools.bash=false），于是运维轮次连 bash 工具都没有，只能回用户
+   *     「会话未提供 bash 工具，请在本机运行」。
+   */
+  agentIdentity?: string;
+  /**
    * 内部用：本轮是否处于「文件读写禁止」限制态。由 runAgentTurn 从权限快照算出，
    * 递归回退（disableServerMode）时沿用同一个值。
    */
@@ -1666,11 +1680,18 @@ async function runOpenCodeServerTurn(
     windowsHide: true,
     cwd: opts.cwd,
     env: opencodeServeEnv({
-      ...(opts.agentName ? { agentName: opts.agentName } : {}),
+      // 用**权限身份**命名派生配置：ops 的执行器是 opencode，但它的配置必须
+      // 独立一份（opencode-device-ops.json），否则会和对话 agent 共用
+      // opencode-device-opencode.json —— 那份可能是 permission.bash=deny 的
+      // 受限版本，运维轮次会因此连 bash 工具都拿不到。
+      ...((opts.agentIdentity ?? opts.agentName)
+        ? { agentName: opts.agentIdentity ?? opts.agentName }
+        : {}),
       // 一律传（可能为空串）：serve 每轮都会重写派生配置，空串表示「这一轮不该
       // 有行为规范」（群聊/讨论组），要显式摘掉上一轮私聊写进去的指令文件；
       // 传 undefined 会被理解成「不要动」，那份指令就会在群聊里重复生效。
-      behaviorPrompt: opts.behaviorPrompt ?? "",
+      // 运维轮次的行为规范在 ops workdir 的 AGENTS.md 里，这里不掺和。
+      ...((opts.agentIdentity ?? opts.agentName) === "ops" ? {} : { behaviorPrompt: opts.behaviorPrompt ?? "" }),
       ...(opts.fsRestricted ? { fsRestricted: true } : {}),
     }),
   });
@@ -1816,7 +1837,10 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   // 快照读的是 supervisor 轮询落盘的那一份（带 5s 缓存，见 agent-permissions.ts），
   // 不是每条消息现查服务端 —— 私聊轮次很密，不能在这里加网络往返。
   // 只在**快照真的变了**的时候打一行日志，避免每轮刷屏。
-  const restriction = fsRestriction(loadPermissionSnapshot(), opts.agentName);
+  // 权限身份优先于执行器名：ops 用 opencode 执行，但豁免判定只认 "ops"。
+  // 不传 identity 时（对话 agent）两者相同，行为不变。
+  const permissionIdentity = opts.agentIdentity ?? opts.agentName;
+  const restriction = fsRestriction(loadPermissionSnapshot(), permissionIdentity);
   const fsRestricted = opts.fsRestricted ?? restriction.restricted;
   logFsRestrictionOnce(fsRestricted, restriction);
 
@@ -1879,12 +1903,24 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // opencode 的 `run` 路径原本完全不碰派生配置（只有 serve 路径设 OPENCODE_CONFIG）。
     // 权限限制要靠配置表达，所以**只在需要时**补上：没有限制、也没有行为规范时
     // 保持老行为不变（不引入「run 也会剥 plugin/mcp」这种副作用）。
-    const deviceConfig = opts.agentName === "opencode" && (fsRestricted || opts.behaviorPrompt)
+    //
+    // ⚠️ 这里判的是**权限身份**不是执行器名：ops 用 opencode 执行、身份是 "ops"，
+    // 它该用 ops workdir 里的 opencode.json（只钉 shell）。一旦套上对话用的派生
+    // 配置（permission.bash=deny / tools.bash=false），运维轮次就只剩一张嘴，
+    // 只能回用户「会话未提供 bash 工具，请在本机运行」——2026-11-04 22:29 现场。
+    // 运维轮次**恒用**自己那份派生配置（opencode-device-ops.json）：既剥掉
+    // 全局 plugin/MCP（否则每轮启动先付几十秒），又天然不带权限限制键 ——
+    // 它的身份不是 "opencode"，不会被对话 agent 的受限配置牵连。
+    // 其它 agent 维持原语义：只在「受限或有行为规范」时才派生。
+    const wantDeviceConfig = permissionIdentity === "ops"
+      || (permissionIdentity === "opencode" && (fsRestricted || opts.behaviorPrompt));
+    const deviceConfig = wantDeviceConfig
       ? ensureDeviceOpencodeConfig(process.env, {
-        ...(opts.agentName ? { agentName: opts.agentName } : {}),
+        ...(permissionIdentity ? { agentName: permissionIdentity } : {}),
         // 与 serve 路径同口径：空串 = 这一轮不该有行为规范（显式清掉），
         // 不能传 undefined（那会保留上一轮私聊写进去的指令，群聊里就重复了）。
-        behaviorPrompt: opts.behaviorPrompt ?? "",
+        // 运维的行为规范在 ops workdir 的 AGENTS.md，这里不碰。
+        ...(permissionIdentity === "ops" ? {} : { behaviorPrompt: opts.behaviorPrompt ?? "" }),
         ...(fsRestricted ? { fsRestricted: true } : {}),
       })
       : null;

@@ -343,6 +343,14 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   // Selects the per-agent invocation strategy (argv vs stdin); see
   // agents.ts buildAgentArgs.
   agentName?: string;
+  /**
+   * 本轮权限判定的**身份**（缺省 = agentName）。
+   *
+   * 内置运维助手（ops）跑的是 opencode 可执行文件，agentName 是 "opencode"；
+   * 但它的权限身份是 "ops" —— 只有分开，FS_GATE_EXEMPT_AGENTS 的豁免才生效，
+   * 运维才不会因为别的 agent 关掉读写而连 bash 工具都拿不到。
+   */
+  agentIdentity?: string;
   model?: string;
   stdout: NodeJS.WriteStream;
   turnTimeoutMs?: number;
@@ -557,6 +565,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       withSessionResume(sessionKey, (resumeSessionId) => runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
+        ...(opts.agentIdentity ? { agentIdentity: opts.agentIdentity } : {}),
         prompt,
         model: modelForTurn(model),
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
@@ -574,6 +583,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       withSessionResume(sessionKey, (resumeSessionId) => runAgentTurn({
         execPath: opts.agentExecPath,
         agentName: opts.agentName,
+        ...(opts.agentIdentity ? { agentIdentity: opts.agentIdentity } : {}),
         prompt,
         model: modelForTurn(model),
         timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,

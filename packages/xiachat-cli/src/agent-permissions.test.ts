@@ -668,6 +668,91 @@ describe("B1 接线：serve 默认路径必须真正带上 allowFs 限制（审�
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  /**
+   * 现场回归（2026-11-04 22:29）：运维轮次回「本轮无法直接执行 shell（会话未
+   * 提供 bash 工具），请在本机运行」，磁盘上的 opencode-device-opencode.json
+   * 是 permission.bash=deny。
+   *
+   * 成因：ops 用 opencode 这个执行器，agentName 也是 "opencode"，于是
+   *   · fsRestriction 拿 "opencode" 判 → FS_GATE_EXEMPT_AGENTS 的 ops 豁免命不中；
+   *   · 同机 hermes 的 allowFs=false 把整机拖进限制态 → 运维跟着受限；
+   *   · 并且复用对话 agent 的派生配置，连 bash 工具都被摘掉。
+   * 修法是给轮次加「权限身份」agentIdentity=ops，配置也独立成一份。
+   */
+  it("运维轮次（agentIdentity=ops）不被别的 agent 关了读写连坐，且配置里没有 bash 拒绝键", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-serve-ops-"));
+    const permPath = join(dir, "agent-permissions.json");
+    const xdg = join(dir, "xdg");
+    mkdirSync(join(xdg, "opencode"), { recursive: true });
+    writeFileSync(join(xdg, "opencode", "opencode.json"), JSON.stringify({ model: "quukk/glm-5.2" }), "utf8");
+    writePermissionSnapshot(
+      snapshot([
+        { agent: "hermes", nodeId: "n-hermes", allowFs: false },
+        { agent: "opencode", nodeId: "n-open", allowFs: true },
+        { agent: "ops", nodeId: "n-ops", allowFs: true },
+      ]),
+      { path: permPath },
+    );
+    clearPermissionCache();
+
+    const prevPerm = process.env[PERMISSION_FILE_ENV];
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const prevServer = process.env.CLAWMESSENGER_OPENCODE_SERVER;
+    const prevOpencodeConfig = process.env.OPENCODE_CONFIG;
+    process.env[PERMISSION_FILE_ENV] = permPath;
+    process.env.XDG_CONFIG_HOME = xdg;
+    delete process.env.CLAWMESSENGER_OPENCODE_SERVER;
+    // OPENCODE_CONFIG 非空时 opencodeServeEnv 直接跳过派生（用户自管配置），
+    // 那样测不到本用例要断言的东西。
+    delete process.env.OPENCODE_CONFIG;
+
+    const opsConfigPath = join(homedir(), ".clawmessenger", "opencode-device-ops.json");
+    const previousOpsConfig = (() => {
+      try {
+        return readFileSync(opsConfigPath, "utf8");
+      } catch {
+        return null;
+      }
+    })();
+    const fake = createFakeOpencode(dir);
+
+    try {
+      await runAgentTurn({
+        execPath: fake.execPath,
+        agentName: "opencode",
+        agentIdentity: "ops",
+        prompt: "获取本机的 opencode 版本号以及公网 ip",
+      }).catch(() => {});
+
+      const spawns = readFileSync(fake.dumpPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { argv: string[]; configPath: string; content: string | null });
+
+      const serve = spawns.find((call) => call.argv.includes("serve"));
+      expect(serve, "ops 轮次也必须走 serve（否则测不到接线）").toBeTruthy();
+      // 独立一份配置：不能和对话 agent 的 opencode-device-opencode.json 共用。
+      expect(serve!.configPath).toBe(opsConfigPath);
+      expect(serve!.content).toBeTruthy();
+
+      const config = JSON.parse(serve!.content!) as Record<string, any>;
+      expect(config.permission).toBeUndefined();
+      expect(config.tools).toBeUndefined();
+    } finally {
+      if (prevPerm === undefined) delete process.env[PERMISSION_FILE_ENV];
+      else process.env[PERMISSION_FILE_ENV] = prevPerm;
+      if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevXdg;
+      if (prevServer !== undefined) process.env.CLAWMESSENGER_OPENCODE_SERVER = prevServer;
+      if (prevOpencodeConfig !== undefined) process.env.OPENCODE_CONFIG = prevOpencodeConfig;
+      clearPermissionCache();
+      if (previousOpsConfig === null) rmSync(opsConfigPath, { force: true });
+      else writeFileSync(opsConfigPath, previousOpsConfig, "utf8");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("快照落盘与读取", () => {

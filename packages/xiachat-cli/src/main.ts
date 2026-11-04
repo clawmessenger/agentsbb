@@ -1104,6 +1104,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           transport,
           agentExecPath,
           agentName,
+          // 权限身份：ops 用 opencode 执行，但豁免判定只认 "ops"（见
+          // FS_GATE_EXEMPT_AGENTS）。不传就退化成执行器名，运维会被
+          // 别的 agent 的 allowFs=false 连坐。
+          agentIdentity: cmdOpts.agent,
           model: cmdOpts.model,
           stdout: opts.stdout,
           turnTimeoutMs,
