@@ -807,7 +807,7 @@ func TestClawUpgradeProgressKeepsRequestedAtAcrossHeartbeats(t *testing.T) {
 		Scan(&node.ID, &node.WorkspaceID, &node.RongcloudUserID, &node.MachineID); err != nil {
 		t.Fatalf("load node: %v", err)
 	}
-	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node, "1.2.0", clawUpgradePlatformWindows, "", 0); err != nil {
+	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node, "1.2.0", clawUpgradePlatformWindows, "", "", 0); err != nil {
 		t.Fatalf("heartbeat upsert: %v", err)
 	}
 
@@ -945,5 +945,144 @@ func TestClawUpgradeDoesNotMarkInstalledWhenTheDeviceReportsAnOldVersion(t *test
 	if after.Status != before.Status || !after.UpdatedAt.Equal(before.UpdatedAt) {
 		t.Fatalf("a not-yet-upgraded row must be left untouched (%q -> %q, %v -> %v)",
 			before.Status, after.Status, before.UpdatedAt, after.UpdatedAt)
+	}
+}
+
+// TestClawUpgradeInstallDirEmptyReportKeepsTheStoredValue 钉住 install_dir 的保旧值
+// 语义（迁移 609）：老 CLI 的心跳不带 installDir（空串），绝不能把这台机器之前由
+// 新版 CLI 上报过的目录擦掉 —— 否则设备升一次级、回滚一次，详情页的「安装目录」
+// 就在「有值 / 空」之间闪，运维按旧目录去找 exe 会扑空。
+//
+// 与 hostname 的 NULLIF 兜底同款：混跑期间新旧 CLI 各自上报，字段只进不退。
+func TestClawUpgradeInstallDirEmptyReportKeepsTheStoredValue(t *testing.T) {
+	if testPool == nil || testHandler == nil {
+		t.Skip("handler test database is not available")
+	}
+	ctx := context.Background()
+	machine := clawUpgradeTestMachine("upgrade-installdir")
+	rc := "rc_node_" + machine
+	cleanupClawUpgradeTestRows(t, []string{machine}, []string{rc})
+	insertClawUpgradeTestNode(t, testWorkspaceID, machine, rc)
+
+	var node db.RongcloudNode
+	if err := testPool.QueryRow(ctx, `
+		SELECT id, workspace_id, rongcloud_user_id, machine_id
+		  FROM rongcloud_node WHERE machine_id = $1`, machine).
+		Scan(&node.ID, &node.WorkspaceID, &node.RongcloudUserID, &node.MachineID); err != nil {
+		t.Fatalf("load node: %v", err)
+	}
+
+	// 新版 CLI 先报一次目录（走与生产一致的 upsert 路径）。
+	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node,
+		"1.3.19", clawUpgradePlatformWindows, "host-a", `C:/Users/ops/.clawmessenger/bin`, 0); err != nil {
+		t.Fatalf("seed install_dir: %v", err)
+	}
+	up, found, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
+	if err != nil || !found {
+		t.Fatalf("read upgrade row: found=%v err=%v", found, err)
+	}
+	if up.InstallDir != `C:/Users/ops/.clawmessenger/bin` {
+		t.Fatalf("install_dir must be stored verbatim, got %q", up.InstallDir)
+	}
+
+	// 老 CLI 混跑：同样一条心跳，installDir 为空。目录必须原样保留。
+	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node,
+		"1.3.9", clawUpgradePlatformWindows, "", "", 0); err != nil {
+		t.Fatalf("old-cli heartbeat upsert: %v", err)
+	}
+	after, _, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
+	if err != nil {
+		t.Fatalf("read upgrade row again: %v", err)
+	}
+	if after.InstallDir != up.InstallDir {
+		t.Fatalf("an empty installDir report must keep the stored value (%q -> %q)",
+			up.InstallDir, after.InstallDir)
+	}
+
+	// 新目录（设备搬家/重装后）仍然能推进：COALESCE 不是「只写一次」。
+	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node,
+		"1.3.19", clawUpgradePlatformWindows, "host-b", `D:/tools/clawmessenger`, 0); err != nil {
+		t.Fatalf("moved install_dir upsert: %v", err)
+	}
+	moved, _, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
+	if err != nil {
+		t.Fatalf("read upgrade row after move: %v", err)
+	}
+	if moved.InstallDir != `D:/tools/clawmessenger` {
+		t.Fatalf("a non-empty installDir must advance the stored value, got %q", moved.InstallDir)
+	}
+}
+
+// TestClawUpgradeReportedAtFollowsHeartbeatButRequestedAtDoesNot 是 install_dir 时代的
+// R1 复核：reported_at 是「设备数据什么时候说的」（详情页数据新鲜度），必须随每次
+// upsert 刷成 now()；而管理端下发时刻 requested_at 与它无关，心跳绝不能动它。
+// 两者一旦混用，要么 10 秒心跳下新鲜度永远显示「刚刚」，要么等待时长永远归零。
+func TestClawUpgradeReportedAtFollowsHeartbeatButRequestedAtDoesNot(t *testing.T) {
+	if testPool == nil || testHandler == nil {
+		t.Skip("handler test database is not available")
+	}
+	ctx := context.Background()
+	machine := clawUpgradeTestMachine("upgrade-reportedat")
+	rc := "rc_node_" + machine
+	cleanupClawUpgradeTestRows(t, []string{machine}, []string{rc})
+	insertClawUpgradeTestNode(t, testWorkspaceID, machine, rc)
+	insertClawUpgradeTestReport(t, testWorkspaceID, machine, clawUpgradePlatformWindows, "1.3.19")
+
+	// 43 分钟前下发的升级 + 30 分钟前的一次上报，制造「两个时间戳明显分离」的行。
+	if _, err := testPool.Exec(ctx, `
+		UPDATE rongcloud_node_upgrade
+		   SET target_version = '1.3.20', desired_generation = 3, status = $2,
+		       batch_id = 'upg-reportedat', wave = 1,
+		       requested_at = now() - interval '43 minutes',
+		       reported_at = now() - interval '30 minutes',
+		       updated_at = now() - interval '30 minutes'
+		 WHERE machine_id = $1`, machine, clawUpgradeStatusWaitingIdle); err != nil {
+		t.Fatalf("seed upgrade row: %v", err)
+	}
+
+	before, found, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
+	if err != nil || !found {
+		t.Fatalf("read upgrade row: found=%v err=%v", found, err)
+	}
+	if !before.ReportedAt.Valid {
+		t.Fatal("seeded reported_at must be readable as a valid timestamptz")
+	}
+
+	var node db.RongcloudNode
+	if err := testPool.QueryRow(ctx, `
+		SELECT id, workspace_id, rongcloud_user_id, machine_id
+		  FROM rongcloud_node WHERE machine_id = $1`, machine).
+		Scan(&node.ID, &node.WorkspaceID, &node.RongcloudUserID, &node.MachineID); err != nil {
+		t.Fatalf("load node: %v", err)
+	}
+	// 一次心跳 upsert（generation=0 的 10 秒轮询）。
+	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node,
+		"1.3.19", clawUpgradePlatformWindows, "host-x", `/home/ops/.local/bin`, 0); err != nil {
+		t.Fatalf("heartbeat upsert: %v", err)
+	}
+
+	after, _, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
+	if err != nil {
+		t.Fatalf("read upgrade row again: %v", err)
+	}
+	// reported_at 被刷新到「刚刚」（30 分钟前 -> 分钟级以内）。
+	if !after.ReportedAt.Valid {
+		t.Fatal("reported_at must stay valid after a heartbeat")
+	}
+	if age := time.Since(after.ReportedAt.Time); age > time.Minute {
+		t.Fatalf("reported_at must follow the heartbeat (fresh within a minute), still %s old", age)
+	}
+	// requested_at 语义不回归（R1）：心跳不得移动下发时刻。
+	if !after.RequestedAt.Valid || !before.RequestedAt.Valid {
+		t.Fatalf("requested_at must be valid on both reads (before=%v after=%v)",
+			before.RequestedAt.Valid, after.RequestedAt.Valid)
+	}
+	if !after.RequestedAt.Time.Equal(before.RequestedAt.Time) {
+		t.Fatalf("a heartbeat must not move requested_at (%v -> %v)",
+			before.RequestedAt.Time, after.RequestedAt.Time)
+	}
+	// install_dir 与 reported_at 同一次 upsert 落库：顺手钉住它没被心跳丢掉。
+	if after.InstallDir != `/home/ops/.local/bin` {
+		t.Fatalf("install_dir must be persisted by the same upsert, got %q", after.InstallDir)
 	}
 }

@@ -69,6 +69,10 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		// Hostname 是设备操作系统的主机名。1.3.4 起随这次 10 秒轮询一起上报，
 		// 后台「机器名称」在昵称为空时用它兜底（老版本不带，保持库里已有值）。
 		Hostname string `json:"hostname"`
+		// InstallDir 是 CLI 可执行文件所在目录（process.execPath 的 dirname），
+		// 供后台详情页给用户精确到路径的排查指引。旧 CLI 不带：为空则 upsert
+		// 保留库里已有值，不会把已上报的目录擦掉。
+		InstallDir string `json:"installDir"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
@@ -124,9 +128,10 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		version := strings.TrimSpace(req.Version)
 		platform := strings.TrimSpace(req.Platform)
 		hostname := strings.TrimSpace(req.Hostname)
-		if version != "" || platform != "" || hostname != "" {
+		installDir := strings.TrimSpace(req.InstallDir)
+		if version != "" || platform != "" || hostname != "" || installDir != "" {
 			// 版本上报失败绝不影响启停：下一轮再报就是了。
-			if err := h.clawDeviceRecordUpgradeState(r.Context(), machineNode, version, platform, hostname, 0); err != nil {
+			if err := h.clawDeviceRecordUpgradeState(r.Context(), machineNode, version, platform, hostname, installDir, 0); err != nil {
 				slog.Warn("claw: device version report failed",
 					"machine", machineIDForDevice(machineNode), "error", err)
 			}

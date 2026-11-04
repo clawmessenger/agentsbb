@@ -66,7 +66,11 @@ type clawNodeUpgrade struct {
 	ReportedPlatform string
 	// ReportedHostname 是设备操作系统的 hostname（人可读的机器标识）。与「机器名」
 	// 的区别：机器名取自机器主节点的昵称（可被人改），hostname 是系统事实。
-	ReportedHostname   string
+	ReportedHostname string
+	// InstallDir 是设备 CLI 可执行文件所在目录（path.dirname(process.execPath)）。
+	// 与 hostname 一样是设备上报的环境事实：运维要指导用户「去哪个目录找日志/换
+	// exe」，服务端猜不出来。空串 = 尚未上报（老 CLI 不带 installDir）。
+	InstallDir         string
 	ReportedAt         pgtype.Timestamptz
 	ReportedGeneration int64
 	TargetVersion      string
@@ -110,12 +114,12 @@ func machineIDForDevice(machineNode db.RongcloudNode) string {
 // reported_generation 单调推进（GREATEST：乱序到达的旧轮询不能把它退回去）。
 // 不碰 status/target —— 那是管理端与设备进度的领域，版本上报只负责版本。
 //
-// hostname 传空表示「这次没带」（老版本设备），此时**保留库里已有的值**：否则
-// 一台已上报过主机名的机器会被它自己的旧版本心跳擦成空。
+// hostname / installDir 传空表示「这次没带」（老版本设备），此时**保留库里已有的值**：
+// 否则一台已上报过主机名/目录的机器会被它自己的旧版本心跳擦成空。
 func (h *Handler) clawDeviceRecordUpgradeState(
 	ctx context.Context,
 	machineNode db.RongcloudNode,
-	version, platform, hostname string,
+	version, platform, hostname, installDir string,
 	generation int64,
 ) error {
 	if h.DB == nil {
@@ -124,8 +128,8 @@ func (h *Handler) clawDeviceRecordUpgradeState(
 	_, err := h.DB.Exec(ctx, `
 		INSERT INTO rongcloud_node_upgrade
 			(machine_id, node_id, workspace_id, reported_version, reported_platform,
-			 reported_hostname, reported_at, reported_generation, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, now(), $7, now())
+			 reported_hostname, install_dir, reported_at, reported_generation, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, now())
 		ON CONFLICT (machine_id) DO UPDATE
 		   SET node_id = EXCLUDED.node_id,
 		       workspace_id = EXCLUDED.workspace_id,
@@ -134,12 +138,15 @@ func (h *Handler) clawDeviceRecordUpgradeState(
 		       reported_hostname = COALESCE(
 		           NULLIF(EXCLUDED.reported_hostname, ''),
 		           rongcloud_node_upgrade.reported_hostname),
+		       install_dir = COALESCE(
+		           NULLIF(EXCLUDED.install_dir, ''),
+		           rongcloud_node_upgrade.install_dir),
 		       reported_at = now(),
 		       reported_generation = GREATEST(
 		           rongcloud_node_upgrade.reported_generation, EXCLUDED.reported_generation),
 		       updated_at = now()`,
 		machineIDForDevice(machineNode), machineNode.ID, machineNode.WorkspaceID,
-		version, platform, hostname, generation)
+		version, platform, hostname, installDir, generation)
 	return err
 }
 
@@ -147,7 +154,8 @@ func (h *Handler) clawDeviceRecordUpgradeState(
 // 必须逐字一致，否则 scanClawNodeUpgrade 会在某一处静默错位。
 const clawNodeUpgradeColumns = `
 	machine_id, node_id, workspace_id,
-	reported_version, reported_platform, reported_hostname, reported_at, reported_generation,
+	reported_version, reported_platform, reported_hostname, install_dir,
+	reported_at, reported_generation,
 	target_version, desired_generation, status, error_code, error_detail,
 	force, batch_id, wave, requested_by, requested_at, updated_at`
 
@@ -171,7 +179,8 @@ func (h *Handler) clawNodeUpgradeByMachine(ctx context.Context, machineID string
 func scanClawNodeUpgrade(row pgx.Row) (clawNodeUpgrade, error) {
 	var up clawNodeUpgrade
 	err := row.Scan(&up.MachineID, &up.NodeID, &up.WorkspaceID,
-		&up.ReportedVersion, &up.ReportedPlatform, &up.ReportedHostname, &up.ReportedAt,
+		&up.ReportedVersion, &up.ReportedPlatform, &up.ReportedHostname, &up.InstallDir,
+		&up.ReportedAt,
 		&up.ReportedGeneration,
 		&up.TargetVersion, &up.DesiredGeneration, &up.Status, &up.ErrorCode, &up.ErrorDetail,
 		&up.Force, &up.BatchID, &up.Wave, &up.RequestedBy, &up.RequestedAt, &up.UpdatedAt)
@@ -441,6 +450,9 @@ func (h *Handler) ClawDeviceUpgradeReport(w http.ResponseWriter, r *http.Request
 		ReportedVersion  string `json:"reportedVersion"`
 		ReportedPlatform string `json:"reportedPlatform"`
 		ReportedHostname string `json:"reportedHostname"`
+		// InstallDir 是 CLI 可执行文件所在目录。旧 CLI 不带该字段，为空则 upsert
+		// 保留库里已有值（与 hostname 同款保旧值语义）。
+		InstallDir string `json:"installDir"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
@@ -459,8 +471,8 @@ func (h *Handler) ClawDeviceUpgradeReport(w http.ResponseWriter, r *http.Request
 		return
 	}
 	machineID := machineIDForDevice(machineNode)
-	if req.ReportedVersion != "" || req.ReportedPlatform != "" || req.ReportedHostname != "" {
-		if err := h.clawDeviceRecordUpgradeState(ctx, machineNode, req.ReportedVersion, req.ReportedPlatform, req.ReportedHostname, req.Generation); err != nil {
+	if req.ReportedVersion != "" || req.ReportedPlatform != "" || req.ReportedHostname != "" || req.InstallDir != "" {
+		if err := h.clawDeviceRecordUpgradeState(ctx, machineNode, req.ReportedVersion, req.ReportedPlatform, req.ReportedHostname, req.InstallDir, req.Generation); err != nil {
 			slog.Warn("claw: upgrade version report failed", "machine", machineID, "error", err)
 		}
 	}

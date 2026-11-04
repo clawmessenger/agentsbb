@@ -1209,6 +1209,27 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 		resp["om_online"] = omOnline
 		resp["om_rongcloud_id"] = omRC
 	}
+	// 运行环境（版本/平台/主机名/安装目录/上报时间）来自机器维度的升级行，与
+	// 后台详情页同源同值。machine_name 不在这里：它按机器反查主节点昵称才能得
+	// 到，C 端设备列表（/api/claw/nodes）已随行下发，前端直取即可，compat 层
+	// 不为此再造一次查询。
+	//
+	// 机器键必须用 machineIDForDevice（与上报侧逐字一致），否则 machine_id 为空
+	// 的老机器会读不到自己刚写的行。查询失败只少下发字段：状态探针的主职责是在
+	// 线判断，环境字段缺了前端显示「-」，不该把整条状态打红。
+	if h.DB != nil {
+		if upgrade, found, err := h.clawNodeUpgradeByMachine(r.Context(), machineIDForDevice(node)); err != nil {
+			slog.Warn("claw: node runtime env lookup failed", "nodeId", nodeID, "error", err)
+		} else if found {
+			resp["exe_version"] = upgrade.ReportedVersion
+			resp["exe_platform"] = upgrade.ReportedPlatform
+			resp["hostname"] = upgrade.ReportedHostname
+			resp["install_dir"] = upgrade.InstallDir
+			if upgrade.ReportedAt.Valid {
+				resp["reported_at"] = upgrade.ReportedAt.Time.UTC().Format(time.RFC3339)
+			}
+		}
+	}
 	clawJSON(w, 200, 200, "", resp)
 }
 

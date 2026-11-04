@@ -280,6 +280,13 @@ type clawAdminNodeRow struct {
 	// ExePlatform 是设备上报的 "<os>-<arch>"（如 win32-x64）。页面的「升级」按钮
 	// 据此禁用：本期只做 Windows-x64 的自动重启，其它平台只能看版本。
 	ExePlatform string `json:"exe_platform,omitempty"`
+	// InstallDir 是设备上报的 CLI 安装目录（exe 所在文件夹）。详情页用它给出精确
+	// 到路径的排查指引。空串 = 从未上报（老 CLI 不带 installDir），页面显示「-」。
+	InstallDir string `json:"install_dir,omitempty"`
+	// ReportedAt 是设备最近一次上报 reported_* 字段的时间（10 秒心跳保活刷新），
+	// 供详情页判断数据新鲜度。与 UpgradeUpdatedAt 的分工：后者是整行 updated_at
+	//（含管理端下发指令），前者才回答「设备数据是什么时候说的」。
+	ReportedAt string `json:"reported_at,omitempty"`
 	// UpgradeStatus/Target/Error/UpdatedAt 来自 rongcloud_node_upgrade，
 	// 与版本同表读取 —— 一次查询同时拿到「现在什么版本」和「升到哪一步了」。
 	UpgradeStatus    string `json:"upgrade_status,omitempty"`
@@ -361,6 +368,10 @@ func (h *Handler) clawAdminAttachUpgrade(row clawAdminNodeRow, rec clawAdminNode
 	row.ExeVersion = upgrade.ReportedVersion
 	row.ExePlatform = upgrade.ReportedPlatform
 	row.Hostname = upgrade.ReportedHostname
+	row.InstallDir = upgrade.InstallDir
+	if upgrade.ReportedAt.Valid {
+		row.ReportedAt = upgrade.ReportedAt.Time.UTC().Format(time.RFC3339)
+	}
 	row.UpgradeStatus = upgrade.Status
 	row.UpgradeTarget = upgrade.TargetVersion
 	if upgrade.ErrorCode != "" {
