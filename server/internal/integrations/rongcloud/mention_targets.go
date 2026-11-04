@@ -40,14 +40,14 @@ const (
 	// 会让「@agent_xxx」被切成「agent」，兜底解析永远失效。
 	mentionTokenBoundaries = "，。、！？：；,.!?:;…·~\"'“”‘’（）()【】[]{}「」『』《》<>"
 
-	// mentionStartBlockers 是「@ 前面出现这些字符 → 这个 @ 一定不是定向意图」
-	// 的字符集：ASCII 邮箱本地部分与域名用到的字符（字母/数字/`.`/`_`/`-`/`+`）
-	// 加上 URL 路径分隔符（`/`/`:`）。
+	// mentionStartBlockers 是**黑名单**：只有当这些字符出现在 @ 前面时，才拒绝
+	// 这个 @ 作为定向起点；其余（汉字、全角符号、空白、标点、行首）一律放行。
 	//
-	// 它和 mentionTokenBoundaries 是**两个不同的问题**，不能合并：前者判「这个
-	// @ 算不算起点」，后者判「名字到哪结束」。用白名单（行首/空白/标点才放行）
-	// 会连「回复@老王」这种中文手打提及一起拒掉 —— 讨论组没有 @ 选人面板，手打
-	// 是那里唯一的 @ 途径，收窄的代价恰好落在最容易被感知的地方。
+	// 集合就是 ASCII 邮箱本地部分/域名可出现的字符（字母、数字、`.`、`_`、`-`、
+	// `+`）与 URL 分隔符（`/`、`:`）。它**不是**标点表，也不与
+	// mentionTokenBoundaries 合并：后者判「名字到哪结束」，这里判「这个 @ 算不算
+	// 起点」，两个问题方向相反 —— 早期版本拿后者当前者用，才把「回复@老王」这种
+	// 中文手打提及一起拒了（详见 extractMentionTokens 的注释）。
 	mentionStartBlockers = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-+/:"
 )
 
@@ -213,9 +213,11 @@ func resolveMentionTargetsByName(
 // 感知的地方。黑名单的口径可以直接说成「老行为 − 邮箱/URL 误判」：`回复@老王`
 // 与老版本一样能定向，`发我邮箱 a@b.com`、`https://x/u/@老王` 不再误判。
 //
-// 代价（明确接受）：`老王@小李` 这种纯文字粘连仍会定向到小李 —— 但那本来就是
-// 老版本的行为，且用户很可能真想 @ 小李，属于「多派/少派」之间的产品取舍，
-// 不在本次「堵误判」的范围内。
+// 代价（**有意接受，请不要改回白名单**）：`老王@小李` 这种纯文字粘连仍会定向到
+// 小李 —— 前面的字符是汉字、不在黑名单里。这本来就是老版本行为，而白名单为了
+// 拒掉它会把「回复@老王」「这个问下@老王」这类**中文手打提及**一起拒掉，而讨论组
+// 没有 @ 选人面板、手打是唯一途径，那个代价大得多。取舍方向始终是「可能多派/
+// 定向」而不是「静默少派」。
 //
 // 两条特例：
 //   - 前一个字符是 @：**沿用上一个 @ 的结论**。`@@张三` 的第一个 @ 合规但切出
@@ -282,8 +284,25 @@ func mentionStartAllowed(runes []rune, i int, prevAtValid bool, prevTokenEnd int
 	if i == prevTokenEnd {
 		return true
 	}
-	// 黑名单：@ 前面是 ASCII 邮箱/URL 字符 → 不是定向起点（a@b.com、/u/@老王）。
-	return !strings.ContainsRune(mentionStartBlockers, prev)
+	// 黑名单：@ 前面是 ASCII 词字符/邮箱字符/URL 分隔符 → 不是定向起点
+	// （a@b.com、/u/@老王）。
+	return !isASCIIWordRune(prev)
+}
+
+// isASCIIWordRune 是起点判据的黑名单谓词：报告 r 是否属于「出现在 @ 前面就
+// 说明这不是定向意图」的字符集（见 mentionStartBlockers）。
+//
+// 为什么这些字符足够：邮箱的 `local@domain` 里 local 与 domain 只允许 ASCII
+// 词字符（字母/数字/`.`/`_`/`-`/`+`），URL 里一个裸 `@` 的前一个字符必然是
+// 路径分隔符（`/`、`:`）或路径段里的 ASCII 字符 —— 两类都被这个集合覆盖，所以
+// 邮箱与 URL 里的 @ 不会被重新当成定向。
+//
+// 已知且**有意接受**的边缘：邮箱本地部分是中文时（`老王@163.com`）前面的字符
+// 是汉字、不在黑名单里，会切出域名前半段。方向是多派（多一个候选）而不是少派，
+// 且要求恰好有成员叫这个串，故按低危记录（用例 `邮箱本地部分是中文 → 会切出
+// 域名前半段` 钉住了这个行为，避免它被当成 bug 反复来回改）。
+func isASCIIWordRune(r rune) bool {
+	return strings.ContainsRune(mentionStartBlockers, r)
 }
 
 // isMentionTokenBoundary 报告 r 是否终止一个 @ 名字。

@@ -316,11 +316,40 @@ func TestResolveMentionTargets(t *testing.T) {
 			wantDirective: true,
 		},
 		{
+			name:          "中文紧贴 @（裸写法，无空格无标点）",
+			members:       base,
+			text:          "回复@老王",
+			wantNames:     []string{"老王"},
+			wantDirective: true,
+		},
+		{
 			name:          "中文标点收尾紧贴 @",
 			members:       base,
 			text:          "同意@老王，开始",
 			wantNames:     []string{"老王"},
 			wantDirective: true,
+		},
+		{
+			name:          "这个问下@老王（中文动词紧贴 @）",
+			members:       base,
+			text:          "这个问下@老王",
+			wantNames:     []string{"老王"},
+			wantDirective: true,
+		},
+		{
+			// 裸邮箱文本：@ 前是字母，黑名单必须挡住（正控见上面几条中文紧贴）。
+			name:          "裸邮箱 a@b.com（成员含 b）→ 无定向",
+			members:       mentionMembers(mentionSpec{"rc_b", "b"}),
+			text:          "a@b.com",
+			wantNames:     nil,
+			wantDirective: false,
+		},
+		{
+			name:          "纯数字本地部分邮箱 10086@qq.com → 无定向",
+			members:       mentionMembers(mentionSpec{"rc_qq", "qq"}, mentionSpec{"rc_c", "com"}),
+			text:          "10086@qq.com",
+			wantNames:     nil,
+			wantDirective: false,
 		},
 		{
 			// 纯文字粘连：等于老版本行为（定向到被 @ 者）。产品取舍已记在
