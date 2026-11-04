@@ -462,8 +462,106 @@ export function createActivityTracker(): ActivityTracker {
       });
     }
 
-    // opencode 每步结束：这一步里没再更新的工具视为已完成，别让气泡一直转圈
-    // （上面的 step_finish 分支已经收尾，这里不再重复）。
+    // --- dsh：v=1 的 tool_call / tool_result 帧（上游 dsh.go:398-405）---
+    // ⚠️ 必须在 cursor-agent 的 tool_call 分支**之前**：dsh 帧同为
+    // type:"tool_call" 但没有 subtype，cursor 分支的
+    // 「subtype 不是 started/completed 就 return false」会把 dsh 帧短路掉。
+    // 形状：{"v":1,"type":"tool_call","call_id":…,"name":…,"arguments":"{…json 串…}"}
+    //       {"v":1,"type":"tool_result","call_id":…,"output":…,"is_error"?}
+    // arguments 是 JSON 字符串（不是对象），解析失败按原样当摘要。
+    if (event.v === 1 && type === "tool_call") {
+      const id = asString(event.call_id) || `dsh-${steps.length}`;
+      const cls = classifyTool(asString(event.name));
+      let input: unknown = event.arguments;
+      if (typeof event.arguments === "string") {
+        try {
+          input = JSON.parse(event.arguments);
+        } catch {
+          input = event.arguments;
+        }
+      }
+      return upsert(id, {
+        kind: cls.kind,
+        label: cls.label,
+        detail: summarizeToolDetail(input),
+        inputDetail: summarizeToolInputDetail(input),
+        status: "running",
+      });
+    }
+    if (event.v === 1 && type === "tool_result") {
+      const id = asString(event.call_id);
+      const target = id ? byId.get(id) : undefined;
+      if (!target) return false;
+      return upsert(id, {
+        kind: target.kind,
+        label: target.label,
+        outputDetail: summarizeToolResultDetail(event.output),
+        status: event.is_error === true ? "failed" : "done",
+      });
+    }
+
+    // --- cursor-agent：顶层 tool_call 事件（真实抓包
+    // testdata/cursor-agent-2026.07.20-stream-json.jsonl:9-12）---
+    // 形状：{type:"tool_call", subtype:"started", tool_call:{readToolCall:…}}
+    //       {type:"tool_call", subtype:"completed", tool_call:{…,result:…}}
+    // call_id 稳定；工具名在 tool_call 下按具体工具键（readToolCall /
+    // shellToolCall / editToolCall）命名。只认 started/completed 两个终态
+    // 边界（上游 cursor.go:205-232 的 MUL-5231 结论：非终态 subtype 不得
+    // 合成结果）。
+    if (type === "tool_call") {
+      const subtype = asString(event.subtype);
+      if (subtype !== "started" && subtype !== "completed") return false;
+      const call = asRecord(event.tool_call);
+      const id = asString(event.call_id) || `cursor-${steps.length}`;
+      const toolName = call
+        ? Object.keys(call).find((k) => k.endsWith("ToolCall"))?.replace(/ToolCall$/, "") || "tool"
+        : "tool";
+      const cls = classifyTool(toolName);
+      if (subtype === "started") {
+        const args = asRecord(asRecord(call?.[`${toolName}ToolCall`])?.args);
+        return upsert(id, {
+          kind: cls.kind,
+          label: cls.label,
+          detail: summarizeToolDetail(args),
+          inputDetail: summarizeToolInputDetail(args),
+          status: "running",
+        });
+      }
+      return upsert(id, {
+        kind: cls.kind,
+        label: cls.label,
+        status: "done",
+      });
+    }
+
+    // --- pi / omp：tool_execution_start / tool_execution_end
+    // （上游 pi.go:561-579）---
+    // 形状：{type:"tool_execution_start","toolCallId":…,"toolName":…,"args":{…}}
+    //       {type:"tool_execution_end","toolCallId":…,"result":…,"isError":…}
+    if (type === "tool_execution_start") {
+      const id = asString(event.toolCallId) || `pi-${steps.length}`;
+      const cls = classifyTool(asString(event.toolName));
+      return upsert(id, {
+        kind: cls.kind,
+        label: cls.label,
+        detail: summarizeToolDetail(event.args),
+        inputDetail: summarizeToolInputDetail(event.args),
+        status: "running",
+      });
+    }
+    if (type === "tool_execution_end") {
+      const id = asString(event.toolCallId);
+      const target = id ? byId.get(id) : undefined;
+      if (!target) return false;
+      return upsert(id, {
+        kind: target.kind,
+        label: target.label,
+        outputDetail: summarizeToolResultDetail(event.result),
+        status: event.isError === true ? "failed" : "done",
+      });
+    }
+
+    // dsh 的帧已在上方（cursor 分支之前）消化。
 
     return false;
   };
