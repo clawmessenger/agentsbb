@@ -1145,3 +1145,135 @@ describe("startup script backfill", () => {
     expect(h.output.join("")).not.toContain("refreshed");
   });
 });
+
+// 旧 supervisor「收到 shutdown 却不退出」是**已发生的两次线上故障**（1.3.22 / 1.3.23，
+// Windows 与 Linux 各一次）：`__relaunch` 等满 60s 判定 pid_timeout 后**放弃启动**，
+// 设备于是跑着已被删除的 inode、不再轮询、页面永远 pending。旧行为把「优雅退出失败」
+// 升级成了「设备静默离线」，比直接失败更难查。下面钉死新的处置。
+describe("__relaunch 对不退出旧进程的处置", () => {
+  /** 一份可写的 target，helper 只在 target 存在时才往下走。 */
+  function fixture(): { dir: string; target: string } {
+    const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-kill-"));
+    dirs.push(dir);
+    const target = join(dir, "clawmessenger.exe");
+    writeFileSync(target, "NEW-BINARY");
+    return { dir, target };
+  }
+
+  it("force-kills a pid that ignores shutdown, then starts the new build", async () => {
+    const { dir, target } = fixture();
+    let alive = true;
+    const kills: number[] = [];
+    const spawned: Array<{ command: string; args: string[] }> = [];
+    const out: string[] = [];
+
+    const program = buildProgram({
+      keystore: new Keystore(join(dir, "creds.json")),
+      apiFactory: () => ({}) as unknown as XiachatApi,
+      stdout: { write: (s: unknown) => { out.push(String(s)); return true } } as unknown as NodeJS.WriteStream,
+      acquireLock: () => Promise.resolve({ release: () => {} }),
+      sleep: () => Promise.resolve(),
+      relaunchAliveMs: 20,
+      // 旧进程一直活到被强杀为止。
+      pidAlive: () => alive,
+      killPid: (pid) => { kills.push(pid); alive = false; return { ok: true } },
+      spawnChild: ((command: string, args: string[]) => {
+        spawned.push({ command, args });
+        writeRelaunchReadyFile(target, process.pid);
+        return { unref: () => {}, pid: process.pid };
+      }) as unknown as typeof spawn,
+    });
+
+    // 同一进程里前面的用例可能留过 exitCode=1（helper 的失败分支就是这么报的），
+    // 这条要断言「成功路径不设失败码」，先清干净再跑。
+    process.exitCode = undefined;
+    await program.parseAsync([
+      "node", "clawmessenger", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "1",
+    ]);
+
+    // 超时那一刻强杀，而不是放弃。
+    expect(kills).toEqual([4242]);
+    // 杀干净之后照常拉起新版 —— 这才是「升级完自动重启」该有的结局。
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].command).toBe(target);
+    expect(out.join("")).toContain("force-killing");
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it("leaves a pid_kill_failed marker instead of starting a second supervisor", async () => {
+    const { dir, target } = fixture();
+    const spawned: Array<{ command: string }> = [];
+    const out: string[] = [];
+
+    const program = buildProgram({
+      keystore: new Keystore(join(dir, "creds.json")),
+      apiFactory: () => ({}) as unknown as XiachatApi,
+      stdout: { write: (s: unknown) => { out.push(String(s)); return true } } as unknown as NodeJS.WriteStream,
+      acquireLock: () => Promise.resolve({ release: () => {} }),
+      sleep: () => Promise.resolve(),
+      pidAlive: () => true,
+      // 权限不足/策略拦截：杀不掉。
+      killPid: () => ({ ok: false, detail: "access denied" }),
+      spawnChild: ((command: string) => {
+        spawned.push({ command });
+        return { unref: () => {}, pid: process.pid };
+      }) as unknown as typeof spawn,
+    });
+
+    await program.parseAsync([
+      "node", "clawmessenger", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "1",
+    ]);
+
+    // 杀不掉时**绝不能**起第二份（两份 supervisor 会登录同一批融云节点互相踢线）。
+    expect(spawned).toHaveLength(0);
+    expect(out.join("")).toContain("reason=pid_kill_failed");
+    expect(process.exitCode ?? 0).toBe(1);
+    process.exitCode = undefined;
+  });
+
+  it("does not touch the pid at all when the old supervisor exits in time", async () => {
+    const { dir, target } = fixture();
+    const kills: number[] = [];
+    const spawned: Array<{ command: string }> = [];
+
+    const program = buildProgram({
+      keystore: new Keystore(join(dir, "creds.json")),
+      apiFactory: () => ({}) as unknown as XiachatApi,
+      stdout: { write: () => true } as unknown as NodeJS.WriteStream,
+      acquireLock: () => Promise.resolve({ release: () => {} }),
+      sleep: () => Promise.resolve(),
+      relaunchAliveMs: 20,
+      pidAlive: () => false,
+      killPid: (pid) => { kills.push(pid); return { ok: true } },
+      spawnChild: ((command: string) => {
+        spawned.push({ command });
+        writeRelaunchReadyFile(target, process.pid);
+        return { unref: () => {}, pid: process.pid };
+      }) as unknown as typeof spawn,
+    });
+
+    await program.parseAsync([
+      "node", "clawmessenger", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "60000",
+    ]);
+
+    expect(kills).toHaveLength(0);
+    expect(spawned).toHaveLength(1);
+  });
+});
+
+// 事件的另一半：**旧进程为什么不肯退**。端口锁是 net.Server，只 listen 不 close
+// 就会一直占着事件循环；shutdown 把定时器清光、子进程杀光、状态文件也写了，
+// 进程却永远退不掉。下面钉死「run 结束时必须把锁放掉」。
+describe("singleton lock 释放", () => {
+  it("releases the port lock once the supervisor stops, so the process can exit", async () => {
+    const released: string[] = [];
+    const h = makeHarness([], BOUND_OPS, {
+      acquireLock: async () => ({ release: () => { released.push("released") } }),
+    });
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+    expect(released).toHaveLength(0);
+    h.getShutdown()();
+    await h.run;
+    expect(released).toEqual(["released"]);
+  });
+});

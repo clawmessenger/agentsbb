@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
@@ -209,6 +209,18 @@ export interface BuildProgramOpts {
   // singleton). Tests substitute an in-memory fake so parallel test processes
   // don't collide on the real port.
   acquireLock?: (port: number) => Promise<SupervisorLock | null>;
+  /**
+   * Injectable for tests; how `__relaunch`硬杀一个不肯退出的旧 supervisor
+   * （默认 taskkill /T /F 或 SIGKILL）。测试里绝不能碰真实进程。
+   */
+  killPid?: (pid: number) => { ok: boolean; detail?: string };
+  /** Injectable for tests; 「这个 pid 还活着吗」（默认 processAlive）。 */
+  pidAlive?: (pid: number) => boolean;
+  /**
+   * Injectable for tests; shutdown 之后多久强退（默认在安装版 exe 里是
+   * SHUTDOWN_HARD_EXIT_MS，测试与 `node bin.ts run` 下是 0 = 不装兜底）。
+   */
+  shutdownGraceMs?: number;
   // Injectable for tests; overrides the CLI version the supervisor reports for
   // itself (defaults to cliVersion(), which is the build-time injected value).
   version?: string;
@@ -289,6 +301,24 @@ export interface SupervisorLock {
 export const SUPERVISOR_LOCK_PORT = 41307;
 
 /**
+ * `__relaunch` 强杀旧 supervisor 之后，再给它多久消失。
+ *
+ * SIGKILL/TerminateProcess 是**异步**生效的：返回成功不等于进程已经不在。
+ * 这段时间太短会在旧进程还占着端口时抢锁失败（升级变成失败），太长则拖慢
+ * 一次本来十几秒就该完成的升级。10 秒足够 OS 回收一个已被 SIGKILL 的进程。
+ */
+export const RELAUNCH_FORCE_KILL_GRACE_MS = 10_000;
+
+/**
+ * shutdown 之后允许进程自然退出的宽限；到点还没退就强退。
+ *
+ * 8 秒是个折中：够子进程收完 SIGTERM、够 keep-alive socket 走完关闭握手，
+ * 又远小于 `__relaunch` 的 60 秒等待窗口 —— 强退必须发生在接力判定超时之前，
+ * 否则兜底就没有意义了。
+ */
+export const SHUTDOWN_HARD_EXIT_MS = 8_000;
+
+/**
  * 升级接力时，新 supervisor 等父进程放掉端口锁的上限（毫秒）。
  *
  * 为什么需要：__relaunch 现在是「拿锁 → spawn → 确认站起来 → 放锁」。父进程握着
@@ -365,6 +395,46 @@ export function processAlive(pid: number): boolean {
     return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * 强杀一个「收到 shutdown 却不退出」的旧 supervisor。
+ *
+ * 为什么需要它 —— 优雅退出的前提是「事件循环能空」。历史上它并不总能空
+ * （1.3.22/1.3.23 的端口锁只 listen 不 close，见 run 里的 release），于是
+ * SIGTERM 之后子进程停了、定时器清了、状态文件也写了，进程本身却一直在。
+ * 升级接力那边等满 60 秒就**放弃启动新版**，设备从此变成「跑着已被删除的
+ * inode、不再轮询、页面永远 pending」的僵尸 —— 比直接失败更难查。
+ *
+ * 此刻旧进程已经在 stopping 状态、不再派发，强杀是安全的；真正的风险是留下
+ * 两份 supervisor 同时登录同一批融云节点互相踢线，所以调用方必须先确认它
+ * 真的没了才拉起新版。
+ */
+export function forceKillPid(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+): { ok: boolean; detail?: string } {
+  if (!Number.isFinite(pid) || pid <= 0) return { ok: false, detail: `invalid pid ${pid}` };
+  try {
+    if (platform === "win32") {
+      // /T 收整棵进程树；Node 的 process.kill 在 Windows 上做不到这一点。
+      const res = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      if (res.error) return { ok: false, detail: res.error.message };
+      // taskkill 对「已经没了」的 pid 返回非 0；那不是失败，交给调用方用
+      // processAlive 复核（这里只报真正执行不下去的情况）。
+      return { ok: true };
+    }
+    process.kill(pid, "SIGKILL");
+    return { ok: true };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ESRCH = 已经在退出路上/已经没了，按成功处理。
+    if (code === "ESRCH") return { ok: true };
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -944,6 +1014,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         // 死进程）还活着时会放行出第二套进程树。端口锁与进程同生死，兜底这道缝。
         // 是否真的拿到单例锁（__relaunch 的交接凭据要看这个值）。
         let lockHeld = false;
+        // 端口锁也在这里留一份引用：**它必须跟着 shutdown 一起放掉**，见下面
+        // runSupervisor 返回处的注释。以前它只进不出，于是进程永远退不掉。
+        let singletonLock: SupervisorLock | null = null;
         if (!allowDuplicateSupervisor()) {
           const acquire = opts.acquireLock ?? acquireSupervisorLock;
           const lockSleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -982,6 +1055,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
             await lockSleep(200);
           }
           lockHeld = lock !== null;
+          singletonLock = lock;
           if (!lock && !lockCheckError) {
             opts.stdout.write(
               "another clawmessenger supervisor is already running (singleton lock held, no live pid file —\n" +
@@ -1091,6 +1165,14 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           },
           onStopped: () => clearSupervisorState(daemonPaths),
         });
+        // 端口锁是 net.Server：**只要还 listen 着就一直占着事件循环**。
+        // 不释放的话，supervisor 收完 SIGTERM、子进程全停、定时器全清、状态文件
+        // 也写了，进程却永远退不掉 —— 升级接力那边等满超时判定 pid_timeout 后
+        // 放弃启动新版，设备就变成「跑着已被删除的 inode、不再轮询、页面永远
+        // pending」的僵尸（1.3.22 / 1.3.23 在 Windows 与 Linux 各复现一次）。
+        // 关闭监听后事件循环才可能变空，正常的优雅退出才真的会退出。
+        singletonLock?.release();
+        singletonLock = null;
         return;
       }
       // The built-in ops agent runs on the local opencode CLI (auto-installed
@@ -1376,7 +1458,13 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       const spawnFn = opts.spawnChild ?? spawn;
       const passthroughArgs = parsePassthroughArgs(cmdOpts.args);
 
-      const deadline = Date.now() + timeoutMs;
+      let deadline = Date.now() + timeoutMs;
+      // 旧 supervisor 死不肯退是**已知形态**（收到 shutdown 但事件循环没空），
+      // 不是理论风险：1.3.22 与 1.3.23 在 Windows、Linux 各复现一次，每次都
+      // 把设备变成「活着但不上报」的僵尸。所以超时不再直接放弃。
+      const killFn = opts.killPid ?? ((pid: number) => forceKillPid(pid, process.platform));
+      const aliveFn = opts.pidAlive ?? processAlive;
+      let forceKilled = false;
       // 所有失败分支都留痕：设备「磁盘是新版、但没有 supervisor」是最难查的故障，
       // 而原来只有一支写了标记、标记还没人读、helper 的 stdout 又被整个丢掉。
       const fail = (reason: string, detail: string): void => {
@@ -1385,11 +1473,38 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         opts.stdout.write(`relaunch: wrote ${relaunchFailureMarkerPath()} (reason=${reason})\n`);
         process.exitCode = 1;
       };
-      while (Number.isFinite(waitPid) && waitPid > 0 && processAlive(waitPid)) {
+      while (Number.isFinite(waitPid) && waitPid > 0 && aliveFn(waitPid)) {
         if (Date.now() > deadline) {
-          // 旧进程没退干净就不要拉起第二份 supervisor（两份会登录同一批融云
-          // 账号、互相踢线）。宁可失败，让人工 `clawmessenger start` 收拾。
-          fail("pid_timeout", `pid ${waitPid} did not exit within ${timeoutMs}ms; not starting`);
+          if (!forceKilled) {
+            // 它已经在 stopping 状态、不再派发（子进程早停了），强杀不会丢正在
+            // 进行的一轮对话；而「放弃启动」会让设备永久停在僵尸态 —— 两害相权
+            // 强杀更轻。真正不能做的是**留两份** supervisor 同时登录互相踢线，
+            // 所以杀完还得复核它确实没了，才继续往下拉起新版。
+            forceKilled = true;
+            const outcome = killFn(waitPid);
+            opts.stdout.write(
+              `relaunch: pid ${waitPid} did not exit within ${timeoutMs}ms`
+                + (outcome.ok
+                  ? "; force-killing it so the new build can start\n"
+                  : `; force-kill failed (${outcome.detail ?? "unknown"}); not starting\n`),
+            );
+            if (!outcome.ok) {
+              fail(
+                "pid_kill_failed",
+                `pid ${waitPid} ignored shutdown for ${timeoutMs}ms and could not be killed: `
+                  + `${outcome.detail ?? "unknown reason"}; not starting`,
+              );
+              return;
+            }
+            deadline = Date.now() + RELAUNCH_FORCE_KILL_GRACE_MS;
+            continue;
+          }
+          // 连强杀都没收走（D 状态卡在 I/O、或 Windows 上句柄释放不了）。这时
+          // 再拉起第二份就是两份 supervisor 抢同一批融云节点，宁可失败留痕。
+          fail(
+            "pid_timeout",
+            `pid ${waitPid} survived a force kill for ${RELAUNCH_FORCE_KILL_GRACE_MS}ms; not starting`,
+          );
           return;
         }
         await sleep(200);
@@ -2554,6 +2669,22 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     // children are gone; `process.on` below replaces Node's default SIGTERM
     // behaviour, so without this the supervisor would outlive its agents.
     resolveStopped();
+    // 兜底强退：主路径是「放掉端口锁 → 事件循环变空 → 自然退出」，但只要有
+    // 任何一处还拖着句柄（第三方 SDK 的 keep-alive socket、库内部 timer），
+    // 进程就会停在「已经停止却不退出」的状态，升级接力只能判定 pid_timeout，
+    // 最后把设备留在僵尸态。宽限期到点直接 exit —— 此刻定时器全清、子进程全停、
+    // 状态文件已写，强退不丢任何东西。
+    // 默认只在安装版 exe 里生效：测试会把 shutdown 当普通函数调用，一个真的
+    // 8 秒后 exit 的定时器会把 vitest worker 带走。
+    const hardExitMs =
+      opts.shutdownGraceMs ?? (isSeaExecutable(process.argv[1]) ? SHUTDOWN_HARD_EXIT_MS : 0);
+    if (hardExitMs > 0) {
+      const hardExit = setTimeout(() => {
+        console.error(`supervisor: still alive ${hardExitMs}ms after shutdown — forcing exit`);
+        process.exit(0);
+      }, hardExitMs);
+      if (typeof hardExit.unref === "function") hardExit.unref();
+    }
   };
   // 升级流程在轮询回调里触发退出（交换完成之后），这里把 shutdown 交出去。
   triggerShutdown = shutdown;
