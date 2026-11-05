@@ -10,7 +10,7 @@ import {
   classifyTool,
   createActivityTracker,
 } from "./agent-activity.js";
-import { ensureCodexBehaviorPrompt, ensureCodexOutputStyle } from "./agent-instructions.js";
+import { ensureCodexBehaviorPrompt, ensureCodexOutputStyle, ensureCodexFastStart, ensureQwenFastStart } from "./agent-instructions.js";
 import {
   fsGateExempt,
   fsRestriction,
@@ -1851,9 +1851,19 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   // 幂等且失败静默 —— 写不了指令文件不该让这一轮答不出来。
   if (opts.agentName === "codex") {
     ensureCodexOutputStyle();
+    // 冷启动提速自愈：禁用 slack / google-calendar 这类「未登录也要重试认证」的
+    // 远程插件（实测每轮冷启动白付 40s+，见 agent-instructions.ts 的现场记录）。
+    // 幂等、失败静默 —— 不影响本轮。
+    ensureCodexFastStart();
     // 行为规范只在私聊轮次存在：群聊/讨论组由服务端拼进 role_prompt，这里传空
     // 表示「摘掉上一轮私聊写进去的那一节」，避免同一段话在群聊里出现两遍。
     ensureCodexBehaviorPrompt(opts.behaviorPrompt ?? "");
+  }
+
+  // qwen 轮次尾延迟自愈：补写 memory.enableManagedAutoMemory=false（用户显式
+  // 设过则不动）。实测每轮 result 事件因此晚 15~45s —— 见 agent-instructions.ts。
+  if (opts.agentName === "qwen") {
+    ensureQwenFastStart();
   }
 
   // opencode：默认走 serve + SSE（真 token 级增量）。只有 argv 策略成立时

@@ -703,6 +703,19 @@ export function buildDeviceOpencodeConfig(
       dropped.push(key);
     }
   }
+  // small_model（title 生成等内部小调用用的小模型）指向的 provider/model 与主
+  // model 不一致时，对齐到主 model。2026-11-05 现场：small_model=
+  // quukk/deepseek-v4-flash 已欠费（Insufficient Balance），而主 model glm-5.2
+  // 正常 —— 每轮 title 生成先失败重试（stream error + 步进重试），把主回答的
+  // 起跑拖慢约 4~5 秒，且日志噪音大。设备端会话的 title 没有任何消费方，
+  // 用主模型生成一次标题的代价可以忽略，换来的是不再被小模型的配额状态绑架。
+  // 用户没配 small_model 时不主动添加（保持其原有行为）。
+  if (typeof out.small_model === "string"
+    && typeof out.model === "string"
+    && out.small_model !== out.model) {
+    dropped.push(`small_model:${out.small_model}`);
+    out.small_model = out.model;
+  }
   if (opts.instructions && opts.instructions.length > 0) {
     // 追加而不是覆盖：用户自己的 instructions 必须原样保留。
     const existing = Array.isArray(out.instructions)

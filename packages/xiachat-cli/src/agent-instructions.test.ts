@@ -113,3 +113,126 @@ describe("ensureCodexOutputStyle", () => {
     expect(changed).toBe(false);
   });
 });
+
+// --- 冷启动/尾延迟自愈（2026-11-05 现场） ----------------------------------
+
+import {
+  CODEX_SLOW_PLUGINS,
+  disableCodexPluginSections,
+  ensureCodexFastStart,
+  ensureQwenFastStart,
+  qwenSettingsPath,
+} from "./agent-instructions.js";
+
+describe("disableCodexPluginSections", () => {
+  it("把目标插件段的 enabled=true 改成 false，其余段落不动", () => {
+    const raw = [
+      'model = "glm-5.2"',
+      "",
+      '[plugins."slack@openai-curated"]',
+      "enabled = true",
+      "",
+      '[plugins."browser@openai-bundled"]',
+      "enabled = true",
+      "",
+      "[features]",
+      "web_search = true",
+    ].join("\n");
+    const { text, changed } = disableCodexPluginSections(raw, CODEX_SLOW_PLUGINS);
+    expect(changed).toBe(true);
+    expect(text).toContain('[plugins."slack@openai-curated"]\nenabled = false');
+    // 无关插件保持原样
+    expect(text).toContain('[plugins."browser@openai-bundled"]\nenabled = true');
+    expect(text).toContain("web_search = true");
+  });
+
+  it("已是 false / 段落不存在时幂等不改", () => {
+    const already = '[plugins."slack@openai-curated"]\nenabled = false\n';
+    expect(disableCodexPluginSections(already, CODEX_SLOW_PLUGINS).changed).toBe(false);
+    expect(disableCodexPluginSections("model = \"x\"\n", CODEX_SLOW_PLUGINS).changed).toBe(false);
+  });
+});
+
+describe("ensureCodexFastStart", () => {
+  it("config.toml 存在且含慢插件时改写；已是 false 时不动", () => {
+    const files = new Map<string, string>([
+      [join("/h", ".codex", "config.toml"), '[plugins."slack@openai-curated"]\nenabled = true\n'],
+    ]);
+    const writeFile = vi.fn((p: string, c: string) => files.set(p, c));
+    const changed = ensureCodexFastStart({
+      home: "/h",
+      readFile: (p) => files.get(p) ?? null,
+      writeFile,
+    });
+    expect(changed).toBe(true);
+    expect(files.get(join("/h", ".codex", "config.toml"))).toContain("enabled = false");
+
+    // 再跑一次：幂等
+    const again = ensureCodexFastStart({
+      home: "/h",
+      readFile: (p) => files.get(p) ?? null,
+      writeFile: vi.fn(),
+    });
+    expect(again).toBe(false);
+  });
+
+  it("CODEX_HOME 优先；config.toml 不存在时静默返回 false", () => {
+    const changed = ensureCodexFastStart({
+      env: { CODEX_HOME: "/custom" },
+      readFile: () => null,
+      writeFile: vi.fn(),
+    });
+    expect(changed).toBe(false);
+  });
+});
+
+describe("ensureQwenFastStart", () => {
+  it("settings.json 没有 memory 键时补写 enableManagedAutoMemory=false", () => {
+    const files = new Map<string, string>([
+      [join("/h", ".qwen", "settings.json"), JSON.stringify({ model: { name: "glm-5.2" } })],
+    ]);
+    const changed = ensureQwenFastStart({
+      home: "/h",
+      readFile: (p) => files.get(p) ?? null,
+      writeFile: (p, c) => files.set(p, c),
+    });
+    expect(changed).toBe(true);
+    const written = JSON.parse(files.get(join("/h", ".qwen", "settings.json"))!);
+    expect(written.memory.enableManagedAutoMemory).toBe(false);
+    // 用户其余内容原样保留
+    expect(written.model.name).toBe("glm-5.2");
+  });
+
+  it("用户显式设过 enableManagedAutoMemory（无论真假）一律不动", () => {
+    const explicit = JSON.stringify({ memory: { enableManagedAutoMemory: true } });
+    const files = new Map<string, string>([
+      [join("/h", ".qwen", "settings.json"), explicit],
+    ]);
+    const changed = ensureQwenFastStart({
+      home: "/h",
+      readFile: (p) => files.get(p) ?? null,
+      writeFile: vi.fn(),
+    });
+    expect(changed).toBe(false);
+    expect(files.get(join("/h", ".qwen", "settings.json"))).toBe(explicit);
+  });
+
+  it("settings.json 不存在时静默返回 false；QWEN_HOME 优先", () => {
+    expect(ensureQwenFastStart({
+      env: { QWEN_HOME: "/q" },
+      readFile: () => null,
+      writeFile: vi.fn(),
+    })).toBe(false);
+    expect(qwenSettingsPath({ QWEN_HOME: "/q" }, "/h")).toBe(join("/q", "settings.json"));
+  });
+
+  it("破损 JSON 静默返回 false（不创建文件）", () => {
+    const writeFile = vi.fn();
+    expect(ensureQwenFastStart({
+      home: "/h",
+      readFile: () => "not json {",
+      writeFile,
+    })).toBe(false);
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+});

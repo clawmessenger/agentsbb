@@ -169,6 +169,136 @@ export interface EnsureCodexOutputStyleOpts {
 }
 
 /**
+ * codex 冷启动提速自愈（2026-11-05 现场定案）。
+ *
+ * 现象：codex 每轮冷启动 40 秒+，全耗在 `slack` / `google-calendar` 两个
+ * `@openai-curated` 远程 MCP 插件上 —— 它们要求 OAuth 登录（"Not logged in"），
+ * 认证失败后各重试 ~11 秒才放行。这两个插件对设备端轮次毫无用处，还会被
+ * codex 桌面端/opencodex 在配置重生成时**自动注回**（本机 11-05 就发生过：
+ * 手工删掉两段后当天又被写回），所以单纯删配置不持久。
+ *
+ * 做法：在 `$CODEX_HOME/config.toml` 里把这两个插件段的 `enabled` 改成
+ * `false`（保留段落，避免注入方发现段落缺失而重建）。幂等：
+ * 已是 false 或段落不存在都不动。用户自己登录过 slack（段落里有 token
+ * 类字段）时也不动 —— 那说明他在用，只是这台设备端不该替他关。
+ */
+export const CODEX_SLOW_PLUGINS: readonly string[] = [
+  "slack@openai-curated",
+  "google-calendar@openai-curated",
+];
+
+/** 把 config.toml 文本里指定插件段的 enabled 置 false。返回改写后的文本与是否变更。 */
+export function disableCodexPluginSections(raw: string, plugins: readonly string[]): { text: string; changed: boolean } {
+  let text = raw;
+  let changed = false;
+  for (const plugin of plugins) {
+    const header = `[plugins."${plugin}"]`;
+    let idx = text.indexOf(header);
+    while (idx >= 0) {
+      const next = text.indexOf("[", idx + header.length);
+      const segEnd = next > 0 ? next : text.length;
+      const seg = text.slice(idx, segEnd);
+      if (/^\s*enabled\s*=\s*true\s*$/m.test(seg)) {
+        const fixed = seg.replace(/^(\s*enabled\s*=\s*)true(\s*)$/m, "$1false$2");
+        text = text.slice(0, idx) + fixed + text.slice(segEnd);
+        changed = true;
+      }
+      idx = text.indexOf(header, idx + header.length);
+    }
+  }
+  return { text, changed };
+}
+
+/**
+ * 每个给定 agent 的轮次前调用：确保 codex 的慢启动插件已禁用。
+ * @returns true = 本次改写了 config.toml。
+ */
+export function ensureCodexFastStart(opts: EnsureCodexOutputStyleOpts = {}): boolean {
+  const env = opts.env ?? process.env;
+  const codexHome = env.CODEX_HOME?.trim()
+    || join(opts.home ?? homedir(), ".codex");
+  const path = join(codexHome, "config.toml");
+  const readFile = opts.readFile
+    ?? ((p: string): string | null => {
+      try {
+        return readFileSync(p, "utf8");
+      } catch {
+        return null;
+      }
+    });
+  const writeFile = opts.writeFile
+    ?? ((p: string, content: string): void => {
+      writeFileSync(p, content, "utf8");
+    });
+  try {
+    const raw = readFile(path);
+    if (raw === null) return false;
+    const { text, changed } = disableCodexPluginSections(raw, CODEX_SLOW_PLUGINS);
+    if (!changed) return false;
+    writeFile(path, text);
+    return true;
+  } catch {
+    // 自愈失败不影响本轮：慢一点总比答不出来好。
+    return false;
+  }
+}
+
+// --- qwen 轮次尾延迟自愈 ---------------------------------------------------
+//
+// 现象（2026-11-05 本机实测，qwen-code 0.25.3）：主回答 7 秒答完
+// （message_stop 事件已发），`result` 终局事件却要再等 15~45 秒 —— qwen 在
+// 每轮结束后串行跑一个 `managed-auto-memory-extractor` 子 agent（fork 出去
+// 再调一次 LLM 提炼「记忆」），它不结束 result 就不出来，CLI 的轮次自然
+// 被拖长。设备端每轮都是无人值守的短会话，这份「记忆」永远不会被复用，
+// 纯属白烧一次模型调用 + 等待。
+//
+// 设置键：`~/.qwen/settings.json` 的 `memory.enableManagedAutoMemory`
+// （qwen-code bundle 反查实证：`settings.memory?.enableManagedAutoMemory ?? true`
+// —— 默认开启）。CLI 侧只做「补默认」：用户**显式设过**这个键（无论真假）
+// 一律不动；settings.json 不存在/读不懂也不动。
+export function qwenSettingsPath(env: NodeJS.ProcessEnv = process.env, home?: string): string {
+  const qwenHome = env.QWEN_HOME?.trim();
+  if (qwenHome) return join(qwenHome, "settings.json");
+  return join(home ?? homedir(), ".qwen", "settings.json");
+}
+
+/** @returns true = 本次写了 settings.json。 */
+export function ensureQwenFastStart(opts: EnsureCodexOutputStyleOpts = {}): boolean {
+  const env = opts.env ?? process.env;
+  const path = qwenSettingsPath(env, opts.home);
+  const readFile = opts.readFile
+    ?? ((p: string): string | null => {
+      try {
+        return readFileSync(p, "utf8");
+      } catch {
+        return null;
+      }
+    });
+  const writeFile = opts.writeFile
+    ?? ((p: string, content: string): void => {
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, content, "utf8");
+    });
+  try {
+    const raw = readFile(path);
+    if (raw === null) return false;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+    const settings = parsed as Record<string, unknown>;
+    const memory = settings.memory;
+    if (typeof memory === "object" && memory !== null && !Array.isArray(memory)
+      && "enableManagedAutoMemory" in memory) {
+      return false; // 用户自己管这个键
+    }
+    settings.memory = { ...(memory as Record<string, unknown> ?? {}), enableManagedAutoMemory: false };
+    writeFile(path, JSON.stringify(settings, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 确保 `$CODEX_HOME/AGENTS.md` 含输出风格段。
  *
  * @returns true = 本次写了文件（新建或有更新）；false = 已是最新，或写入失败。

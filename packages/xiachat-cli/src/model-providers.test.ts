@@ -435,3 +435,38 @@ describe("readAgentConfig", () => {
     expect(readAgentConfig(undefined, {})).toBeNull();
   });
 });
+
+// --- small_model 对齐主模型（2026-11-05 现场） ------------------------------
+
+import { buildDeviceOpencodeConfig } from "./model-providers.js";
+
+describe("buildDeviceOpencodeConfig small_model 对齐", () => {
+  it("small_model 与主 model 不一致时对齐到主 model（防小模型欠费拖慢 title 生成）", () => {
+    const raw = JSON.stringify({
+      model: "quukk/glm-5.2",
+      small_model: "quukk/deepseek-v4-flash",
+      provider: { quukk: { models: {} } },
+      plugin: ["x"],
+      mcp: { y: {} },
+    });
+    const built = buildDeviceOpencodeConfig(raw, {});
+    expect(built).not.toBeNull();
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.small_model).toBe("quukk/glm-5.2");
+    expect(parsed.model).toBe("quukk/glm-5.2");
+    expect(built!.dropped).toContain("plugin");
+    expect(built!.dropped).toContain("mcp");
+    expect(built!.dropped.some((d) => d.startsWith("small_model:"))).toBe(true);
+  });
+
+  it("small_model 与主 model 一致 / 未配置时不动", () => {
+    const same = buildDeviceOpencodeConfig(
+      JSON.stringify({ model: "a/x", small_model: "a/x" }), {},
+    );
+    expect(JSON.parse(same!.text).small_model).toBe("a/x");
+    expect(same!.dropped.some((d) => d.startsWith("small_model:"))).toBe(false);
+
+    const absent = buildDeviceOpencodeConfig(JSON.stringify({ model: "a/x" }), {});
+    expect(JSON.parse(absent!.text).small_model).toBeUndefined();
+  });
+});
