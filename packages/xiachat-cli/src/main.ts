@@ -30,6 +30,7 @@ import {
   defaultDaemonPaths,
   findLiveSupervisor,
   formatDaemonStatus,
+  readSupervisorState,
   supervisorSpawnArgv,
   WATCHDOG_INTERVAL_MINUTES,
   WATCHDOG_TASK_NAME,
@@ -42,6 +43,7 @@ import {
   applyStagedUpdate,
   assetNameForPlatform,
   checkForUpdate,
+  compareVersions,
   healInstall,
   stageUpdate,
   stageUpdateFromMirrors,
@@ -102,10 +104,17 @@ export function isSupervisedChild(env: NodeJS.ProcessEnv = process.env): boolean
  * 杀掉自己。宁可让模型拿到一句明确的拒绝，也不要让用户对着转圈的气泡等。
  */
 export function supervisedSelfKillRejection(
-  action: "stop" | "restart",
+  action: "stop" | "restart" | "update",
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
   if (!isSupervisedChild(env)) return null;
+  if (action === "update") {
+    // update 与 stop/restart 不同：它可以只交换不重启，所以这里不是「拒绝」，
+    // 而是「把重启这一步交给设备下次启动」—— 新版仍然会到位，这一轮也还能回话。
+    return "\n`clawmessenger update` 在智能体进程里执行时不重启 supervisor（重启会把这一轮连同回复一起杀掉）。"
+      + "\n新版已换到磁盘上，设备下次启动 / 看门狗拉起时就跑新版；"
+      + "要立刻生效，请在设备本机的终端执行 `clawmessenger restart`。";
+  }
   return `\`clawmessenger ${action}\` 不能在智能体自己的进程里执行：它会停掉拉起本轮的 supervisor，`
     + "把这一轮连同回复一起杀掉（前端将一直停在「正在思考」）。\n"
     + "要停整台设备，请在设备本机的终端（不在智能体会话里）执行；只想让某个智能体上下线，"
@@ -213,8 +222,14 @@ export interface BuildProgramOpts {
   // (see SUPERVISOR_UPGRADE_QUIET_POLLS).
   upgradeQuietPolls?: number;
   // Injectable for tests; the fetch used to pull a release asset from the
-  // mirrors handed out by the server.
+  // mirrors handed out by the server (supervisor-driven upgrades).
   upgradeFetch?: UpgradeFetch;
+  /**
+   * Injectable for tests; the fetch the manual `update` command uses for both the
+   * release lookup and the asset download. 与上面的 upgradeFetch 分开：一个是
+   * supervisor 按服务端指令升级，一个是人工敲命令，测试要分别断言。
+   */
+  updateFetch?: FetchLike;
   // Injectable for tests; replaces the detached `__relaunch` helper spawn.
   relaunch?: (target: string, waitPid: number, passthroughArgs?: string[]) => void;
   // Injectable for tests; where the in-flight upgrade bookkeeping file lives.
@@ -1167,53 +1182,166 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       opts.stdout.write(formatDaemonStatus(scope ? scopeDaemonReport(report, scope) : report, daemonPaths));
     });
 
-  // 自更新：下载 + 校验到安装目录旁，真正换上去放在下一次启动。
-  // 运行中的 exe 在 Windows 上无法被覆盖（EBUSY），但可以被改名 —— 所以这里
-  // 只落一份 `<target>.new-<version>`，由 bin.ts 在下次启动时完成交换。
+  // 自更新：下载 + 校验 + 换上去 + 重启，一条命令干完。
+  //
+  // 为什么要拆「stage → apply → restart」三步而不是直接覆盖：运行中的 exe 在
+  // Windows 上无法被覆盖（EBUSY），只能改名。所以顺序必须是
+  //   1. stage：把新 exe 落到 `<target>.new-<version>`，校验 SHA256；
+  //   2. apply：target → `.old-<ts>`、staged → target（两步 rename；此刻磁盘上是
+  //      新版，本进程仍在跑已经映射的旧镜像）；
+  //   3. restart：停 supervisor 再起 —— 新起的进程读的就是新 exe。
+  // 少了第 3 步，用户看到的仍然是旧版本在干活（旧进程不会自己换镜像），
+  // 以前的 `update` 就停在这里，要求人工再敲一次 `restart`。
+  //
+  // `--no-restart` 保留旧语义：只暂存，由 bin.ts 在下次启动时交换。
   program
     .command("update")
-    .description("Fetch the latest release, verify its checksum, and stage it for the next start")
+    .description("Download the latest build, verify it, and restart the supervisor into it")
     .option("--check", "only report whether a newer version is available")
-    .option("--force", "stage the latest release even when it is not newer than this build")
-    .action(async (cmdOpts: { check?: boolean; force?: boolean }) => {
+    .option("--force", "install even when the release is not newer than this build")
+    .option("--no-restart", "download and stage only; take effect on the next start")
+    .action(async (cmdOpts: { check?: boolean; force?: boolean; restart?: boolean }) => {
       const current = program.version() ?? "0.0.0";
+      const platform = opts.platform ?? process.platform;
+      const arch = opts.arch ?? process.arch;
+      const fetchImpl = opts.updateFetch ?? (fetch as unknown as FetchLike);
+      const wantRestart = cmdOpts.restart !== false;
       // 暂存到**正在运行的自己**旁边，而不是 installPaths 猜出来的安装位 ——
       // 两者在 Linux 上经常不同（systemd 的 unit 指向 /usr/local/bin，installPaths
       // 指向 ~/.local/bin）。猜错的话，`update` 会兴高采烈地报「staged 1.3.x」，
       // 而每次启动去另一个目录找暂存、永远找不到，升级静默失效；下一次 update
       // 又会去改同一个错文件，问题自己不会暴露。
-      const target = upgradeTargetPath(
+      // `opts.upgradeTarget` 只给测试用（生产不注入），否则单测会去改真实安装位。
+      const target = opts.upgradeTarget ?? upgradeTargetPath(
         process.platform,
         process.argv[1],
         process.execPath,
         os.homedir(),
       );
-      let plan;
+
+      /**
+       * 服务端下发的升级指令（control 轮询里的 `upgrade`）。
+       *
+       * 为什么需要这条兜底：正常的升级通道本来就是它 —— mirrors 里除了 GitHub
+       * 直连，还有一条服务端自己的相对路径（`/api/agent/upgrade/download?...`）。
+       * 国内设备连不上 GitHub 时，Release 通道必然失败，而服务端镜像一直是通的。
+       * 没注册 / 服务端还没排期升级时拿不到 intent，返回 null 继续走 Release。
+       */
+      const serverIntent = async (): Promise<{ intent: DeviceUpgradeIntent; serverUrl: string } | null> => {
+        const creds = opts.keystore.load();
+        if (!creds?.credentialId || !creds.deviceSecret) return null;
+        try {
+          const api = opts.apiFactory(creds.serverUrl);
+          const snap = await api.fetchDeviceControl(creds.nodeId, creds.credentialId, creds.deviceSecret, {
+            version: current,
+            platform,
+          });
+          return snap.upgrade ? { intent: snap.upgrade, serverUrl: creds.serverUrl } : null;
+        } catch {
+          return null;
+        }
+      };
+
+      let staged: { version: string; asset: string; bytes: number };
+      let planError: unknown = null;
       try {
-        plan = await checkForUpdate(current, process.platform, process.arch);
+        const plan = await checkForUpdate(current, platform, arch, fetchImpl);
+        opts.stdout.write(`current: ${plan.currentVersion}\nlatest:  ${plan.latestVersion}\n`);
+        if (plan.release.source === "cdn") {
+          opts.stdout.write(
+            "note: GitHub's API was unavailable (rate limit?), so the version came from the release CDN.\n" +
+            "      set CLAWMESSENGER_UPDATE_TOKEN to raise the API quota.\n",
+          );
+        }
+        if (!plan.updateAvailable && !cmdOpts.force) {
+          opts.stdout.write("already up to date\n");
+          return;
+        }
+        if (cmdOpts.check) {
+          opts.stdout.write("update available\n");
+          return;
+        }
+        staged = await stageUpdate(plan.release, target, platform, arch, fetchImpl);
       } catch (err) {
-        throw new Error(`update check failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      opts.stdout.write(`current: ${plan.currentVersion}\nlatest:  ${plan.latestVersion}\n`);
-      if (plan.release.source === "cdn") {
+        planError = err;
+        const remote = await serverIntent();
+        if (!remote) {
+          throw new Error(
+            `update check failed: ${err instanceof Error ? err.message : String(err)}\n` +
+            "hint: no upgrade was scheduled for this device on the server either — " +
+            "ask the admin page to schedule one, or set CLAWMESSENGER_UPDATE_API / _WEB to a reachable mirror.",
+          );
+        }
+        const { intent } = remote;
+        const newer = compareVersions(intent.targetVersion, current) > 0;
         opts.stdout.write(
-          "note: GitHub's API was unavailable (rate limit?), so the version came from the release CDN.\n" +
-          "      set CLAWMESSENGER_UPDATE_TOKEN to raise the API quota.\n",
+          `release lookup failed (${err instanceof Error ? err.message : String(err)})\n` +
+          `using the server's upgrade intent: ${intent.targetVersion}\n`,
+        );
+        if (!newer && !cmdOpts.force) {
+          opts.stdout.write("already up to date\n");
+          return;
+        }
+        if (cmdOpts.check) {
+          opts.stdout.write("update available\n");
+          return;
+        }
+        staged = await stageUpdateFromMirrors(
+          {
+            version: intent.targetVersion,
+            assetName: intent.assetName,
+            sha256: intent.sha256,
+            mirrors: intent.mirrors ?? [],
+          },
+          target,
+          remote.serverUrl,
+          fetchImpl,
         );
       }
-      if (!plan.updateAvailable && !cmdOpts.force) {
-        opts.stdout.write("already up to date\n");
+      opts.stdout.write(`staged ${staged.version} (${staged.asset}, ${staged.bytes} bytes)\n`);
+      if (planError) {
+        opts.stdout.write("note: the version above came from the server, not from the release channel.\n");
+      }
+
+      if (!wantRestart) {
+        opts.stdout.write("it takes effect on the next start — run `clawmessenger restart`\n");
         return;
       }
-      if (cmdOpts.check) {
-        opts.stdout.write("update available\n");
+
+      // 在智能体自己的进程里执行 = 重启会把这轮连同回复一起杀掉（同 stop/restart）。
+      // 这时**只交换、不重启**：磁盘上已经是新版，设备下一次启动（或看门狗拉起）
+      // 就跑新版，这一轮回复还能发出去。
+      const selfKill = supervisedSelfKillRejection("update");
+      const applied = applyStagedUpdate(target, process.platform);
+      if (!applied.applied) {
+        // 交换失败有可能把 target 弄没了（第一步 rename 成功、第二步失败且回滚
+        // 也失败）。此刻还能自愈，等到下次启动就晚了 —— 登录自启的 VBS 会找不到
+        // exe 而静默失败，设备从此离线。
+        const healed = healInstall(target);
+        throw new Error(
+          `could not swap in ${staged.version}: ${applied.reason ?? "unknown reason"}` +
+          (healed.healed ? `\nrestored ${target} from ${healed.staged ?? healed.from ?? "a backup"}` : ""),
+        );
+      }
+      opts.stdout.write(`applied ${staged.version} to ${target}\n`);
+      if (selfKill) {
+        opts.stdout.write(`${selfKill}\n`);
         return;
       }
-      const staged = await stageUpdate(plan.release, target, process.platform, process.arch);
-      opts.stdout.write(
-        `staged ${staged.version} (${staged.asset}, ${staged.bytes} bytes)\n` +
-        `it takes effect on the next start — run \`clawmessenger restart\`\n`,
-      );
+      const running = findLiveSupervisor(daemonPaths);
+      if (!running) {
+        opts.stdout.write("no supervisor is running — the new build starts with the next start\n");
+        return;
+      }
+      // 模型/工作目录是启动参数，重启不带过去就会静默回落默认值（用户只会觉得
+      // 「回答变了」）。状态文件里两个都有，照抄。
+      const state = running.state ?? readSupervisorState(daemonPaths);
+      opts.stdout.write(`restarting supervisor PID ${running.pid} into ${staged.version}...\n`);
+      await daemon.restart({
+        ...(state?.model ? { model: state.model } : {}),
+        ...(state?.cwd ? { workdir: state.cwd } : {}),
+      });
+      opts.stdout.write(`updated to ${staged.version} and restarted\n`);
     });
 
   // 隐藏命令：升级后把 supervisor 重新拉起来的接力进程（不出现在 help 里）。

@@ -1,15 +1,17 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowDuplicateSupervisor, buildProgram, commanderExit, OPS_SCOPE_ENV, scopeDaemonReport, SUPERVISED_ENV, supervisedSelfKillRejection, waitForAliveFor, wholeMachineActionRejection } from "./main.js";
 import { Keystore } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
-import { defaultDaemonPaths, type Daemon } from "./daemon.js";
+import { defaultDaemonPaths, type Daemon, type DaemonPaths } from "./daemon.js";
+import type { FetchLike } from "./self-update.js";
 
 const dirs: string[] = [];
 function tempKeystore(): Keystore {
@@ -976,5 +978,251 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
 
     await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_manual"]);
     expect(keystore.load()?.nodeId).toBe("node_1");
+  });
+});
+
+// ---------------------------------------------------------------- update
+
+/**
+ * `update` 一条命令干完「下载 → 校验 → 换上去 → 重启」。
+ *
+ * 这里的桩只做两件事：给一份「GitHub 长这样」的 Release，和一个记名字的假
+ * daemon。真正要钉死的是**顺序与边界**：
+ *   · 换上去之后必须 restart，否则用户看到的还是旧版本在干活（旧 `update` 就
+ *     停在这一步，要求人工再敲 `restart`）；
+ *   · `--no-restart` / 智能体进程里只交换不重启；
+ *   · 模型与工作目录要跟着重启带过去，否则设备会静默回落默认模型。
+ */
+describe("clawmessenger update", () => {
+  const ASSET = "clawmessenger-linux-x64";
+
+  /** Buffer → 独立的 ArrayBuffer（`buf.buffer` 会带出 SharedArrayBuffer 的联合类型）。 */
+  const toArrayBuffer = (b: Buffer): ArrayBuffer => {
+    const ab = new ArrayBuffer(b.length);
+    new Uint8Array(ab).set(b);
+    return ab;
+  };
+
+  function releaseFetch(payload: Buffer, version = "1.3.23", opts: { failLookup?: boolean } = {}) {
+    const sha = createHash("sha256").update(payload).digest("hex");
+    const sums = `${sha}  ${ASSET}\n`;
+    const urls: string[] = [];
+    const fetchImpl: FetchLike = async (url) => {
+      urls.push(url);
+      if (opts.failLookup) throw new Error("getaddrinfo ENOTFOUND api.github.com");
+      if (url.endsWith("/releases/latest")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            tag_name: `clawmessenger-v${version}`,
+            assets: [
+              { name: ASSET, browser_download_url: `https://cdn.test/${ASSET}`, size: payload.length },
+              { name: "SHA256SUMS", browser_download_url: "https://cdn.test/SHA256SUMS", size: sums.length },
+            ],
+          }),
+          arrayBuffer: async () => new ArrayBuffer(0),
+        };
+      }
+      if (url.endsWith("SHA256SUMS")) {
+        const bytes = Buffer.from(sums);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          arrayBuffer: async () => toArrayBuffer(bytes),
+          text: async () => sums,
+        };
+      }
+      if (url.endsWith(ASSET)) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          arrayBuffer: async () => toArrayBuffer(payload),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0) };
+    };
+    return { fetchImpl, urls, sha, sums };
+  }
+
+  /** 临时安装目录：target 是一份「旧 exe」，旁边放状态/pid 文件。 */
+  function installFixture(opts: { running: boolean; model?: string; cwd?: string }) {
+    const root = mkdtempSync(join(tmpdir(), "clawmessenger-update-"));
+    dirs.push(root);
+    const target = join(root, "clawmessenger");
+    writeFileSync(target, "OLD-EXE-BYTES");
+    const paths = defaultDaemonPaths(join(root, "state"));
+    mkdirSync(paths.stateDir, { recursive: true });
+    if (opts.running) {
+      writeFileSync(paths.pidFile, `${process.pid}\n`);
+      writeFileSync(
+        paths.stateFile,
+        JSON.stringify({
+          pid: process.pid,
+          startedAt: Date.now(),
+          execPath: target,
+          cwd: opts.cwd ?? root,
+          ...(opts.model ? { model: opts.model } : {}),
+          agents: ["claude"],
+        }),
+      );
+    }
+    return { root, target, paths };
+  }
+
+  function programFor(args: {
+    target: string;
+    paths: DaemonPaths;
+    fetchImpl: FetchLike;
+    daemon: Daemon;
+    keystore?: Keystore;
+    apiFactory?: (serverUrl: string) => XiachatApi;
+    lines: string[];
+  }) {
+    return buildProgram({
+      keystore: args.keystore ?? tempKeystore(),
+      apiFactory: args.apiFactory ?? (() => { throw new Error("api should not be called"); }),
+      stdout: { write: (s: string) => { args.lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
+      daemon: args.daemon,
+      daemonPaths: args.paths,
+      upgradeTarget: args.target,
+      updateFetch: args.fetchImpl,
+      platform: "linux",
+      arch: "x64",
+      version: "1.3.22",
+    });
+  }
+
+  it("applies the new build and restarts the supervisor into it", async () => {
+    const payload = Buffer.from("NEW-EXE-BYTES-1.3.23");
+    const { fetchImpl } = releaseFetch(payload);
+    const { target, paths } = installFixture({ running: true, model: "claude-opus", cwd: "/work/dir" });
+    const fake = fakeDaemon();
+    const lines: string[] = [];
+
+    const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
+    await program.parseAsync(["node", "clawmessenger", "update"]);
+
+    const out = lines.join("");
+    expect(out).toContain("current: 1.3.22");
+    expect(out).toContain("latest:  1.3.23");
+    expect(out).toContain(`applied 1.3.23 to ${target}`);
+    // 关键：重启必须发生，且模型 / 工作目录要原样带过去。
+    expect(fake.calls).toContainEqual(`restart:${JSON.stringify({ model: "claude-opus", workdir: "/work/dir" })}`);
+    expect(out).toContain("updated to 1.3.23 and restarted");
+    // 磁盘上真的是新 exe，旧的那份被改名留作回滚。
+    expect(readFileSync(target, "utf8")).toBe(payload.toString());
+    const backups = readdirSync(dirname(target)).filter((f) => f.startsWith("clawmessenger.old-"));
+    expect(backups.length).toBe(1);
+  });
+
+  it("--no-restart only stages and leaves the running build alone", async () => {
+    const payload = Buffer.from("NEW-EXE-BYTES-1.3.23");
+    const { fetchImpl } = releaseFetch(payload);
+    const { target, paths } = installFixture({ running: true });
+    const fake = fakeDaemon();
+    const lines: string[] = [];
+
+    const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
+    await program.parseAsync(["node", "clawmessenger", "update", "--no-restart"]);
+
+    expect(fake.calls.filter((c) => c.startsWith("restart"))).toHaveLength(0);
+    expect(readFileSync(target, "utf8")).toBe("OLD-EXE-BYTES");
+    expect(existsSync(`${target}.new-1.3.23`)).toBe(true);
+    expect(lines.join("")).toContain("run `clawmessenger restart`");
+  });
+
+  it("says already up to date and touches nothing", async () => {
+    const { fetchImpl } = releaseFetch(Buffer.from("same"), "1.3.22");
+    const { target, paths } = installFixture({ running: true });
+    const fake = fakeDaemon();
+    const lines: string[] = [];
+
+    const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
+    await program.parseAsync(["node", "clawmessenger", "update"]);
+
+    expect(lines.join("")).toContain("already up to date");
+    expect(fake.calls).toHaveLength(0);
+    expect(readFileSync(target, "utf8")).toBe("OLD-EXE-BYTES");
+  });
+
+  it("installs but does not restart when no supervisor is running", async () => {
+    const payload = Buffer.from("NEW-EXE-BYTES-1.3.23");
+    const { fetchImpl } = releaseFetch(payload);
+    const { target, paths } = installFixture({ running: false });
+    const fake = fakeDaemon();
+    const lines: string[] = [];
+
+    const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
+    await program.parseAsync(["node", "clawmessenger", "update"]);
+
+    expect(fake.calls).toHaveLength(0);
+    expect(readFileSync(target, "utf8")).toBe(payload.toString());
+    expect(lines.join("")).toContain("no supervisor is running");
+  });
+
+  it("in a supervised agent process it swaps the exe but never restarts", async () => {
+    const payload = Buffer.from("NEW-EXE-BYTES-1.3.23");
+    const { fetchImpl } = releaseFetch(payload);
+    const { target, paths } = installFixture({ running: true });
+    const fake = fakeDaemon();
+    const lines: string[] = [];
+    vi.stubEnv(SUPERVISED_ENV, "1");
+    try {
+      const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
+      await program.parseAsync(["node", "clawmessenger", "update"]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(fake.calls).toHaveLength(0);
+    expect(readFileSync(target, "utf8")).toBe(payload.toString());
+    expect(lines.join("")).toContain("不重启 supervisor");
+  });
+
+  it("falls back to the server's upgrade intent when the release channel is unreachable", async () => {
+    const payload = Buffer.from("NEW-EXE-BYTES-FROM-MIRROR");
+    const sha = createHash("sha256").update(payload).digest("hex");
+    const { fetchImpl, sums } = releaseFetch(payload, "1.3.23", { failLookup: true });
+    // 只让镜像地址可用：Release 通道整体不可达。
+    const mirrorFetch: FetchLike = async (url, init) => {
+      if (url.endsWith("/api/agent/upgrade/download") || url.includes("mirror.test")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          arrayBuffer: async () => toArrayBuffer(payload),
+        };
+      }
+      return fetchImpl(url, init);
+    };
+    const keystore = tempKeystore();
+    keystore.save({ nodeId: "node_1", token: "t", serverUrl: "http://srv", credentialId: "dc_1", deviceSecret: "sec" });
+    const apiFactory = () => ({
+      fetchDeviceControl: async () => ({
+        agents: [],
+        upgrade: {
+          generation: 3,
+          targetVersion: "1.3.23",
+          assetName: ASSET,
+          sha256: sha,
+          force: false,
+          mirrors: ["https://mirror.test/1.3.23/clawmessenger-linux-x64"],
+        },
+      }),
+    }) as unknown as XiachatApi;
+    const { target, paths } = installFixture({ running: true });
+    const fake = fakeDaemon();
+    const lines: string[] = [];
+
+    const program = programFor({ target, paths, fetchImpl: mirrorFetch, daemon: fake.daemon, lines, keystore, apiFactory });
+    await program.parseAsync(["node", "clawmessenger", "update"]);
+
+    const out = lines.join("");
+    expect(out).toContain("using the server's upgrade intent: 1.3.23");
+    expect(readFileSync(target, "utf8")).toBe(payload.toString());
+    expect(fake.calls.filter((c) => c.startsWith("restart"))).toHaveLength(1);
+    expect(sums).toContain(sha);
   });
 });
