@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1225,6 +1226,15 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 			resp["exe_platform"] = upgrade.ReportedPlatform
 			resp["hostname"] = upgrade.ReportedHostname
 			resp["install_dir"] = upgrade.InstallDir
+			// 服务端观测到的设备来源地址（不是设备自述）。三端详情页的「公网 IP」
+			// 一行同源同值；remote_ip_public=false 时前端打「内网」标记。
+			if upgrade.RemoteIP != "" {
+				resp["remote_ip"] = upgrade.RemoteIP
+				resp["remote_ip_public"] = clawIPIsPublic(net.ParseIP(upgrade.RemoteIP))
+			}
+			if upgrade.RemoteIPAt.Valid {
+				resp["remote_ip_at"] = upgrade.RemoteIPAt.Time.UTC().Format(time.RFC3339)
+			}
 			if upgrade.ReportedAt.Valid {
 				resp["reported_at"] = upgrade.ReportedAt.Time.UTC().Format(time.RFC3339)
 			}

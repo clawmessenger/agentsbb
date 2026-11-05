@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -70,7 +71,14 @@ type clawNodeUpgrade struct {
 	// InstallDir 是设备 CLI 可执行文件所在目录（path.dirname(process.execPath)）。
 	// 与 hostname 一样是设备上报的环境事实：运维要指导用户「去哪个目录找日志/换
 	// exe」，服务端猜不出来。空串 = 尚未上报（老 CLI 不带 installDir）。
-	InstallDir         string
+	InstallDir string
+	// RemoteIP 是**服务端观测**到的设备来源地址（不是设备自述）。supervisor 每
+	// 10 秒来轮询一次，那次连接的来源就是这台机器出口到平台的 IP —— 设备在 NAT
+	// 后面时通常就是它的公网 IP。空串 = 还没轮询过。
+	RemoteIP string
+	// RemoteIPAt 是最近一次观测到该地址的时间。与 ReportedAt 分开：后者只在设备
+	// 带版本/主机名上报时刷新，而 IP 每轮轮询都能确认，用它判断 IP 是否过期。
+	RemoteIPAt         pgtype.Timestamptz
 	ReportedAt         pgtype.Timestamptz
 	ReportedGeneration int64
 	TargetVersion      string
@@ -150,11 +158,105 @@ func (h *Handler) clawDeviceRecordUpgradeState(
 	return err
 }
 
+// clawDeviceRecordRemoteIP 记录服务端本次观测到的设备来源地址。
+//
+// 为什么与版本上报分开写：版本/平台/主机名都是**设备自述**，老 CLI 根本不带；
+// 而来源地址是服务端自己看到的，任何版本的设备（现在线上还混跑 1.3.16~1.3.21）
+// 只要来轮询一次就有值 —— 不必等全量升版，10 秒内所有在线设备就都有了。
+//
+// 为什么不判重（IP 没变也写）：每 10 秒一次单行 UPDATE，代价远小于「多一次
+// SELECT 才能知道要不要写」；换来 remote_ip_at 真的是「最近一次确认这个地址」
+// 而不是「这个地址第一次出现」。注意**不碰 updated_at** —— 那一列是管理端
+// 排序/判活的口径，IP 刷新不该让它动。
+//
+// 失败只记日志（调用方）：IP 是排障信息，不该因为写库失败把启停轮询打红。
+func (h *Handler) clawDeviceRecordRemoteIP(
+	ctx context.Context,
+	machineNode db.RongcloudNode,
+	remoteIP string,
+) error {
+	if h.DB == nil || strings.TrimSpace(remoteIP) == "" {
+		return nil
+	}
+	_, err := h.DB.Exec(ctx, `
+		INSERT INTO rongcloud_node_upgrade
+			(machine_id, node_id, workspace_id, remote_ip, remote_ip_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (machine_id) DO UPDATE
+		   SET remote_ip = EXCLUDED.remote_ip,
+		       remote_ip_at = now()`,
+		machineIDForDevice(machineNode), machineNode.ID, machineNode.WorkspaceID, remoteIP)
+	return err
+}
+
+// clawDeviceObservedIP 解析「服务端看到的设备来源地址」。
+//
+// 直连且来源是公网地址时，X-Forwarded-For / X-Real-IP 一概不采信：那种拓扑下
+// 设备自己就能塞这两个头，信了等于让设备自报 IP，而这一屏要的恰恰是「服务端眼里
+// 你是谁」。来源是回环/内网（生产就是 nginx 在同一台机上转到 127.0.0.1）时才取
+// 转发头 —— 那两行头由反代覆写，设备塞的值会被冲掉。
+//
+// 解析不出来返回空串：调用方据此跳过写入，不会把空值刷进库里。
+func clawDeviceObservedIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	remote := net.ParseIP(strings.TrimSpace(host))
+	if remote != nil && clawIPIsPublic(remote) {
+		return remote.String()
+	}
+	if ip := clawForwardedIP(r.Header.Get("X-Real-IP")); ip != nil {
+		return ip.String()
+	}
+	if ip := clawForwardedIP(r.Header.Get("X-Forwarded-For")); ip != nil {
+		return ip.String()
+	}
+	if remote != nil {
+		return remote.String()
+	}
+	return ""
+}
+
+// clawForwardedIP 取一条转发头里的第一个合法地址。X-Real-IP 是单值；
+// X-Forwarded-For 是「客户端, 代理1, 代理2」的链，最左边那跳才是原始客户端。
+func clawForwardedIP(raw string) net.IP {
+	for _, part := range strings.Split(raw, ",") {
+		if ip := net.ParseIP(strings.TrimSpace(part)); ip != nil {
+			return ip
+		}
+	}
+	return nil
+}
+
+// clawIPIsPublic 判断地址是否「公网可路由」。私网、CGNAT、回环、链路本地、组播、
+// 未指定地址都不算 —— 详情页据此打「内网」标记，而不是把 10.1.1.225 当公网 IP
+// 展示（设备与服务端同处内网时，服务端看到的就是这个）。
+func clawIPIsPublic(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	// 100.64.0.0/10 是运营商级 NAT（CGNAT）：IsPrivate 不管这一段，但它公网不可
+	// 路由，当成公网 IP 展示会把人引到错误的排查方向。
+	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return false
+	}
+	return true
+}
+
 // clawNodeUpgradeColumns 是读升级行的唯一列清单：三处查询（单台/批量/全量）
 // 必须逐字一致，否则 scanClawNodeUpgrade 会在某一处静默错位。
 const clawNodeUpgradeColumns = `
 	machine_id, node_id, workspace_id,
 	reported_version, reported_platform, reported_hostname, install_dir,
+	remote_ip, remote_ip_at,
 	reported_at, reported_generation,
 	target_version, desired_generation, status, error_code, error_detail,
 	force, batch_id, wave, requested_by, requested_at, updated_at`
@@ -180,6 +282,7 @@ func scanClawNodeUpgrade(row pgx.Row) (clawNodeUpgrade, error) {
 	var up clawNodeUpgrade
 	err := row.Scan(&up.MachineID, &up.NodeID, &up.WorkspaceID,
 		&up.ReportedVersion, &up.ReportedPlatform, &up.ReportedHostname, &up.InstallDir,
+		&up.RemoteIP, &up.RemoteIPAt,
 		&up.ReportedAt,
 		&up.ReportedGeneration,
 		&up.TargetVersion, &up.DesiredGeneration, &up.Status, &up.ErrorCode, &up.ErrorDetail,
@@ -471,6 +574,11 @@ func (h *Handler) ClawDeviceUpgradeReport(w http.ResponseWriter, r *http.Request
 		return
 	}
 	machineID := machineIDForDevice(machineNode)
+	// 升级回传也是一次设备直连（往往发生在两轮轮询之间），顺手刷新来源 IP：
+	// 设备换网/重拨号时，这条路径比等下一轮 10 秒轮询更快反映新地址。
+	if err := h.clawDeviceRecordRemoteIP(ctx, machineNode, clawDeviceObservedIP(r)); err != nil {
+		slog.Warn("claw: upgrade report remote ip record failed", "machine", machineID, "error", err)
+	}
 	if req.ReportedVersion != "" || req.ReportedPlatform != "" || req.ReportedHostname != "" || req.InstallDir != "" {
 		if err := h.clawDeviceRecordUpgradeState(ctx, machineNode, req.ReportedVersion, req.ReportedPlatform, req.ReportedHostname, req.InstallDir, req.Generation); err != nil {
 			slog.Warn("claw: upgrade version report failed", "machine", machineID, "error", err)

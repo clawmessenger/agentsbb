@@ -136,6 +136,12 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 					"machine", machineIDForDevice(machineNode), "error", err)
 			}
 		}
+		// 来源 IP 与版本上报分开：这条**不依赖设备带任何字段**，老 CLI 也照样有值
+		// （服务端看到的就是这台机器出口）。同样是失败不影响启停。
+		if err := h.clawDeviceRecordRemoteIP(r.Context(), machineNode, clawDeviceObservedIP(r)); err != nil {
+			slog.Warn("claw: device remote ip record failed",
+				"machine", machineIDForDevice(machineNode), "error", err)
+		}
 		intent, err := h.clawDeviceUpgradeIntent(r.Context(), machineNode, version)
 		if err != nil {
 			slog.Warn("claw: device upgrade intent failed",

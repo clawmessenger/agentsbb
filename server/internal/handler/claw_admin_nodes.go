@@ -18,6 +18,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -287,6 +288,17 @@ type clawAdminNodeRow struct {
 	// 供详情页判断数据新鲜度。与 UpgradeUpdatedAt 的分工：后者是整行 updated_at
 	//（含管理端下发指令），前者才回答「设备数据是什么时候说的」。
 	ReportedAt string `json:"reported_at,omitempty"`
+	// RemoteIP 是**服务端观测**到的设备来源地址（不是设备自述）：supervisor 每
+	// 10 秒来轮询一次，取的正是那次连接的来源。设备在 NAT 后面时，它通常就是这
+	// 台机器的公网出口 IP —— 防火墙/白名单要放行的那个数。空串 = 还没轮询过。
+	RemoteIP string `json:"remote_ip,omitempty"`
+	// RemoteIPPublic 标记 RemoteIP 是不是公网可路由的地址。false 时页面上打
+	// 「内网」标记：设备与服务端同处内网，服务端看到的就是 10.x/192.168.x，
+	// 不能当公网 IP 展示（会把人引向错误的排查方向）。
+	RemoteIPPublic bool `json:"remote_ip_public"`
+	// RemoteIPAt 是最近一次观测到该地址的时间（每轮轮询刷新）。与 reported_at
+	// 分开：后者只在设备带版本/主机名上报时才刷新。
+	RemoteIPAt string `json:"remote_ip_at,omitempty"`
 	// UpgradeStatus/Target/Error/UpdatedAt 来自 rongcloud_node_upgrade，
 	// 与版本同表读取 —— 一次查询同时拿到「现在什么版本」和「升到哪一步了」。
 	UpgradeStatus    string `json:"upgrade_status,omitempty"`
@@ -369,6 +381,13 @@ func (h *Handler) clawAdminAttachUpgrade(row clawAdminNodeRow, rec clawAdminNode
 	row.ExePlatform = upgrade.ReportedPlatform
 	row.Hostname = upgrade.ReportedHostname
 	row.InstallDir = upgrade.InstallDir
+	row.RemoteIP = upgrade.RemoteIP
+	if upgrade.RemoteIP != "" {
+		row.RemoteIPPublic = clawIPIsPublic(net.ParseIP(upgrade.RemoteIP))
+	}
+	if upgrade.RemoteIPAt.Valid {
+		row.RemoteIPAt = upgrade.RemoteIPAt.Time.UTC().Format(time.RFC3339)
+	}
 	if upgrade.ReportedAt.Valid {
 		row.ReportedAt = upgrade.ReportedAt.Time.UTC().Format(time.RFC3339)
 	}
