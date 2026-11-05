@@ -278,6 +278,10 @@ function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: s
     restart: async (o) => { calls.push(`restart:${JSON.stringify(o ?? {})}`); },
     status: () => ({ platform: "linux", running: false, stale: false, agents: [], logs: [], serviceName: "clawmessenger" }),
     logs: (o) => { calls.push(`logs:${o?.lines ?? 40}`); },
+    // 看门狗：计划任务每 5 分钟调一次，绝大多数时候返回 false（什么都没做）。
+    watchdog: async (o) => { calls.push(`watchdog:${JSON.stringify(o ?? {})}`); return true; },
+    // 存量设备升级时自动补看门狗：默认「什么都不用做」（非 Windows 的常态）。
+    ensureWatchdog: async () => { calls.push("ensure-watchdog"); return { created: false, reason: "not-windows" }; },
     installService: async (o) => { calls.push(`install-service:${JSON.stringify(o ?? {})}`); },
     uninstall: async () => { calls.push("uninstall"); },
     // 登录自启脚本的模板刷新：这里不需要模拟文件系统，记一笔即可。
@@ -387,6 +391,18 @@ describe("clawmessenger background commands", () => {
     expect(calls).toEqual(["install-service:{}", "uninstall"]);
   });
 
+  it("watchdog is a top-level command: it is what the Windows scheduled task invokes", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await program.parseAsync(["node", "clawmessenger", "watchdog"]);
+    expect(calls).toEqual(["watchdog:{}"]);
+  });
+
   it("the `daemon` namespace dispatches every action", async () => {
     const { daemon, calls } = fakeDaemon();
     const lines: string[] = [];
@@ -397,11 +413,11 @@ describe("clawmessenger background commands", () => {
       daemon,
       daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
     });
-    for (const action of ["start", "stop", "restart", "logs", "install-service", "uninstall"]) {
+    for (const action of ["start", "stop", "restart", "logs", "watchdog", "install-service", "uninstall"]) {
       await program.parseAsync(["node", "clawmessenger", "daemon", action]);
     }
     await program.parseAsync(["node", "clawmessenger", "daemon", "status"]);
-    expect(calls).toEqual(["start:{}", "stop", "restart:{}", "logs:40", "install-service:{}", "uninstall"]);
+    expect(calls).toEqual(["start:{}", "stop", "restart:{}", "logs:40", "watchdog:{}", "install-service:{}", "uninstall"]);
     expect(lines.join("")).toContain("not running in the background");
   });
 

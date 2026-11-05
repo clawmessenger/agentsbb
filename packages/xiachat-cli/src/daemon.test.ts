@@ -812,3 +812,225 @@ describe("logon script self-heal backfill", () => {
     expect(result).toMatchObject({ updated: false, reason: "not-windows" });
   });
 });
+
+// Windows 崩溃自愈（2026-11-05）。
+//
+// 现场：codex-2 离线后一直没回来。根因不在「自启没装」——VBS 在「启动」文件夹里躺着，
+// 只是它**只在登录时跑一次**：进程崩溃/被任务管理器结束后，没有任何东西会把它拉回来。
+// Linux 那边 systemd 的 Restart=always 早就兜住了，Windows 没有等价物，只能拿计划任务补。
+describe("Windows 看门狗", () => {
+  const winHarness = (extra: Partial<DaemonOverrides> = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-watchdog-"));
+    dirs.push(dir);
+    const vbs = join(dir, "Startup", "clawmessenger.vbs");
+    const cmd = join(dir, "watchdog.cmd");
+    const h = harness({
+      platform: "win32",
+      env: { APPDATA: dir, PATH: "C://bin" },
+      selfArgv: () => ({ exec: "C://Program Files//clawmessenger//clawmessenger.exe", args: [] }),
+      autostartPaths: { startupVbs: vbs, watchdogCmd: cmd },
+      ...extra,
+    });
+    return { h, dir, vbs, cmd };
+  };
+
+  it("install-service 除了登录自启，还注册每 5 分钟一次的看门狗任务", async () => {
+    const { h, vbs, cmd } = winHarness();
+
+    await h.daemon.installService();
+
+    expect(existsSync(vbs)).toBe(true);
+    expect(existsSync(cmd)).toBe(true);
+
+    const create = h.commands.find((c) => c.file === "schtasks" && c.args.includes("/Create"));
+    expect(create).toBeDefined();
+    const args = create!.args;
+    expect(args).toContain("/TN");
+    expect(args[args.indexOf("/TN") + 1]).toBe("clawmessenger-watchdog");
+    expect(args[args.indexOf("/SC") + 1]).toBe("MINUTE");
+    expect(args[args.indexOf("/MO") + 1]).toBe("5");
+    // /TR 指向 .cmd（含引号包裹，路径可能带空格），而不是直接拼 exe 命令行：
+    // schtasks 对 /TR 里的引号解析各版本不一致，套一层 .cmd 才稳。
+    const target = args[args.indexOf("/TR") + 1];
+    expect(target).toBe(`"${cmd}"`);
+
+    // 不传 /RU：默认当前用户、登录后运行，因此不需要管理员。
+    expect(args).not.toContain("/RU");
+
+    expect(h.lines.join("")).toContain("installed watchdog task");
+    expect(h.lines.join("")).toContain("every 5 min");
+  });
+
+  it("看门狗脚本是薄壳：调 `clawmessenger watchdog`，并把输出重定向进日志", async () => {
+    const { h, cmd } = winHarness();
+
+    await h.daemon.installService();
+
+    const body = readFileSync(cmd, "utf8");
+    // 路径带空格时必须整体加引号，否则 cmd 会把 C:/Program 当成命令。
+    expect(body).toContain('"C://Program Files//clawmessenger//clawmessenger.exe" watchdog');
+    expect(body).toContain("watchdog.log");
+    expect(body.startsWith("@echo off")).toBe(true);
+  });
+
+  it("计划任务注册失败时：不 fail-closed，但必须说清「崩溃后不会自己回来」", async () => {
+    const { h, vbs } = winHarness({
+      runCommand: (file, args) => {
+        h.commands.push({ file, args });
+        if (file === "schtasks") return { status: 1, stdout: "", stderr: "Access is denied." };
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    await h.daemon.installService();
+
+    // 登录自启已经装好了，不能因为看门狗失败就把它回滚掉。
+    expect(existsSync(vbs)).toBe(true);
+    const errText = h.errors.join("");
+    expect(errText).toContain("could not register the watchdog task");
+    expect(errText).toContain("will NOT come back on its own");
+    // 给一条能复制走的手动命令，而不是让用户自己猜参数。
+    expect(errText).toContain("schtasks /Create");
+  });
+
+  it("watchdog：supervisor 活着时什么都不做，也不写日志噪声", async () => {
+    const h = harness();
+    state(h.paths, 4242);
+    h.alive.add(4242);
+
+    const started = await h.daemon.watchdog();
+
+    expect(started).toBe(false);
+    expect(h.spawns).toHaveLength(0);
+    // 5 分钟一次的调度，一天 288 次；每次都写一行就是纯噪声，真出事时翻不到记录。
+    expect(h.lines.join("")).toBe("");
+  });
+
+  it("watchdog：supervisor 不在了就拉起来，并在日志里留下时间戳", async () => {
+    const h = harness({}, { spawnPid: 777 });
+    h.alive.add(777); // 拉起后的新进程
+    h.publishOnSpawn = (pid) => {
+      writeSupervisorState({ pid, startedAt: 1_000_000, execPath: EXE, cwd: h.home, agents: ["claude"] }, h.paths);
+    };
+
+    const started = await h.daemon.watchdog();
+
+    expect(started).toBe(true);
+    expect(h.spawns).toHaveLength(1);
+    expect(h.spawns[0].argv).toEqual(["run"]);
+    // detached：计划任务退出后不能让 supervisor 跟着走。
+    expect(h.spawns[0].options.detached).toBe(true);
+    expect(h.lines.join("")).toMatch(/watchdog: supervisor is not running/);
+  });
+
+  it("watchdog：pid 文件是崩溃残骸时也能起来，并标明是残骸", async () => {
+    const h = harness({}, { spawnPid: 888 });
+    state(h.paths, 4242); // 文件在，进程早没了
+    h.alive.add(888);
+    h.publishOnSpawn = (pid) => {
+      writeSupervisorState({ pid, startedAt: 1_000_000, execPath: EXE, cwd: h.home, agents: ["claude"] }, h.paths);
+    };
+
+    const started = await h.daemon.watchdog();
+
+    expect(started).toBe(true);
+    expect(h.lines.join("")).toContain("stale pid/state left behind");
+  });
+
+  it("uninstall 连看门狗一起拆：先删任务再删脚本", async () => {
+    const { h, cmd } = winHarness();
+    await h.daemon.installService();
+    expect(existsSync(cmd)).toBe(true);
+    h.commands.length = 0;
+
+    await h.daemon.uninstall();
+
+    const del = h.commands.find((c) => c.file === "schtasks" && c.args.includes("/Delete"));
+    expect(del).toBeDefined();
+    expect(del!.args[del!.args.indexOf("/TN") + 1]).toBe("clawmessenger-watchdog");
+    expect(existsSync(cmd)).toBe(false);
+    expect(h.lines.join("")).toContain("removed watchdog task");
+  });
+
+  it("status 的 autostart 行要能看出「只装了登录自启、没有看门狗」", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-watchdog-status-"));
+    dirs.push(dir);
+    const vbs = join(dir, "clawmessenger.vbs");
+    const cmd = join(dir, "watchdog.cmd");
+
+    const onlyVbs = harness({ platform: "win32", env: { APPDATA: dir }, autostartPaths: { startupVbs: vbs, watchdogCmd: cmd } });
+    writeFileSync(vbs, "rem logon only\n");
+    expect(formatDaemonStatus(onlyVbs.daemon.status()).toString()).toContain("no crash watchdog");
+
+    const both = harness({ platform: "win32", env: { APPDATA: dir }, autostartPaths: { startupVbs: vbs, watchdogCmd: cmd } });
+    writeFileSync(cmd, "rem watchdog\n");
+    const text = formatDaemonStatus(both.daemon.status());
+    expect(text).toContain("watchdog every 5 min");
+    expect(text).not.toContain("no crash watchdog");
+  });
+});
+
+// 存量设备也会拿到看门狗：远程升级只会 spawn `target run`，不会有人再去点一次
+// install-service。不在 supervisor 启动时补一刀，自愈就只对新装设备生效 —— 而现场
+// 离线的那批恰恰全是存量设备。
+describe("ensureWatchdog（存量设备自愈补装）", () => {
+  const setup = (extra: Partial<DaemonOverrides> = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-ensure-watchdog-"));
+    dirs.push(dir);
+    const vbs = join(dir, "Startup", "clawmessenger.vbs");
+    const cmd = join(dir, "watchdog.cmd");
+    const h = harness({
+      platform: "win32",
+      env: { APPDATA: dir, PATH: "C://bin" },
+      selfArgv: () => ({ exec: "C://Program Files//clawmessenger//clawmessenger.exe", args: [] }),
+      autostartPaths: { startupVbs: vbs, watchdogCmd: cmd },
+      ...extra,
+    });
+    return { h, dir, vbs, cmd };
+  };
+
+  it("从没装过登录自启的设备一律不碰：未经同意不往别人机器上写开机项", async () => {
+    const { h, cmd } = setup();
+
+    const result = await h.daemon.ensureWatchdog();
+
+    expect(result).toEqual({ created: false, reason: "no-logon-autostart" });
+    expect(existsSync(cmd)).toBe(false);
+    // 连 schtasks 都不该被调用（有个用例把这条钉死：只读探测也不该发生）。
+    expect(h.commands.filter((c) => c.file === "schtasks")).toHaveLength(0);
+  });
+
+  it("已装登录自启但缺看门狗 → 补上 cmd 与计划任务", async () => {
+    const { h, vbs, cmd } = setup();
+    mkdirSync(join(vbs, ".."), { recursive: true });
+    writeFileSync(vbs, "rem logon only\n");
+
+    const result = await h.daemon.ensureWatchdog();
+
+    expect(result).toEqual({ created: true });
+    expect(existsSync(cmd)).toBe(true);
+    const create = h.commands.find((c) => c.file === "schtasks" && c.args.includes("/Create"));
+    expect(create).toBeDefined();
+    expect(create!.args[create!.args.indexOf("/TN") + 1]).toBe("clawmessenger-watchdog");
+  });
+
+  it("任务已经在了就一个字节都不动（/Create /F 会覆盖用户加过的触发器）", async () => {
+    const { h, vbs, cmd } = setup();
+    mkdirSync(join(vbs, ".."), { recursive: true });
+    writeFileSync(vbs, "rem logon only\n");
+    writeFileSync(cmd, "rem existing watchdog\n");
+
+    const result = await h.daemon.ensureWatchdog();
+
+    expect(result).toEqual({ created: false, reason: "already-installed" });
+    expect(readFileSync(cmd, "utf8")).toBe("rem existing watchdog\n");
+    expect(h.commands.filter((c) => c.args.includes("/Create"))).toHaveLength(0);
+  });
+
+  it("非 Windows 平台：直接跳过，不去调 schtasks", async () => {
+    const h = harness({ platform: "linux" });
+    const result = await h.daemon.ensureWatchdog();
+    expect(result).toEqual({ created: false, reason: "not-windows" });
+    expect(h.commands).toHaveLength(0);
+  });
+});

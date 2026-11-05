@@ -42,6 +42,24 @@ import { join } from "node:path";
 export const DAEMON_SERVICE_NAME = "clawmessenger";
 
 /**
+ * Windows 看门狗的计划任务名（`schtasks /Delete /TN` 按这个名字删）。
+ */
+export const WATCHDOG_TASK_NAME = "clawmessenger-watchdog";
+
+/**
+ * 看门狗检查间隔（分钟）。
+ *
+ * 这是「崩溃后最多多久回来」与「有多频繁地无谓启动一个进程」的折中：5 分钟
+ * 意味着设备最坏下线 5 分钟。别调成 1 分钟 —— 每次触发都要起一个 exe（冷启动
+ * 几十毫秒到几百毫秒），1 分钟一次在一台长期开机的机器上就是每天 1440 次无谓
+ * 进程创建；也别调成 15 分钟以上，那已经谈不上「永远在线」了。
+ *
+ * Linux/macOS 不需要它：systemd 的 `Restart=always` / launchd 的 KeepAlive 本来就
+ * 是进程级守护，秒级自愈。Windows 的「启动」文件夹只解决登录时那一次。
+ */
+export const WATCHDOG_INTERVAL_MINUTES = 5;
+
+/**
  * 登录自启脚本的模板版本标记。
  *
  * `install-service` 落盘的 VBS 里带这一行；**旧模板没有**。supervisor 每次启动都
@@ -164,6 +182,21 @@ export interface Daemon {
   installService(o?: DaemonStartOptions): Promise<void>;
   uninstall(): Promise<void>;
   /**
+   * 看门狗：supervisor 不在就拉起来，在就什么都不做（返回 false）。
+   *
+   * 与 `start` 的区别只在**幂等**：`start` 是人的动作（已经在跑就报导），
+   * `watchdog` 是计划任务的动作（每 5 分钟一次，绝大多数时候什么都不该发生）。
+   */
+  watchdog(o?: DaemonStartOptions): Promise<boolean>;
+  /**
+   * 确保崩溃看门狗已就位（存量设备升级后自动补，不用人再点一次 install-service）。
+   *
+   * 只对**已经装了登录自启**的设备动手：那份 VBS 说明用户同意过「开机自己起来」，
+   * 再补一个「崩了自己起来」是同一意图的完整实现。从没装过自启的设备一律不碰 ——
+   * 未经同意往别人机器上写开机启动项是另一回事。
+   */
+  ensureWatchdog(): Promise<{ created: boolean; reason?: string }>;
+  /**
    * 把存量设备磁盘上那份**旧模板**的登录自启脚本就地补上自愈块。
    *
    * 为什么必须有：自愈块写在 `windowsStartupVbs()` 里，但那份模板只在
@@ -204,6 +237,8 @@ export interface DaemonOverrides {
     userUnit?: string;
     launchAgent?: string;
     startupVbs?: string;
+    /** Windows 看门狗的 .cmd（计划任务指向它）。 */
+    watchdogCmd?: string;
   };
 }
 
@@ -404,6 +439,9 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       "Startup",
       "clawmessenger.vbs",
     );
+  // 看门狗脚本放在状态目录（跟着 CLAWMESSENGER_HOME 走），不塞进用户盘符根目录：
+  // 它只是个薄壳，真正的判断在 `clawmessenger watchdog` 里，升级后自动跟着新 exe 走。
+  const WATCHDOG_CMD = autostartPaths.watchdogCmd ?? join(paths.stateDir, "watchdog.cmd");
 
   const readPidFile = (): number | undefined => readSupervisorPid(paths);
 
@@ -438,7 +476,18 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       return undefined;
     }
     if (platform === "darwin") return existsSync(LAUNCH_AGENT) ? `LaunchAgent (${LAUNCH_AGENT})` : undefined;
-    if (platform === "win32") return existsSync(STARTUP_VBS) ? `Startup folder script (${STARTUP_VBS})` : undefined;
+    if (platform === "win32") {
+      // 两段分别报：只装了登录自启的设备（旧版本 install-service 的产物、或计划任务
+      // 注册失败的机器）必须一眼看出来「崩溃后不会自己回来」，别再靠猜。
+      const parts: string[] = [];
+      if (existsSync(STARTUP_VBS)) parts.push(`Startup folder script (${STARTUP_VBS})`);
+      if (existsSync(WATCHDOG_CMD)) parts.push(`watchdog every ${WATCHDOG_INTERVAL_MINUTES} min`);
+      if (parts.length === 0) return undefined;
+      if (parts.length === 1 && !existsSync(WATCHDOG_CMD)) {
+        parts.push(`no crash watchdog (re-run \`clawmessenger install-service\`)`);
+      }
+      return parts.join(" + ");
+    }
     return undefined;
   };
 
@@ -570,6 +619,59 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     await stop();
     await sleep(1_000);
     await start(o);
+  }
+
+  /**
+   * 看门狗：supervisor 不在就拉起来，在就安静退出（返回 false）。
+   *
+   * 计划任务每 5 分钟调一次，所以「不需要做事」必须是安静且快速的一条路径：
+   * 每次都往 watchdog.log 写一行 "already running"，一天就是 288 行噪声，真出事
+   * 时反而翻不到那次真正的启动记录。
+   */
+  async function watchdog(o: DaemonStartOptions = {}): Promise<boolean> {
+    const running = findRunning();
+    if (running) return false;
+    const stale = stateFilesPresent();
+    out(
+      `${new Date(now()).toISOString()} watchdog: supervisor is not running`
+      + `${stale ? " (stale pid/state left behind)" : ""}; starting it\n`,
+    );
+    await start(o);
+    return true;
+  }
+
+  /**
+   * 确保看门狗就位。幂等、静默、可重复调用（supervisor 每次启动都会走一遍）。
+   *
+   * 为什么不让用户自己再跑一次 install-service：存量设备是被**远程升级**升上来的，
+   * 升级路径只 spawn `target run`，永远不会去注册计划任务 —— 登录自启那份 VBS 就是
+   * 这么错过一整轮的（见 refreshStartupScript 注释）。自愈能力必须先自愈到自己身上。
+   */
+  async function ensureWatchdog(): Promise<{ created: boolean; reason?: string }> {
+    if (platform !== "win32") return { created: false, reason: "not-windows" };
+    if (!existsSync(STARTUP_VBS)) return { created: false, reason: "no-logon-autostart" };
+    // 先查任务：已存在就一个字节都不动（/Create /F 会把用户可能加过的触发器改回默认）。
+    const probe = runCommand("schtasks", ["/Query", "/TN", WATCHDOG_TASK_NAME]);
+    if (probe.status === 0 && existsSync(WATCHDOG_CMD)) return { created: false, reason: "already-installed" };
+
+    try {
+      mkdirSync(paths.stateDir, { recursive: true });
+      mkdirSync(paths.logDir, { recursive: true });
+      writeFileSync(WATCHDOG_CMD, windowsWatchdogCmd(), { mode: 0o644 });
+    } catch (err) {
+      return { created: false, reason: `write-failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    const created = runCommand("schtasks", [
+      "/Create", "/F",
+      "/SC", "MINUTE", "/MO", String(WATCHDOG_INTERVAL_MINUTES),
+      "/TN", WATCHDOG_TASK_NAME,
+      "/TR", `"${WATCHDOG_CMD}"`,
+    ]);
+    if (created.status !== 0) {
+      const detail = `${created.stdout ?? ""}${created.stderr ?? ""}`.trim();
+      return { created: false, reason: `schtasks failed: ${detail || `exit ${created.status}`}` };
+    }
+    return { created: true };
   }
 
   function status(): DaemonStatusReport {
@@ -760,6 +862,34 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   }
 
   /**
+   * Windows 看门狗的 .cmd（计划任务每 N 分钟执行一次）。
+   *
+   * 为什么是「薄壳 + exe 子命令」而不是把判断写进 cmd：
+   *   · 判断要读 pid 文件、要看进程是否真的活着（Windows 上 pid 会被复用），
+   *     用 bat 写这套等于重写一遍 daemon 的状态机；
+   *   · 判断逻辑留在 exe 里，升级后自动跟着新版走 —— 登录自启那份 VBS 就是因为
+   *     「只在 install-service 时落盘」而没法被远程升级更新（见 refreshStartupScript
+   *     的注释），别在同一个坑里摔第二次。
+   *
+   * 输出重定向到 watchdog.log：计划任务默认开一个隐藏窗口，没人看得到 stdout，
+   * 出问题时这是唯一的现场（也是「到底是没触发还是触发了但起不来」的唯一区分依据）。
+   */
+  function windowsWatchdogCmd(): string {
+    const { exec, args } = selfArgv();
+    const quote = (a: string): string => (/[\s"]/.test(a) ? `"${a}"` : a);
+    const cmdline = [quote(exec), ...args.map(quote), "watchdog"].join(" ");
+    const log = join(paths.logDir, "watchdog.log");
+    return [
+      "@echo off",
+      "rem Generated by `clawmessenger install-service`. Remove with `clawmessenger uninstall`.",
+      `rem Started by the "${WATCHDOG_TASK_NAME}" scheduled task every ${WATCHDOG_INTERVAL_MINUTES} minutes:`,
+      "rem it exits immediately unless the supervisor is gone.",
+      `${cmdline} >> "${log}" 2>&1`,
+      "",
+    ].join("\r\n");
+  }
+
+  /**
    * 服务管理器拒收 unit 时，把「它自己那句话」原样带出来。
    * `systemctl start` 只会说一句 "has a bad unit file setting"，真正哪一行不合法只在
    * status / journal 里；与其让用户自己去翻，不如我们连着 unit 正文一起打出来。
@@ -934,6 +1064,38 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       mkdirSync(join(STARTUP_VBS, ".."), { recursive: true });
       writeFileSync(STARTUP_VBS, windowsStartupVbs(o), { mode: 0o644 });
       out(`installed logon autostart: ${STARTUP_VBS}\n`);
+
+      // 第二道：看门狗。上面那份 VBS 只在登录时跑一次，进程崩了/被结束之后
+      // 没有任何东西会把它拉回来 —— 这正是 Windows 上「运维助手该永远在线却
+      // 离线了」的机制性原因（Linux 那边 systemd 的 Restart=always 早就兜住了，
+      // Windows 没有等价物，只能自己拿计划任务补）。
+      mkdirSync(paths.stateDir, { recursive: true });
+      mkdirSync(paths.logDir, { recursive: true });
+      writeFileSync(WATCHDOG_CMD, windowsWatchdogCmd(), { mode: 0o644 });
+
+      // 不传 /RU、不传 /IT：默认就是「当前用户 + 登录后运行」，因此**不需要管理员**。
+      // 代价是「开机但没人登录」时不会触发 —— 那种场景 VBS 也起不来，只有装成
+      // SYSTEM 服务能解，而那需要提权，不该在 install-service 里默默要。
+      const created = runCommand("schtasks", [
+        "/Create", "/F",
+        "/SC", "MINUTE", "/MO", String(WATCHDOG_INTERVAL_MINUTES),
+        "/TN", WATCHDOG_TASK_NAME,
+        "/TR", `"${WATCHDOG_CMD}"`,
+      ]);
+      if (created.status === 0) {
+        out(`installed watchdog task: ${WATCHDOG_TASK_NAME} (every ${WATCHDOG_INTERVAL_MINUTES} min)\n`);
+      } else {
+        // 不 fail-closed：自启已经装好了，用户至少还有「登录后自动起来」这一层。
+        // 但必须说清楚「崩溃自愈没装上」，否则设备下次崩了还是没人知道为什么。
+        const detail = `${created.stdout ?? ""}${created.stderr ?? ""}`.trim();
+        err(`could not register the watchdog task "${WATCHDOG_TASK_NAME}"`);
+        if (detail) err(`: ${tailLines(detail, 5)}`);
+        err("\n");
+        err("  logon autostart IS installed, but a crashed supervisor will NOT come back on its own.\n");
+        err("  register it by hand (no admin rights needed):\n");
+        err(`    schtasks /Create /F /SC MINUTE /MO ${WATCHDOG_INTERVAL_MINUTES} /TN ${WATCHDOG_TASK_NAME} /TR "\\"${WATCHDOG_CMD}\\""\n`);
+      }
+
       out("  it runs `clawmessenger run` hidden at every logon (no admin rights needed).\n");
       out("  start it now with: clawmessenger start\n");
       out("  remove with:       clawmessenger uninstall\n");
@@ -974,6 +1136,16 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       rmSync(STARTUP_VBS, { force: true });
       removed.push(`logon autostart (${STARTUP_VBS})`);
     }
+    if (platform === "win32") {
+      // 先删任务再删脚本：顺序反过来会留下一个每 5 分钟报一次「文件不存在」的
+      // 计划任务，比不装还难查。
+      const delTask = runCommand("schtasks", ["/Delete", "/F", "/TN", WATCHDOG_TASK_NAME]);
+      if (delTask.status === 0) removed.push(`watchdog task (${WATCHDOG_TASK_NAME})`);
+      if (existsSync(WATCHDOG_CMD)) {
+        rmSync(WATCHDOG_CMD, { force: true });
+        removed.push(`watchdog script (${WATCHDOG_CMD})`);
+      }
+    }
     if (removed.length === 0) {
       out("no autostart entry was configured.\n");
     } else {
@@ -982,7 +1154,9 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     out("(the running supervisor was left alone; stop it with `clawmessenger stop`)\n");
   }
 
-  return { start, stop, restart, status, logs, installService, uninstall, refreshStartupScript };
+  return {
+    start, stop, restart, status, logs, installService, uninstall, refreshStartupScript, watchdog, ensureWatchdog,
+  };
 }
 
 // ---------------------------------------------------------------- 展示

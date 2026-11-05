@@ -31,6 +31,8 @@ import {
   findLiveSupervisor,
   formatDaemonStatus,
   supervisorSpawnArgv,
+  WATCHDOG_INTERVAL_MINUTES,
+  WATCHDOG_TASK_NAME,
   writeSupervisorState,
   type Daemon,
   type DaemonPaths,
@@ -239,6 +241,11 @@ export interface BuildProgramOpts {
    * 桩函数，既不用碰真实 APPDATA，也能断言「启动时确实检查过」。
    */
   refreshStartupScript?: () => Promise<{ updated: boolean; path: string; reason?: string } | null>;
+  /**
+   * 确保崩溃看门狗就位（`Daemon.ensureWatchdog`）。与上一个注入点同理：只有真的
+   * 安装版 exe 才该去动系统计划任务，`node bin.ts run` 不该碰用户机器。
+   */
+  ensureWatchdog?: () => Promise<{ created: boolean; reason?: string }> | null;
 }
 
 /** 升级资产下载用的 fetch（self-update.ts 的 FetchLike，测试可替换）。 */
@@ -999,6 +1006,30 @@ export function buildProgram(opts: BuildProgramOpts): Command {
             console.warn("startup script refresh failed:", err instanceof Error ? err.message : String(err));
           }
         }
+        // 崩溃看门狗同理：存量 Windows 设备是被**远程升级**升上来的，升级路径只
+        // spawn `target run`，不会注册计划任务 —— 不在这里补一刀，自愈就只对新装
+        // 设备生效，而现场离线的那批恰恰都是存量设备。
+        //
+        // 与 refreshStartup 一样只在安装版 exe 里做：`node bin.ts run` 或测试跑起来
+        // 时绝不该去创建用户机器上的计划任务。
+        const ensureWatchdogFn =
+          opts.ensureWatchdog ?? (isSeaExecutable(process.argv[1]) ? () => daemon.ensureWatchdog() : null);
+        if (ensureWatchdogFn) {
+          try {
+            const wd = await ensureWatchdogFn();
+            if (wd?.created) {
+              opts.stdout.write(
+                `supervisor: installed the crash watchdog (${WATCHDOG_TASK_NAME}, every ${WATCHDOG_INTERVAL_MINUTES} min)\n`,
+              );
+            } else if (wd?.reason && !["not-windows", "no-logon-autostart", "already-installed"].includes(wd.reason)) {
+              // 只报「本该装却没装成」的那几种，别在非 Windows 上每次启动刷一行。
+              console.warn(`watchdog ensure skipped: ${wd.reason}`);
+            }
+          } catch (err) {
+            // 补看门狗失败不能挡住 supervisor 起来。
+            console.warn("watchdog ensure failed:", err instanceof Error ? err.message : String(err));
+          }
+        }
         // 交接凭据必须是「锁已到手」之后才写：__relaunch 用它当成功判据，
         // 提前写等于又回到「活着就算成功」的老问题（审查报告 B1）。
         signalRelaunchReady(lockHeld);
@@ -1425,6 +1456,20 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       daemon.logs({ lines: Number.isFinite(n) && n > 0 ? n : 40 });
     });
 
+  /**
+   * 看门狗：计划任务每 N 分钟调一次，supervisor 不在就拉起来。
+   *
+   * 单独做成子命令（而不是把判断写进 .cmd）是为了升级后自动跟着新版走 ——
+   * 登录自启那份 VBS 就因为只在 install-service 时落盘，远程升级永远改不动它。
+   */
+  daemonOpts(
+    program
+      .command("watchdog")
+      .description("Start the supervisor only if it is not running (called by the Windows scheduled task)"),
+  ).action(async (cmdOpts: { model?: string; workdir?: string }) => {
+    await daemon.watchdog(cmdOpts);
+  });
+
   daemonOpts(
     program
       .command("install-service")
@@ -1443,7 +1488,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   // 显式命名空间，等价于上面那些顶层命令，给「不想让 6 个动词混在命令列表里」的人用。
   program
     .command("daemon <action>")
-    .description("Background-supervisor actions: start | stop | restart | status | logs | install-service | uninstall")
+    .description("Background-supervisor actions: start | stop | restart | status | logs | watchdog | install-service | uninstall")
     .option("--model <model>", "model override passed through to the agent CLI")
     .option("--workdir <dir>", "working directory for agent turns (default: your home directory)")
     .option("--lines <n>", "lines to show for `daemon logs`", "40")
@@ -1486,6 +1531,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           daemon.logs({ lines: Number.isFinite(n) && n > 0 ? n : 40 });
           return;
         }
+        case "watchdog":
+          await daemon.watchdog(passthrough);
+          return;
         case "install-service":
           await daemon.installService(passthrough);
           return;
@@ -1493,7 +1541,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           await daemon.uninstall();
           return;
         default:
-          throw new Error(`unknown daemon action '${action}'; try: start | stop | restart | status | logs | install-service | uninstall`);
+          throw new Error(`unknown daemon action '${action}'; try: start | stop | restart | status | logs | watchdog | install-service | uninstall`);
       }
     });
 
