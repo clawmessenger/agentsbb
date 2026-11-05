@@ -35,11 +35,16 @@ done
 if [[ "${TAG_ONLY}" == false ]]; then
   [[ -n "${VERSION}" ]] || { echo "usage: $0 <version> [--no-push] | --tag-only" >&2; exit 2; }
   echo "==> bumping xiachat-cli to ${VERSION}"
-  # main.ts 的 .version("x.y.z") 与 package.json 的 "version" 都要改
-  sed -i -E "s/(\.version\(\")[0-9]+\.[0-9]+\.[0-9]+(\"\))/\1${VERSION}\2/" "${CLI_DIR}/src/main.ts"
+  # 版本号只剩**两处**硬编码（main.ts 早已改走 cliVersion()，没有字面量了）：
+  #   package.json "version"                      —— 构建脚本的默认来源
+  #   version.ts   CLAWMESSENGER_VERSION_FALLBACK —— 未注入时的运行时兜底，
+  #                                                  version.test.ts 盯着它与 package.json 一致
+  # 以前只改 package.json（version.ts 漏了），测试在 bump 之后跑，脚本自己把自己挡住，
+  # 而且 tag 上会留一份「fallback 撒谎」的源码。
   sed -i -E "s/(\"version\":\s*\")[0-9]+\.[0-9]+\.[0-9]+(\")/\1${VERSION}\2/" "${CLI_DIR}/package.json"
-  echo "    main.ts   -> $(grep -oE '\.version\("[0-9.]+"\)' "${CLI_DIR}/src/main.ts")"
-  echo "    pkg.json  -> $(grep -m1 -oE '"version":\s*"[0-9.]+"' "${CLI_DIR}/package.json")"
+  sed -i -E "s/(CLAWMESSENGER_VERSION_FALLBACK = \")[0-9]+\.[0-9]+\.[0-9]+(\")/\1${VERSION}\2/" "${CLI_DIR}/src/version.ts"
+  echo "    pkg.json   -> $(grep -m1 -oE '"version":\s*"[0-9.]+"' "${CLI_DIR}/package.json")"
+  echo "    version.ts -> $(grep -oE 'CLAWMESSENGER_VERSION_FALLBACK = "[0-9.]+"' "${CLI_DIR}/src/version.ts")"
 fi
 
 TAG="clawmessenger-v${VERSION}"
@@ -52,9 +57,9 @@ if [[ "${TAG_ONLY}" == false ]]; then
   echo "==> running CLI tests + typecheck"
   ( cd "${CLI_DIR}" && pnpm typecheck && pnpm test )
 
-  if ! git diff --quiet -- "${CLI_DIR}/src/main.ts" "${CLI_DIR}/package.json"; then
+  if ! git diff --quiet -- "${CLI_DIR}/package.json" "${CLI_DIR}/src/version.ts"; then
     echo "==> committing version bump"
-    git add "${CLI_DIR}/src/main.ts" "${CLI_DIR}/package.json"
+    git add "${CLI_DIR}/package.json" "${CLI_DIR}/src/version.ts"
     git commit -m "chore(cli): bump xiachat-cli to ${VERSION}"
   fi
 
