@@ -437,11 +437,13 @@ describe("MessageDispatcher 接线：私聊闸门真的挡住了 agent", () => {
     return { dispatcher, turns, sent, ran };
   }
 
-  it("allowPrivate=false 时陌生人的私聊不执行，也不回任何消息（不做探测信道）", async () => {
+  it("allowPrivate=false 时陌生人的私聊不执行，只回一条占位（2026-11-04 后的新契约：拒绝不能静默）", async () => {
     const { dispatcher, turns, sent, ran } = build(snapshot([{ agent: "codex", nodeId: "node-1", allowPrivate: false }]));
     await dispatcher.handle(privateMsg("stranger"), turns);
     expect(ran).toEqual([]);
-    expect(sent).toEqual([]);
+    // 不再是「零回包」：占位私聊让发送方 UI 立刻落定（60s 节流在 im.test.ts 钉）。
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: "stranger", objectName: "RC:TxtMsg" });
   });
 
   it("主人自己的私聊照常执行", async () => {
@@ -465,13 +467,15 @@ describe("MessageDispatcher 接线：私聊闸门真的挡住了 agent", () => {
     expect(ran[0]?.opts).toMatchObject({ behaviorPrompt: "每句话都要简短。" });
   });
 
-  it("有快照但快照里没有本节点：拒绝，且同样不回包（审查 S3）", async () => {
+  it("有快照但快照里没有本节点：拒绝执行，但回占位（审查 S3 + 修复①占位契约）", async () => {
     const { dispatcher, turns, sent, ran } = build(
       snapshot([{ agent: "codex", nodeId: "other-node", allowPrivate: true }]),
     );
     await dispatcher.handle(privateMsg(OWNER), turns);
     expect(ran).toEqual([]);
-    expect(sent).toEqual([]);
+    // 同上：连主人也不放行，但占位照回（否则 UI 永远转圈）。
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: OWNER, objectName: "RC:TxtMsg" });
   });
 
   it("无快照放行时每条都打 warn，且与「有快照且允许」的日志可区分", async () => {
