@@ -11,6 +11,7 @@ import {
   type DeviceUpgradeIntent,
   type DeviceUpgradeStatus,
   type MachineAgentCredential,
+  type ObservedAgentState,
 } from "./api.js";
 import { discoverAgents, syncAgentPermissionConfig, type AgentInfo } from "./agents.js";
 import {
@@ -273,6 +274,12 @@ export interface BuildProgramOpts {
    * 安装版 exe 才该去动系统计划任务，`node bin.ts run` 不该碰用户机器。
    */
   ensureWatchdog?: () => Promise<{ created: boolean; reason?: string }> | null;
+  /**
+   * 常驻自愈是否就位（`Daemon.serviceHealth`）。生产路径由真 exe 自己调；
+   * `node bin.ts run` 与测试注入桩函数 —— 这个探测会起 `schtasks` 子进程，
+   * 测试里不该碰用户机器。
+   */
+  serviceHealth?: () => { ready: boolean; detail: string } | null;
 }
 
 /** 升级资产下载用的 fetch（self-update.ts 的 FetchLike，测试可替换）。 */
@@ -1121,6 +1128,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         }
         // 交接凭据必须是「锁已到手」之后才写：__relaunch 用它当成功判据，
         // 提前写等于又回到「活着就算成功」的老问题（审查报告 B1）。
+        // 常驻自愈的判据（安装版 exe 才有意义：`node bin.ts run` 不该去查系统计划任务）。
+        const serviceHealthFn =
+          opts.serviceHealth ?? (isSeaExecutable(process.argv[1]) ? () => daemon.serviceHealth() : null);
         signalRelaunchReady(lockHeld);
         await runSupervisor({
           opts,
@@ -1147,6 +1157,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           ...(opts.supervisorControlPollMs !== undefined
             ? { controlPollIntervalMs: opts.supervisorControlPollMs }
             : {}),
+          ...(serviceHealthFn ? { serviceHealth: serviceHealthFn } : {}),
           // 不管是 `clawmessenger start` 拉起的，还是用户在终端里直接 `run`，
           // supervisor 都把自己的运行状态写下来 —— 于是 status / stop 都能看到它，
           // 顺带实现「前台跑着时 start 会拒绝，避免两份 supervisor 抢同一批 agent」。
@@ -1829,6 +1840,12 @@ interface RunSupervisorOpts {
   /** Called when the supervisor is shutting down, so the caller can clear that
    * state. Must fire exactly once. */
   onStopped?: () => void;
+  /**
+   * 常驻自愈是否就位（见 Daemon.serviceHealth）。只在 supervisor 启动时调一次：
+   * 它要起 `schtasks` 子进程，不能塞进 10 秒轮询。返回 null = 本进程判断不了
+   * （`node bin.ts run` / 测试），此时不上报该字段，服务端按「未知」处理。
+   */
+  serviceHealth?: () => { ready: boolean; detail: string } | null;
 }
 
 // --- supervised child restarts --------------------------------------------
@@ -1934,6 +1951,78 @@ function supervisedKey(agent: MachineAgentCredential): string {
 // 同一个 "ops" 键：停 ops 即停全部运维子进程，与机型粒度的运维语义一致。
 function controlKeyFor(supervisedKeyName: string): string {
   return supervisedKeyName.startsWith("ops@") ? OPS_AGENT_NAME : supervisedKeyName;
+}
+
+/** supervisor 内部一个受管 agent 的运行时快照（只取回执需要的字段）。 */
+export interface SupervisedSnapshotEntry {
+  /** managed 的键：机器级用 ai_type，per-agent 运维子进程用 `ops@<agentRC>`。 */
+  key: string;
+  state: "running" | "restarting" | "stopped";
+  desired: "running" | "stopped";
+  restarts: number;
+  lastExitCode: number | null;
+  /** 已收敛到的期望状态版本；未见过任何指令时为空。 */
+  seenVersion?: number;
+}
+
+/**
+ * 把 supervisor 的运行时快照翻成**设备回执**（随 10 秒轮询上报）。
+ *
+ * 这是「后台点启动到底有没有真的启动」的另一半答案：服务端只有期望状态，没有
+ * 设备侧事实，于是按钮点完之后的每一秒它都只能显示「待执行」。这里把三件事说清楚：
+ *
+ *   1. 真在跑的 → running（带上收敛到的版本号，服务端据此判定「已生效」）；
+ *   2. 起过就崩的 → failed + 原因（退出码/连续失败次数），页面直接显示，不用上机；
+ *   3. 绑定了但本机根本没有这个 CLI 的 → missing。**这一条最值钱**：过去点启动
+ *      毫无反应、又找不到任何日志，十有八九就是这种。
+ *
+ * 纯函数（不碰进程/网络），因为这条映射一旦写错，页面会把「没起来」显示成
+ * 「已生效」—— 正是这次要消灭的东西。
+ */
+export function observedAgentStates(
+  entries: SupervisedSnapshotEntry[],
+  boundAgents: string[],
+): ObservedAgentState[] {
+  const byAgent = new Map<string, ObservedAgentState>();
+  // 同机多个 per-agent 运维子进程映射到同一个 "ops" 控制键，必须合并成一条：
+  // 服务端按 agent 名匹配控制行，重复项会让后一条覆盖前一条（状态来回跳）。
+  const rank = (state: string): number => (state === "running" ? 3 : state === "starting" ? 2 : 1);
+  for (const entry of entries) {
+    const agent = controlKeyFor(entry.key);
+    let state: ObservedAgentState["state"];
+    let error: string | undefined;
+    if (entry.state === "running") {
+      state = "running";
+    } else if (entry.state === "restarting") {
+      state = "starting";
+    } else if (entry.desired === "running" && entry.restarts > 0) {
+      // 期望在跑却被停着，且已经失败过：这是崩溃退避中，不是「按指令停着」。
+      state = "failed";
+      error = `已连续失败 ${entry.restarts} 次${entry.lastExitCode !== null ? `，最近退出码 ${entry.lastExitCode}` : ""}`;
+    } else {
+      state = "stopped";
+    }
+    const next: ObservedAgentState = {
+      agent,
+      state,
+      version: entry.seenVersion ?? 0,
+      ...(error ? { error } : {}),
+    };
+    const prev = byAgent.get(agent);
+    if (!prev || rank(next.state) > rank(prev.state)) byAgent.set(agent, next);
+  }
+  // 绑定过、supervisor 却管不到的 agent：本机没有这个命令行。服务端把它显示成
+  // 「执行失败：本机 PATH 上没有 xxx 命令」，运维才知道该装东西而不是继续点按钮。
+  for (const agent of boundAgents) {
+    if (byAgent.has(agent)) continue;
+    byAgent.set(agent, {
+      agent,
+      state: "missing",
+      version: 0,
+      error: `本机 PATH 上没有 ${agent} 命令，supervisor 无法拉起`,
+    });
+  }
+  return [...byAgent.values()];
 }
 
 export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
@@ -2409,6 +2498,27 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     }
   };
 
+  /**
+   * 本机常驻自愈是否就位。**只在这里算一次**：`serviceHealth()` 会起一个
+   * `schtasks /Query` 子进程，放进制 10 秒的轮询里就是每 10 秒一个进程。
+   * 结论随每轮轮询上报，装/卸自愈后重启 supervisor 即刷新。
+   */
+  const serviceHealth = supervisor.serviceHealth?.() ?? null;
+
+  /** 当前各 agent 的实际状态（启停回执），每轮轮询上报。 */
+  const observedNow = (): ObservedAgentState[] =>
+    observedAgentStates(
+      [...managed].map(([key, entry]) => ({
+        key,
+        state: entry.state,
+        desired: entry.desired,
+        restarts: entry.restarts,
+        lastExitCode: entry.lastExitCode,
+        ...(entry.seenVersion !== undefined ? { seenVersion: entry.seenVersion } : {}),
+      })),
+      bound.map((agent) => agent.agent),
+    );
+
   /** 上次看到的期望状态与版本。失败时返回空 Map，applyControlStates 读作
    * 「什么都别改」—— 服务端抖动绝不能把操作员留着运行的 agent 停掉。 */
   const fetchControlSnapshot = async (): Promise<{
@@ -2425,6 +2535,13 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         hostname: os.hostname(),
         // 安装目录同理：详情页据此给精确到路径的排查指引，老服务端忽略。
         installDir,
+        // 常驻自愈是否就位：没就位时「后台点启动」永远不会生效，页面要能说出来。
+        ...(serviceHealth
+          ? { serviceReady: serviceHealth.ready, serviceDetail: serviceHealth.detail }
+          : {}),
+        // 启停回执：本机各 agent 现在实际是什么状态。服务端据此把「已下发」升级成
+        // 「已生效 / 执行失败（原因）」。老服务端忽略这个字段。
+        observed: observedNow(),
       });
       // 权限快照：先落盘，再收敛启停 —— 闸门依赖它，落盘失败只记日志（最坏
       // 结果是沿用上一份，不能因为写不了文件就把轮询判失败）。

@@ -197,6 +197,18 @@ export interface Daemon {
    */
   ensureWatchdog(): Promise<{ created: boolean; reason?: string }>;
   /**
+   * 常驻自愈是否真的就位（崩溃/被杀之后会不会自己回来）。
+   *
+   * 为什么要单独给一个判据：`ensureWatchdog` 失败是**静默**的（只往 supervisor
+   * 日志写一行 `watchdog ensure skipped: schtasks failed`），现场表现就是「后台点
+   * 启动永远没反应」，而没有人知道这台机器其实缺了看门狗。这个函数把「装没装上」
+   * 变成一个明确的布尔值，随 10 秒轮询上报给服务端，后台详情页据此红字告警。
+   *
+   * 与 `autostart` 字段的区别：那个是给人看的描述串，这个是给机器判断的三态
+   * （ready / not-ready + 原因），不要互相替代。
+   */
+  serviceHealth(): { ready: boolean; detail: string };
+  /**
    * 把存量设备磁盘上那份**旧模板**的登录自启脚本就地补上自愈块。
    *
    * 为什么必须有：自愈块写在 `windowsStartupVbs()` 里，但那份模板只在
@@ -489,6 +501,61 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       return parts.join(" + ");
     }
     return undefined;
+  };
+
+  /** 取一段命令输出的第一行非空文本（错误信息要短，页面只有一行位置）。 */
+  const firstLine = (text: string | undefined): string =>
+    (text || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line !== "") ?? "";
+
+  /**
+   * 常驻自愈是否就位。判据按平台各取「真的会被系统拉起来」的那份证据：
+   *
+   *  · Windows —— 登录自启 VBS（开机/登录）+ **计划任务看门狗**（崩溃后 5 分钟内
+   *    自己回来）。缺后者等于「掉一次就掉到下次登录」，所以只有两者都在、且
+   *    `schtasks /Query` 能查到任务，才算就位。
+   *  · Linux —— systemd 单元（system 或 user 级任意一份）。
+   *  · macOS —— LaunchAgent。
+   *
+   * Windows 上额外探一次计划任务状态，是因为文件可能写着、任务却被删了/从没建成
+   * （本机现场就是这样：watchdog.cmd 在，任务不在，`schtasks` 被安全软件拦掉）。
+   * 这个探测会起一个子进程，所以只在 supervisor 启动时调一次，不要塞进 10 秒轮询。
+   */
+  const serviceHealth = (): { ready: boolean; detail: string } => {
+    if (platform === "win32") {
+      const hasAutostart = existsSync(STARTUP_VBS);
+      const hasWatchdogCmd = existsSync(WATCHDOG_CMD);
+      if (!hasAutostart && !hasWatchdogCmd) {
+        return { ready: false, detail: "未安装登录自启与崩溃看门狗：执行 clawmessenger install-service" };
+      }
+      if (!hasWatchdogCmd) {
+        return {
+          ready: false,
+          detail: "只装了登录自启，缺崩溃看门狗：执行 clawmessenger install-service",
+        };
+      }
+      const probe = runCommand("schtasks", ["/Query", "/TN", WATCHDOG_TASK_NAME]);
+      if (probe.status !== 0) {
+        const reason = firstLine(`${probe.stdout ?? ""}${probe.stderr ?? ""}`);
+        return {
+          ready: false,
+          detail: `看门狗计划任务 ${WATCHDOG_TASK_NAME} 未注册（${reason || "schtasks 不可用，可能被安全软件拦截"}）`,
+        };
+      }
+      return { ready: true, detail: `登录自启 + 每 ${WATCHDOG_INTERVAL_MINUTES} 分钟崩溃看门狗` };
+    }
+    if (platform === "linux") {
+      if (existsSync(SYSTEM_UNIT)) return { ready: true, detail: `systemd 服务 ${SYSTEM_UNIT}` };
+      if (existsSync(USER_UNIT)) return { ready: true, detail: `systemd 用户服务 ${USER_UNIT}` };
+      return { ready: false, detail: "未安装 systemd 服务：执行 clawmessenger install-service" };
+    }
+    if (platform === "darwin") {
+      if (existsSync(LAUNCH_AGENT)) return { ready: true, detail: `LaunchAgent ${LAUNCH_AGENT}` };
+      return { ready: false, detail: "未安装 LaunchAgent：执行 clawmessenger install-service" };
+    }
+    return { ready: false, detail: `平台 ${platform} 不支持常驻自愈` };
   };
 
   const targetPidFile = (): string | undefined => {
@@ -1156,6 +1223,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
 
   return {
     start, stop, restart, status, logs, installService, uninstall, refreshStartupScript, watchdog, ensureWatchdog,
+    serviceHealth,
   };
 }
 

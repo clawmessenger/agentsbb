@@ -67,6 +67,25 @@ export interface AgentControlState {
   behaviorPrompt?: string;
 }
 
+/**
+ * 设备回执：本机某个 agent **现在实际是什么状态**，随 10 秒轮询一起上报。
+ *
+ * 为什么是「状态」而不是「执行完发一次 ack」：ack 会丢（网络抖动、进程被杀），
+ * 丢一次页面就永远停在「已下发」；而状态天然可以重复上报，幂等且能自己修正 ——
+ * 服务端只要比较回执版本与下发版本，就知道这条指令收敛到哪一步了。
+ *
+ * state 取值：running（在跑）/ starting（刚拉起还没稳定）/ stopped（已按期望停掉）
+ * / missing（本机 PATH 上根本没有这个 agent 的命令行）/ failed（起过就崩）。
+ */
+export interface ObservedAgentState {
+  agent: string;
+  state: "running" | "starting" | "stopped" | "missing" | "failed";
+  /** 已经收敛到的期望状态版本（supervisor 的 seenVersion）；0 = 还没看到过任何指令。 */
+  version: number;
+  /** 失败/缺失的原因，一句话（服务端会截断后存)。 */
+  error?: string;
+}
+
 // 服务端下发的 exe 升级指令（POST /api/claw/device/control 响应里的 upgrade）。
 //
 // mirrors 是有序的下载地址：先 GitHub 直连，失败再回退服务端相对路径
@@ -301,7 +320,17 @@ export class XiachatApi {
     nodeId: string,
     credentialId: string,
     secret: string,
-    report?: { version?: string; platform?: string; hostname?: string; installDir?: string },
+    report?: {
+      version?: string;
+      platform?: string;
+      hostname?: string;
+      installDir?: string;
+      /** 常驻自愈是否就位（见 Daemon.serviceHealth）。undefined = 本进程不判断。 */
+      serviceReady?: boolean;
+      serviceDetail?: string;
+      /** 本机各 agent 的实际状态（启停回执）。空数组 = 不报。 */
+      observed?: ObservedAgentState[];
+    },
   ): Promise<DeviceControlSnapshot> {
     const raw = await this.request<{
       data?: { ownerUserId?: string; agents?: AgentControlState[]; upgrade?: DeviceUpgradeIntent };
@@ -316,6 +345,11 @@ export class XiachatApi {
         ...(report?.platform ? { platform: report.platform } : {}),
         ...(report?.hostname ? { hostname: report.hostname } : {}),
         ...(report?.installDir ? { installDir: report.installDir } : {}),
+        // serviceReady 用「有没有这个键」判断，不能用真值判断：false 是有效信息
+        // （这台机器确实不会自愈），被 `&&` 吃掉就等于永远不告警。
+        ...(typeof report?.serviceReady === "boolean" ? { serviceReady: report.serviceReady } : {}),
+        ...(report?.serviceDetail ? { serviceDetail: report.serviceDetail } : {}),
+        ...(report?.observed && report.observed.length > 0 ? { observed: report.observed } : {}),
       },
     );
     const agents = raw.data?.agents;

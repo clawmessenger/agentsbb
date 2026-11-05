@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildProgram,
+  observedAgentStates,
   supervisorRestartDelayMs,
   RELAUNCH_LOCK_WAIT_ENV,
   RELAUNCH_LOCK_WAIT_MS,
@@ -1275,5 +1276,83 @@ describe("singleton lock 释放", () => {
     h.getShutdown()();
     await h.run;
     expect(released).toEqual(["released"]);
+  });
+});
+
+// 启停回执（2026-11-05）：服务端只有期望状态，没有设备侧事实 —— 于是「后台点了
+// 启动，到底有没有真的启动」永远显示成「待执行」。supervisor 每轮轮询随手上报
+// 本机各 agent 的实际状态，服务端拿它把「已下发」升级成「已生效 / 执行失败」。
+describe("observedAgentStates（设备回执的纯函数映射）", () => {
+  const base = { key: "ops", restarts: 0, lastExitCode: null as number | null };
+
+  it("在跑、重启中、崩溃退避、按指令停止，各报各的", () => {
+    const states = observedAgentStates(
+      [
+        { ...base, key: "codex", state: "running", desired: "running", seenVersion: 7 },
+        { ...base, key: "hermes", state: "restarting", desired: "running", seenVersion: 2 },
+        { ...base, key: "qwen", state: "stopped", desired: "running", restarts: 3, lastExitCode: 1, seenVersion: 1 },
+        { ...base, key: "openclaw", state: "stopped", desired: "stopped", seenVersion: 4 },
+      ],
+      [],
+    );
+    const byAgent = Object.fromEntries(states.map((s) => [s.agent, s]));
+    expect(byAgent.codex).toEqual({ agent: "codex", state: "running", version: 7 });
+    expect(byAgent.hermes).toEqual({ agent: "hermes", state: "starting", version: 2 });
+    // 期望在跑、却连续失败停着 —— 必须报 failed 并带上原因，否则页面只会显示
+    // 「待确认」，运维永远不知道它其实一直在崩。
+    expect(byAgent.qwen.state).toBe("failed");
+    expect(byAgent.qwen.error).toContain("连续失败 3 次");
+    expect(byAgent.qwen.error).toContain("退出码 1");
+    // 按指令停着的不算失败。
+    expect(byAgent.openclaw.state).toBe("stopped");
+  });
+
+  it("绑定了但本机没有这个 CLI：报 missing，而不是静默跳过", () => {
+    // 过去这就是「点启动毫无反应、日志里什么都没有」的真相：discoverAgents 扫不到
+    // 就根本不为它建受管项，applyControlStates 直接 continue。
+    const states = observedAgentStates([{ ...base, state: "running", desired: "running", seenVersion: 1 }], ["ops", "qwen"]);
+    const qwen = states.find((s) => s.agent === "qwen");
+    expect(qwen?.state).toBe("missing");
+    expect(qwen?.error).toContain("PATH");
+  });
+
+  it("多个 per-agent 运维子进程合并成一条 ops，取最健康的那个状态", () => {
+    const states = observedAgentStates(
+      [
+        { ...base, key: "ops@codex_1", state: "stopped", desired: "running", restarts: 2, lastExitCode: 1 },
+        { ...base, key: "ops@qwen_1", state: "running", desired: "running", seenVersion: 5 },
+      ],
+      ["ops"],
+    );
+    expect(states).toHaveLength(1);
+    expect(states[0]).toMatchObject({ agent: "ops", state: "running", version: 5 });
+  });
+});
+
+describe("常驻自愈与启停回执随轮询上报", () => {
+  it("轮询体带上 serviceReady / serviceDetail 与本机实际状态", async () => {
+    const h = makeHarness([], BOUND_OPS, {
+      serviceHealth: () => ({ ready: false, detail: "看门狗计划任务未注册（schtasks 被安全软件拦截）" }),
+    });
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+    await realSleep(CONTROL_TICK_MS * 3);
+
+    const calls = vi.mocked(h.api.fetchDeviceControl).mock.calls;
+    const report = calls[calls.length - 1][3];
+    // ready=false 是**有效信息**，不能因为是假值就被 `&&` 吃掉。
+    expect(report?.serviceReady).toBe(false);
+    expect(report?.serviceDetail).toContain("看门狗");
+    expect(report?.observed).toEqual([{ agent: "ops", state: "running", version: 0 }]);
+  });
+
+  it("装好的机器上报 ready=true", async () => {
+    const h = makeHarness([], BOUND_OPS, {
+      serviceHealth: () => ({ ready: true, detail: "登录自启 + 每 5 分钟崩溃看门狗" }),
+    });
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+    await realSleep(CONTROL_TICK_MS * 3);
+
+    const calls = vi.mocked(h.api.fetchDeviceControl).mock.calls;
+    expect(calls[calls.length - 1][3]?.serviceReady).toBe(true);
   });
 });

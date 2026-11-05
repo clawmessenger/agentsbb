@@ -288,6 +288,9 @@ function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: s
     uninstall: async () => { calls.push("uninstall"); },
     // 登录自启脚本的模板刷新：这里不需要模拟文件系统，记一笔即可。
     refreshStartupScript: async () => ({ updated: false, path: "/nonexistent/clawmessenger.vbs", reason: "no-logon-script" }),
+    // 常驻自愈判据：默认「非 Windows，无需看门狗」—— Linux 上 install-service
+    // 装的是 systemd 单元，而不是计划任务。
+    serviceHealth: () => ({ ready: true, detail: "systemd 服务" }),
     ...overrides,
   };
   return { daemon, calls };
