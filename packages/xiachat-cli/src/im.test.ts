@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
 import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
+import type { PermissionSnapshot } from "./agent-permissions.js";
 import { createAnsweredTurnStore } from "./answered-turns.js";
 import { TurnIncompleteError } from "./turn-error.js";
 import { MemoryUserModelStore } from "./user-models.js";
@@ -108,6 +109,172 @@ describe("MessageDispatcher single chat", () => {
       { runTurn: async () => { throw new Error("boom"); } },
     );
     expect(deps.sent).toHaveLength(0);
+  });
+});
+
+// 私聊闸门拒绝占位回执（2026-11-04 事故修复①）：拒绝不能静默 ——
+// no-agent-entry / denied-stranger 必须回一条占位私聊，让发送方 UI 立刻落定；
+// 同一发送者 60s 内只回一条（融云离线重放防刷屏）；发送失败只记日志。
+describe("private gate reject notice", () => {
+  const snapshotWith = (agents: PermissionSnapshot["agents"]): PermissionSnapshot => ({
+    ownerUserId: "owner_1",
+    ownerUserIdPresent: true,
+    agents,
+    updatedAt: Date.now(),
+  });
+
+  const inbound = (fromUserId: string): Parameters<MessageDispatcher["handle"]>[0] => ({
+    objectName: "RC:TxtMsg",
+    fromUserId,
+    toUserId: "rc_node_x",
+    targetId: "rc_node_x",
+    conversationType: 1,
+    content: JSON.stringify({ content: "你好" }),
+  });
+
+  // 快照里只有「别的节点」（agent 名也不能撞上本进程的 agentName，否则
+  // findPermissionEntry 的 agent 名兜底会命中它、按 unrestricted 放行）。
+  const noAgentEntrySnapshot = snapshotWith([
+    { agent: "other_agent", nodeId: "node_other", allowPrivate: true, behaviorPrompt: "", version: 1 },
+  ]);
+  const deniedStrangerSnapshot = snapshotWith([
+    { agent: "kimi", nodeId: "node_x", allowPrivate: false, behaviorPrompt: "", version: 1 },
+  ]);
+
+  it("no-agent-entry: replies one placeholder notice and never runs the agent", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => noAgentEntrySnapshot,
+    });
+    await dispatcher.handle(inbound("user_9"), {
+      runTurn: async () => { throw new Error("must not run"); },
+    });
+    expect(deps.sent).toHaveLength(1);
+    expect(deps.sent[0].to).toBe("user_9");
+    expect(deps.sent[0].objectName).toBe("RC:TxtMsg");
+    const parsed = JSON.parse(deps.sent[0].content) as { content: string };
+    expect(parsed.content).toContain("kimi");
+    expect(parsed.content).toContain("无法响应");
+    expect(parsed.content).toContain("管理后台");
+  });
+
+  it("denied-stranger: placeholder says private chat is not open", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => deniedStrangerSnapshot,
+    });
+    await dispatcher.handle(inbound("stranger_1"), {
+      runTurn: async () => { throw new Error("must not run"); },
+    });
+    expect(deps.sent).toHaveLength(1);
+    const parsed = JSON.parse(deps.sent[0].content) as { content: string };
+    expect(parsed.content).toContain("未开放");
+  });
+
+  it("throttles: a burst from the same sender gets exactly one notice", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => noAgentEntrySnapshot,
+    });
+    for (let i = 0; i < 5; i += 1) {
+      await dispatcher.handle(inbound("user_burst"), {
+        runTurn: async () => { throw new Error("must not run"); },
+      });
+    }
+    expect(deps.sent).toHaveLength(1);
+  });
+
+  it("different senders each get their own notice (throttle is per-sender)", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => noAgentEntrySnapshot,
+    });
+    await dispatcher.handle(inbound("user_a"), { runTurn: async () => "x" });
+    await dispatcher.handle(inbound("user_b"), { runTurn: async () => "x" });
+    expect(deps.sent).toHaveLength(2);
+    expect(deps.sent[0].to).toBe("user_a");
+    expect(deps.sent[1].to).toBe("user_b");
+  });
+
+  it("throttle window expires: a later rejection gets a fresh notice", async () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      const dispatcher = new MessageDispatcher({
+        send: deps.send,
+        agentName: "kimi",
+        permissionNodeId: "node_x",
+        permissionSnapshot: () => noAgentEntrySnapshot,
+      });
+      const turns = { runTurn: async () => { throw new Error("must not run"); } };
+      await dispatcher.handle(inbound("user_later"), turns);
+      expect(deps.sent).toHaveLength(1);
+      vi.advanceTimersByTime(61_000);
+      await dispatcher.handle(inbound("user_later"), turns);
+      expect(deps.sent).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a send failure never breaks the message loop (logged only)", async () => {
+    const deps = makeDeps();
+    let calls = 0;
+    const dispatcher = new MessageDispatcher({
+      send: async () => {
+        calls += 1;
+        throw new Error("rate limited 20604");
+      },
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => noAgentEntrySnapshot,
+    });
+    // handle() 本身必须 resolve —— 回执失败只是记日志，绝不能往上抛。
+    await expect(dispatcher.handle(inbound("user_fail"), {
+      runTurn: async () => { throw new Error("must not run"); },
+    })).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+  });
+
+  it("fail-open branches (no-snapshot / unclaimed) still run the agent, no notice", async () => {
+    // no-snapshot：快照整份缺失 → 放行（旧行为不变，占位只属于拒绝分支）。
+    const depsA = makeDeps();
+    const dispatcherA = new MessageDispatcher({
+      send: depsA.send,
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => null,
+    });
+    await dispatcherA.handle(inbound("user_ok"), { runTurn: async () => "answer" });
+    expect(depsA.sent.some((f) => f.content.includes("无法响应"))).toBe(false);
+
+    // unclaimed-fail-open：allowPrivate=false 但没有主人 → 放行。
+    const depsB = makeDeps();
+    const dispatcherB = new MessageDispatcher({
+      send: depsB.send,
+      agentName: "kimi",
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => ({
+        ownerUserId: "",
+        ownerUserIdPresent: true,
+        agents: [{ agent: "kimi", nodeId: "node_x", allowPrivate: false, behaviorPrompt: "", version: 1 }],
+        updatedAt: Date.now(),
+      }),
+    });
+    await dispatcherB.handle(inbound("user_ok2"), { runTurn: async () => "answer" });
+    expect(depsB.sent.some((f) => f.content.includes("无法响应"))).toBe(false);
   });
 });
 

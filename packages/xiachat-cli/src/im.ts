@@ -353,6 +353,21 @@ interface ActiveStream {
   conversationId: string;
 }
 
+// 私聊闸门拒绝占位回执：同一发送者的节流窗口。窗口内多条被拒只回一条，
+// 防止融云离线重放（每次重连全量重发）把占位刷成消息风暴，也堵住「靠被拒
+// 消息触发回包」的放大攻击面。60s 对齐一次轮询周期，权限恢复后放行即止。
+const GATE_NOTICE_THROTTLE_MS = 60_000;
+
+// 占位文案：让发送方立刻知道「消息没被处理、为什么」，而不是 UI 永远转圈。
+// 按拒绝原因分两档：no-agent-entry 是本节点没在服务端权限快照里（绑定关系
+// 不同步 / 快照被写成空表），denied-stranger 是管理员显式关了私聊。
+function gateRejectNotice(reason: PrivateGateReason, agent: string): string {
+  if (reason === "no-agent-entry") {
+    return `（${agent} 本轮无法响应：本节点未获得私聊授权，请在管理后台检查权限配置）`;
+  }
+  return `（${agent} 本轮无法响应：管理员未开放该节点的私聊权限）`;
+}
+
 export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
   // iteration (html_revise) can rebuild context. Bounded: evicts oldest.
@@ -377,6 +392,12 @@ export class MessageDispatcher {
 
   /** 一次性提示的记账：同一原因只记一行，避免每条消息刷屏。 */
   private readonly loggedPrivateGateReasons = new Set<string>();
+
+  /**
+   * 占位回执的节流账本：fromUserId -> 上次发出占位的时间。
+   * Map 保序，超过上限就丢最老的（与 htmlCards / answeredCatalogRequests 同款）。
+   */
+  private readonly gateNoticeLastSentAt = new Map<string, number>();
 
   /**
    * 私聊闸门 + 该 agent 的行为规范。
@@ -453,6 +474,48 @@ export class MessageDispatcher {
     }
   }
 
+  /**
+   * 私聊闸门拒绝后的占位回执（2026-11-04 事故修复①）。
+   *
+   * 以前拒绝分支只丢消息不回包：发送方的 UI 永远停在「正在思考」（用户等了
+   * 40 分钟无人察觉）。现在回一条占位私聊，让用户**立刻**知道消息没被处理。
+   *
+   * 三条硬约束：
+   *  · **节流**：同一发送者 60s 窗口内只回一条（融云离线重放会一次重发整段
+   *    历史，不节流就是自己刷自己；也是对「触发回包」攻击面的收敛）；
+   *  · **绝不抛错**：发送失败只记日志 —— 回执是善意提示，不能反过来打断
+   *    消息循环；
+   *  · 只覆盖两个「确定拒绝」的分支（no-agent-entry / denied-stranger）；
+   *    fail-open 分支（no-snapshot / unclaimed-fail-open）本来就会继续执行，
+   *    无需占位。
+   */
+  private async sendGateRejectNotice(reason: PrivateGateReason, fromUserId: string): Promise<void> {
+    if (reason !== "no-agent-entry" && reason !== "denied-stranger") return;
+    const now = Date.now();
+    const lastSentAt = this.gateNoticeLastSentAt.get(fromUserId) ?? 0;
+    if (now - lastSentAt < GATE_NOTICE_THROTTLE_MS) return;
+    this.gateNoticeLastSentAt.set(fromUserId, now);
+    while (this.gateNoticeLastSentAt.size > 256) {
+      const oldest = this.gateNoticeLastSentAt.keys().next().value;
+      if (oldest === undefined) break;
+      this.gateNoticeLastSentAt.delete(oldest);
+    }
+    const agent = this.deps.agentName || this.deps.permissionNodeId || "agent";
+    const notice = gateRejectNotice(reason, agent);
+    console.log(
+      `im out: 私聊闸门拒绝占位已回执 from=${fromUserId} reason=${reason}`
+      + ` node=${this.deps.permissionNodeId || this.deps.agentName || "?"}`,
+    );
+    try {
+      await this.deps.send(fromUserId, "RC:TxtMsg", JSON.stringify({ content: notice }));
+    } catch (err) {
+      console.error(
+        "private gate notice send failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
   async handle(msg: InboundIMMessage, turns: TurnRunner): Promise<void> {
     // Never answer our own messages: see DispatcherDeps.selfUserId.
     if (this.isOwnMessage(msg)) {
@@ -494,8 +557,11 @@ export class MessageDispatcher {
       const gate = this.privateGate(msg.fromUserId);
       this.logPrivateGate(gate.reason, msg.fromUserId);
       if (!gate.allow) {
-        // **不回复**「无权限」：那会把闸门变成探测信道（陌生人能靠回包确认这里有
-        // 活的 agent），也违背「安静地不理」这个产品语义。只留一行本机日志。
+        // 拒绝不能静默：占位回执让发送方的 UI 立刻落定（2026-11-04 事故里
+        // 8 条 `private chat dropped (no-agent-entry)` 换来用户 40 分钟转圈）。
+        // 占位本身带 60s 节流、失败只记日志（见 sendGateRejectNotice）。
+        // 注意这仍然不是「对话能力」：占位只说明本轮没被处理，不执行 agent。
+        await this.sendGateRejectNotice(gate.reason, msg.fromUserId);
         return;
       }
       // `/use-model` 是 web 切模型发的**文本命令**（设备管理里选模型、圆桌里
