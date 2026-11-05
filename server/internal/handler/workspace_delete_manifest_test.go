@@ -80,6 +80,12 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	// 属 installation 级用户偏好。workspace 拆除不得触碰：删一个工作区不该清掉
 	// 用户对整本通讯录的私有标注（该表也刻意零外键，见 608 up 的说明）。
 	"im_contact_remark":                  workspaceDeleteKeep,
+	// 通讯录分组（606）：im_contact_group 按 user_id 归属、im_contact_group_member
+	// 是 (user_id, node_id) 的成员行，两表都没有 workspace_id —— 与
+	// im_contact_remark 同理属 installation 级用户数据。workspace 拆除不得触碰：
+	// 删一个工作区不该清空用户整本通讯录的分组。
+	"im_contact_group":                   workspaceDeleteKeep,
+	"im_contact_group_member":            workspaceDeleteKeep,
 	"client_usage_daily":                 workspaceDeleteDetach,
 	"comment":                            workspaceDelete,
 	"comment_reaction":                   workspaceDelete,
