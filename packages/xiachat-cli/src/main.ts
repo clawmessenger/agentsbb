@@ -14,6 +14,7 @@ import {
   type ObservedAgentState,
 } from "./api.js";
 import { discoverAgents, syncAgentPermissionConfig, type AgentInfo } from "./agents.js";
+import { AgentCliInfoProbe } from "./agent-runtime-info.js";
 import {
   loadPermissionSnapshot,
   mergePermissionSnapshot,
@@ -280,6 +281,17 @@ export interface BuildProgramOpts {
    * 测试里不该碰用户机器。
    */
   serviceHealth?: () => { ready: boolean; detail: string } | null;
+  /**
+   * 各 agent CLI 的路径/版本探测器（见 agent-runtime-info.ts）。默认按 6 小时
+   * TTL 落盘缓存、后台刷新；测试注入以便断言上报字段而不真的起 `--version`。
+   */
+  agentCliInfoProbe?: AgentCliInfoProbeLike;
+}
+
+/** AgentCliInfoProbe 的结构子集（注入用，避免测试依赖具体实现类）。 */
+export interface AgentCliInfoProbeLike {
+  snapshot: () => Map<string, { agent: string; cliPath: string; cliVersion: string }>;
+  refresh: (agents: string[], opts?: { force?: boolean }) => void;
 }
 
 /** 升级资产下载用的 fetch（self-update.ts 的 FetchLike，测试可替换）。 */
@@ -1158,6 +1170,11 @@ export function buildProgram(opts: BuildProgramOpts): Command {
             ? { controlPollIntervalMs: opts.supervisorControlPollMs }
             : {}),
           ...(serviceHealthFn ? { serviceHealth: serviceHealthFn } : {}),
+          // agent CLI 的路径/版本探测器：默认由 supervisor 自建（6 小时 TTL 落盘
+          // 缓存），测试注入空表以避免依赖开发机装了什么。
+          ...(opts.agentCliInfoProbe !== undefined
+            ? { agentCliInfoProbe: opts.agentCliInfoProbe }
+            : {}),
           // 不管是 `clawmessenger start` 拉起的，还是用户在终端里直接 `run`，
           // supervisor 都把自己的运行状态写下来 —— 于是 status / stop 都能看到它，
           // 顺带实现「前台跑着时 start 会拒绝，避免两份 supervisor 抢同一批 agent」。
@@ -1846,6 +1863,11 @@ interface RunSupervisorOpts {
    * （`node bin.ts run` / 测试），此时不上报该字段，服务端按「未知」处理。
    */
   serviceHealth?: () => { ready: boolean; detail: string } | null;
+  /**
+   * 各 agent CLI 的路径/版本探测器（见 agent-runtime-info.ts）。默认 6 小时 TTL
+   * 落盘缓存 + 后台刷新；测试注入以便断言上报字段而不真的起 `--version`。
+   */
+  agentCliInfoProbe?: AgentCliInfoProbeLike;
 }
 
 // --- supervised child restarts --------------------------------------------
@@ -2505,9 +2527,17 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
    */
   const serviceHealth = supervisor.serviceHealth?.() ?? null;
 
+  /**
+   * 各 agent CLI 的路径/版本。**只读内存快照**，绝不在这里起子进程：轮询 10 秒
+   * 一拍，探测一次 `--version` 就要几百毫秒到数秒。首次运行为空表，后台探完
+   * 下一轮自然带上；TTL（6 小时）到了或新绑了 agent 才重探。
+   */
+  const cliInfoProbe = supervisor.agentCliInfoProbe ?? new AgentCliInfoProbe();
+
   /** 当前各 agent 的实际状态（启停回执），每轮轮询上报。 */
-  const observedNow = (): ObservedAgentState[] =>
-    observedAgentStates(
+  const observedNow = (): ObservedAgentState[] => {
+    const cliInfo = cliInfoProbe.snapshot();
+    return observedAgentStates(
       [...managed].map(([key, entry]) => ({
         key,
         state: entry.state,
@@ -2517,7 +2547,17 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
         ...(entry.seenVersion !== undefined ? { seenVersion: entry.seenVersion } : {}),
       })),
       bound.map((agent) => agent.agent),
-    );
+    ).map((state) => {
+      const info = cliInfo.get(state.agent);
+      if (!info) return state;
+      // 只补探测到的字段：没探到就别带空串，服务端按「缺省=保留旧值」处理。
+      return {
+        ...state,
+        ...(info.cliPath ? { cliPath: info.cliPath } : {}),
+        ...(info.cliVersion ? { cliVersion: info.cliVersion } : {}),
+      };
+    });
+  };
 
   /** 上次看到的期望状态与版本。失败时返回空 Map，applyControlStates 读作
    * 「什么都别改」—— 服务端抖动绝不能把操作员留着运行的 agent 停掉。 */
@@ -2527,6 +2567,10 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   }> => {
     const desired = new Map<string, ControlIntent>();
     try {
+      // 后台刷一次 agent CLI 的路径/版本（TTL 内/正在探时是空操作）。放这里是
+      // 因为它天然是「每 10 秒一次」的心跳点：探测失败只影响版本号晚几轮才有，
+      // 完全不影响下面的启停与升级。
+      cliInfoProbe.refresh(bound.map((agent) => agent.agent));
       const snapshot = await api.fetchDeviceControl(nodeID, credentialID, deviceSecret, {
         version: currentVersion,
         platform: platformTag,

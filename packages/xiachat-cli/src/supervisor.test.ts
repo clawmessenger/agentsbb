@@ -150,6 +150,12 @@ function makeHarness(
     })) as never,
     // 默认不真的 spawn `__relaunch`：那会多出一个子进程并影响子进程计数断言。
     relaunch: () => {},
+    // agent CLI 的版本/路径探测同样不该真的跑：默认实现会读宿主机
+    // ~/.clawmessenger/agent-cli-info.json 并起 `<cli> --version` 子进程，
+    // 于是「observed 里只有 agent/state/version」这类断言会随开发机装了什么
+    // 而飘（本机就真的探出了 opencode 1.19.4）。用例只关心上报管道，
+    // 需要断言字段时由单个用例用 overrides 注入带值的 stub。
+    agentCliInfoProbe: { snapshot: () => new Map(), refresh: () => {} },
     ...overrides,
   });
 
@@ -1371,5 +1377,46 @@ describe("常驻自愈与启停回执随轮询上报", () => {
     await realSleep(CONTROL_TICK_MS * 3);
     const last = vi.mocked(h.api.fetchDeviceControl).mock.calls.at(-1)?.[3];
     expect(last?.observed).toEqual([{ agent: "ops", state: "running", version: 0 }]);
+  });
+
+  // 「智能体版本」「安装目录」两栏的数据来源（迁移 612）：随 observed 一起上报。
+  // 这两条字段缺了，页面就只能继续显示 supervisor 自己的版本与目录 —— 正是
+  // 2026-11-05 反馈的那个问题。
+  it("探测到的 agent CLI 路径/版本随 observed 上报", async () => {
+    const h = makeHarness([], BOUND_OPS, {
+      agentCliInfoProbe: {
+        snapshot: () => new Map([["ops", {
+          agent: "ops",
+          cliPath: "C:\\nvm4w\\nodejs\\opencode.cmd",
+          cliVersion: "1.19.4",
+        }]]),
+        refresh: () => {},
+      },
+    });
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+    await realSleep(CONTROL_TICK_MS * 3);
+
+    const calls = vi.mocked(h.api.fetchDeviceControl).mock.calls;
+    const report = calls[calls.length - 1][3];
+    expect(report?.observed?.[0]).toMatchObject({
+      agent: "ops",
+      state: "running",
+      version: 0,
+      cliPath: "C:\\nvm4w\\nodejs\\opencode.cmd",
+      cliVersion: "1.19.4",
+    });
+  });
+
+  // 没探到就不带字段：服务端按「缺省 = 保留旧值」处理，带空串会把已知版本抹掉。
+  it("没有探测结果时不带空串的 cli 字段", async () => {
+    const h = makeHarness([], BOUND_OPS);
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+    await realSleep(CONTROL_TICK_MS * 3);
+
+    const calls = vi.mocked(h.api.fetchDeviceControl).mock.calls;
+    const observed = calls[calls.length - 1][3]?.observed ?? [];
+    expect(observed).toHaveLength(1);
+    expect("cliPath" in observed[0]).toBe(false);
+    expect("cliVersion" in observed[0]).toBe(false);
   });
 });

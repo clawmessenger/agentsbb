@@ -303,6 +303,16 @@ type clawAdminNodeRow struct {
 	// InstallDir 是设备上报的 CLI 安装目录（exe 所在文件夹）。详情页用它给出精确
 	// 到路径的排查指引。空串 = 从未上报（老 CLI 不带 installDir），页面显示「-」。
 	InstallDir string `json:"install_dir,omitempty"`
+	// ---- 智能体 CLI 自己的版本与路径（迁移 612）-------------------------------
+	//
+	// 上面三个字段（ExeVersion/ExePlatform/InstallDir）描述的是 **clawmessenger
+	// 自己**（supervisor）。详情页讲的却是「某个智能体」：运维要知道 codex 装的是
+	// 哪个版本、二进制在哪个目录，出问题时要直接去那儿翻日志、换二进制。所以
+	// 「版本」「安装目录」两栏展示这一组，supervisor 的版本另列（升级要用）。
+	//
+	// 空串 = 设备没探到（agent CLI 不在 PATH / 老 CLI 未上报），页面显示「-」。
+	AgentCLIVersion string `json:"agent_cli_version,omitempty"`
+	AgentCLIPath    string `json:"agent_cli_path,omitempty"`
 	// ReportedAt 是设备最近一次上报 reported_* 字段的时间（10 秒心跳保活刷新），
 	// 供详情页判断数据新鲜度。与 UpgradeUpdatedAt 的分工：后者是整行 updated_at
 	//（含管理端下发指令），前者才回答「设备数据是什么时候说的」。
@@ -428,9 +438,51 @@ func (h *Handler) clawAdminAttachUpgrade(row clawAdminNodeRow, rec clawAdminNode
 	return row
 }
 
+// clawNodeAgentCLI 是 rongcloud_node_agent_cli 的一行：某个 agent 自己的 CLI
+// 版本与安装路径（设备侧探测后上报，见 CLI 的 agent-runtime-info.ts）。
+type clawNodeAgentCLI struct {
+	CLIVersion string
+	CLIPath    string
+	ProbedAt   pgtype.Timestamptz
+}
+
+// clawNodeAgentCLIByNode 取**一个节点**的 agent CLI 信息。
+//
+// 详情页 / C 端状态探针一次只问一个节点，按 node_id 主键查比全表捞再筛便宜，
+// 也不会被「同机多个 agent」混淆（那正是这张表按节点建的原因）。
+//
+// 迁移没跑（表不存在）时返回 found=false 而不是报错：这属于「还没上这个功能」，
+// 不该让整个详情页 500。
+func (h *Handler) clawNodeAgentCLIByNode(ctx context.Context, nodeID pgtype.UUID) (clawNodeAgentCLI, bool) {
+	if h.DB == nil || !nodeID.Valid {
+		return clawNodeAgentCLI{}, false
+	}
+	var out clawNodeAgentCLI
+	err := h.DB.QueryRow(ctx, `
+		SELECT cli_version, cli_path, probed_at
+		  FROM rongcloud_node_agent_cli
+		 WHERE node_id = $1`, nodeID).Scan(&out.CLIVersion, &out.CLIPath, &out.ProbedAt)
+	if err != nil {
+		return clawNodeAgentCLI{}, false
+	}
+	return out, true
+}
+
+// clawAdminAttachAgentCLI 把 agent CLI 的版本/路径贴到行投影上。
+//
+// 与 clawAdminAttachUpgrade 分开的理由相同（不动物理签名被钉住的函数），而且
+// 语义本来就是两组字段：那一组是 supervisor 的环境，这一组是智能体自己的。
+func clawAdminAttachAgentCLI(row clawAdminNodeRow, cli clawNodeAgentCLI, found bool) clawAdminNodeRow {
+	if !found {
+		return row
+	}
+	row.AgentCLIVersion = cli.CLIVersion
+	row.AgentCLIPath = cli.CLIPath
+	return row
+}
+
 // clawAdminNodeControl 是 rongcloud_node_control 的一行（运维期望状态 + 设备回执）。
-type clawAdminNodeControl struct {
-	DesiredState   string
+type clawAdminNodeControl struct {	DesiredState   string
 	DesiredVersion int64
 	// Applied* 是设备对这条指令的执行回执（迁移 611）。从未上报时 AppliedAt 无效，
 	// 页面据此显示「待设备确认」而不是「失败」—— 这两件事必须分开，否则离线设备
@@ -720,8 +772,12 @@ func (h *Handler) ClawAdminGetNode(w http.ResponseWriter, r *http.Request) {
 		h.clawAdminNodeControls(ctx)[uuidToText(rec.ID)],
 	)
 	allRecords, _ := h.clawAdminListNodeRecords(ctx)
-	clawAdminOK(w, h.clawAdminAttachUpgrade(
-		row, rec, h.clawAdminNodeUpgrades(ctx), h.clawAdminMachineNames(allRecords, names)))
+	row = h.clawAdminAttachUpgrade(
+		row, rec, h.clawAdminNodeUpgrades(ctx), h.clawAdminMachineNames(allRecords, names))
+	// 智能体自己的 CLI 版本/路径：详情页「版本」「安装目录」两栏展示的是它，
+	// 不是上面 ExeVersion/InstallDir（那是 supervisor 自己的）。
+	agentCLI, cliFound := h.clawNodeAgentCLIByNode(ctx, rec.ID)
+	clawAdminOK(w, clawAdminAttachAgentCLI(row, agentCLI, cliFound))
 }
 
 func (h *Handler) ClawAdminGetNodeStatus(w http.ResponseWriter, r *http.Request) {

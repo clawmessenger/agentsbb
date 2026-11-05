@@ -40,7 +40,23 @@ type clawDeviceObservedState struct {
 	// 与 desired_version 比：>= 说明这条指令设备已经看过了。
 	Version int64  `json:"version"`
 	Error   string `json:"error"`
+	// CliPath/CliVersion 是**这个 agent 自己的 CLI** 的安装路径与版本（迁移 612）。
+	//
+	// 与机器维度的 install_dir / exe_version 分工：那两列讲的是 supervisor
+	// （clawmessenger 自己），这两列讲的是真正干活的 codex/opencode/qwen。后台
+	// 「设备详情」的「安装目录」「版本」展示的是这两个 —— 运维要翻的是 agent 的
+	// 日志，不是 supervisor 的目录。空串 = 设备没探到（没装 / 超时），写入端
+	// 保留旧值而不是把已知版本抹掉。
+	CliPath    string `json:"cliPath"`
+	CliVersion string `json:"cliVersion"`
 }
+
+// 设备上报的 CLI 路径/版本长度上限。版本串本来就短，路径在 Windows 上受
+// MAX_PATH 限制；这里只防一条恶意/异常的超长串把页面撑爆。
+const (
+	clawCliPathMaxLen    = 512
+	clawCliVersionMaxLen = 64
+)
 
 // clawAppliedErrorMaxLen 限制回执错误文本长度（设备侧可能是整段 stderr）。
 const clawAppliedErrorMaxLen = 200
@@ -97,6 +113,34 @@ func (h *Handler) clawDeviceRecordAppliedStates(
 			        OR applied_error IS DISTINCT FROM $3)`,
 			state, item.Version, detail, nodeUUID); err != nil && firstErr == nil {
 			firstErr = err
+		}
+		// 智能体 CLI 的版本/路径（迁移 612，独立的 rongcloud_node_agent_cli）。
+		//
+		// 为什么不写进 rongcloud_node_control：那张表的行只在管理端操作过启停时
+		// 才存在（只 UPDATE 不 INSERT）。挂上去等于「从没被点过启动的 agent 永远
+		// 没有版本」，而凭空 INSERT 会带上 desired_state、被设备当成真实意图执行。
+		//
+		// COALESCE(NULLIF(...)) 保留旧值的语义：这次没探到（超时 / 临时不在 PATH）
+		// 就不要把已知版本抹成空串，否则页面上的版本号会在有/无之间闪；WHERE 里
+		// 再判一次「真的变了才写」，避免每轮 10 秒都刷 probed_at。
+		cliPath := clawTruncateRunes(strings.TrimSpace(item.CliPath), clawCliPathMaxLen)
+		cliVersion := clawTruncateRunes(strings.TrimSpace(item.CliVersion), clawCliVersionMaxLen)
+		if cliPath != "" || cliVersion != "" {
+			if _, err := h.DB.Exec(ctx, `
+				INSERT INTO rongcloud_node_agent_cli (node_id, cli_version, cli_path, probed_at, updated_at)
+				VALUES ($1, $2, $3, now(), now())
+				ON CONFLICT (node_id) DO UPDATE
+				   SET cli_version = COALESCE(NULLIF(EXCLUDED.cli_version, ''), rongcloud_node_agent_cli.cli_version),
+				       cli_path = COALESCE(NULLIF(EXCLUDED.cli_path, ''), rongcloud_node_agent_cli.cli_path),
+				       probed_at = now(),
+				       updated_at = now()
+				 WHERE rongcloud_node_agent_cli.cli_version IS DISTINCT FROM
+				           COALESCE(NULLIF(EXCLUDED.cli_version, ''), rongcloud_node_agent_cli.cli_version)
+				    OR rongcloud_node_agent_cli.cli_path IS DISTINCT FROM
+				           COALESCE(NULLIF(EXCLUDED.cli_path, ''), rongcloud_node_agent_cli.cli_path)`,
+				nodeUUID, cliVersion, cliPath); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr

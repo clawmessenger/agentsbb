@@ -84,6 +84,17 @@ export interface ObservedAgentState {
   version: number;
   /** 失败/缺失的原因，一句话（服务端会截断后存)。 */
   error?: string;
+  /**
+   * 这个 agent 的 CLI 可执行文件绝对路径（见 agent-runtime-info.ts）。
+   *
+   * 与随轮询上报的 `installDir` 不是一回事：后者是 **clawmessenger 自己**的
+   * 安装目录，这个是「真正干活的智能体二进制在哪」。后台/移动端详情页的
+   * 「安装目录」展示后者 —— 运维要翻的是 agent 的日志，不是 supervisor 的。
+   * 探测不到时整个字段缺省（老服务端忽略未知字段，新服务端保留旧值）。
+   */
+  cliPath?: string;
+  /** 该 agent CLI 自报的版本（如 `0.48.0`）。缺省 = 没探到。 */
+  cliVersion?: string;
 }
 
 // 服务端下发的 exe 升级指令（POST /api/claw/device/control 响应里的 upgrade）。

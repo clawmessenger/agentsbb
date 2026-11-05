@@ -1239,6 +1239,21 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 				resp["reported_at"] = upgrade.ReportedAt.Time.UTC().Format(time.RFC3339)
 			}
 		}
+		// 智能体自己的 CLI 版本与路径（迁移 612）：三端详情页的「版本」「安装目录」
+		// 展示的是这一组，不是上面机器维度的 exe_version/install_dir —— 后者是
+		// supervisor（clawmessenger 自己）的，运维要看的是 codex/opencode 的。
+		//
+		// 按**节点**查而不是按机器：一台机器上可能同时跑 codex、opencode、qwen，
+		// 各自的 CLI 版本不同。查不到（老 CLI 未上报 / 迁移没跑）就不下发该字段，
+		// 前端显示「-」，不要拿 supervisor 的版本兜底。
+		if cli, found := h.clawNodeAgentCLIByNode(r.Context(), node.ID); found {
+			if cli.CLIVersion != "" {
+				resp["agent_cli_version"] = cli.CLIVersion
+			}
+			if cli.CLIPath != "" {
+				resp["agent_cli_path"] = cli.CLIPath
+			}
+		}
 	}
 	clawJSON(w, 200, 200, "", resp)
 }
