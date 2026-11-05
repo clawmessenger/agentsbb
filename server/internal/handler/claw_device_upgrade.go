@@ -78,7 +78,15 @@ type clawNodeUpgrade struct {
 	RemoteIP string
 	// RemoteIPAt 是最近一次观测到该地址的时间。与 ReportedAt 分开：后者只在设备
 	// 带版本/主机名上报时刷新，而 IP 每轮轮询都能确认，用它判断 IP 是否过期。
-	RemoteIPAt         pgtype.Timestamptz
+	RemoteIPAt pgtype.Timestamptz
+	// ServiceReady 表示这台机器的**常驻自愈**是否就位：崩溃/被杀掉之后会不会自己
+	// 回来。Windows 看「计划任务看门狗装没装上」，Linux/macOS 看 systemd/launchd
+	// 单元在不在。false + ServiceAt 有效 = 明确知道没就位（页面要红字告警）；
+	// ServiceAt 为 NULL = 老 CLI 从未上报，页面不下结论（三态，别混成两态）。
+	ServiceReady bool
+	// ServiceDetail 是给人看的说明（如「计划任务注册被拒绝：schtasks failed」）。
+	ServiceDetail      string
+	ServiceAt          pgtype.Timestamptz
 	ReportedAt         pgtype.Timestamptz
 	ReportedGeneration int64
 	TargetVersion      string
@@ -189,6 +197,51 @@ func (h *Handler) clawDeviceRecordRemoteIP(
 	return err
 }
 
+// clawServiceDetailMaxLen 限制上报的诊断文本长度。
+//
+// 为什么要在服务端截断：这段文本来自设备（可能是 schtasks 的整段 stderr），而
+// 它只用于页面展示与排障。不截断的话一条病态长文本会跟着列表每一行返回；截断
+// 200 字足以看清「谁拒绝了什么」。
+const clawServiceDetailMaxLen = 200
+
+// clawDeviceRecordServiceHealth 记录设备上报的**常驻自愈**状态。
+//
+// 为什么需要这个字段：管理端的「启动/停止」只写期望状态，真正执行的是设备上的
+// supervisor。只要 supervisor 不在（崩溃后没人拉起、计划任务被安全软件拦掉），
+// 页面上的按钮就永远是「待设备执行」，而服务端对此一无所知 —— 运维只能一台台
+// 上机看。设备自己知道它有没有装自愈，让它随 10 秒轮询报上来是最便宜的办法。
+//
+// 空值语义：ready 用 *bool 让调用方区分「设备没带这个字段」（老 CLI）与「设备说
+// 没就位」；只有带了才写，老 CLI 混跑期间不会把已上报的值擦成 false。
+func (h *Handler) clawDeviceRecordServiceHealth(
+	ctx context.Context,
+	machineNode db.RongcloudNode,
+	ready *bool,
+	detail string,
+) error {
+	if h.DB == nil || ready == nil {
+		return nil
+	}
+	detail = strings.TrimSpace(detail)
+	if len(detail) > clawServiceDetailMaxLen {
+		// 按 rune 截断，别把一个多字节汉字切成半个（pgx 会直接报错）。
+		runes := []rune(detail)
+		if len(runes) > clawServiceDetailMaxLen {
+			detail = string(runes[:clawServiceDetailMaxLen])
+		}
+	}
+	_, err := h.DB.Exec(ctx, `
+		INSERT INTO rongcloud_node_upgrade
+			(machine_id, node_id, workspace_id, service_ready, service_detail, service_at)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (machine_id) DO UPDATE
+		   SET service_ready = EXCLUDED.service_ready,
+		       service_detail = EXCLUDED.service_detail,
+		       service_at = now()`,
+		machineIDForDevice(machineNode), machineNode.ID, machineNode.WorkspaceID, *ready, detail)
+	return err
+}
+
 // clawDeviceObservedIP 解析「服务端看到的设备来源地址」。
 //
 // 直连且来源是公网地址时，X-Forwarded-For / X-Real-IP 一概不采信：那种拓扑下
@@ -257,6 +310,7 @@ const clawNodeUpgradeColumns = `
 	machine_id, node_id, workspace_id,
 	reported_version, reported_platform, reported_hostname, install_dir,
 	remote_ip, remote_ip_at,
+	service_ready, service_detail, service_at,
 	reported_at, reported_generation,
 	target_version, desired_generation, status, error_code, error_detail,
 	force, batch_id, wave, requested_by, requested_at, updated_at`
@@ -283,6 +337,7 @@ func scanClawNodeUpgrade(row pgx.Row) (clawNodeUpgrade, error) {
 	err := row.Scan(&up.MachineID, &up.NodeID, &up.WorkspaceID,
 		&up.ReportedVersion, &up.ReportedPlatform, &up.ReportedHostname, &up.InstallDir,
 		&up.RemoteIP, &up.RemoteIPAt,
+		&up.ServiceReady, &up.ServiceDetail, &up.ServiceAt,
 		&up.ReportedAt,
 		&up.ReportedGeneration,
 		&up.TargetVersion, &up.DesiredGeneration, &up.Status, &up.ErrorCode, &up.ErrorDetail,

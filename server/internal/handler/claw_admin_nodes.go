@@ -263,6 +263,25 @@ type clawAdminNodeRow struct {
 	Controllable   bool   `json:"controllable"`
 	DesiredState   string `json:"desired_state,omitempty"`
 	DesiredVersion int64  `json:"desired_version,omitempty"`
+	// ---- 启停的可验证性（迁移 611）--------------------------------------------
+	//
+	// ControlState 是「这条指令到哪一步了」的结论，由 desired_* 与设备回执折算：
+	//   applied —— 设备已确认（回执版本追平下发版本、且实际状态就是期望状态）
+	//   pending —— 已下发但设备还没确认（离线 / 老 CLI / 刚下发还没轮到下一轮轮询）
+	//   failed  —— 设备明确说做不到（本机没装这个 agent 的 CLI、或起过就崩）
+	// 没有它，页面只能显示「待执行」—— 而「待执行 8 小时」和「5 秒前刚点」长得一样。
+	ControlState  string `json:"control_state,omitempty"`
+	ControlDetail string `json:"control_detail,omitempty"`
+	AppliedState  string `json:"applied_state,omitempty"`
+	ControlAt     string `json:"control_applied_at,omitempty"`
+	// ---- 常驻自愈（迁移 611）--------------------------------------------------
+	//
+	// ServiceReadyKnown=false 表示老 CLI 从未上报过，页面不下结论（不是「没就位」）。
+	// ServiceReady=false 且 Known=true 才是「这台机器掉线后不会自己回来」。
+	ServiceReady      bool   `json:"service_ready"`
+	ServiceReadyKnown bool   `json:"service_ready_known"`
+	ServiceDetail     string `json:"service_detail,omitempty"`
+	ServiceAt         string `json:"service_at,omitempty"`
 	// 机器维度（exe 归属）：同一台机器上的多个 agent 行共享一个 machine_id，
 	// 也就共享一个 exe 版本与一个升级任务。页面的「exe 版本」列与「升级」按钮
 	// 都按 machine_id 聚合，避免同机重复下载。
@@ -391,6 +410,13 @@ func (h *Handler) clawAdminAttachUpgrade(row clawAdminNodeRow, rec clawAdminNode
 	if upgrade.ReportedAt.Valid {
 		row.ReportedAt = upgrade.ReportedAt.Time.UTC().Format(time.RFC3339)
 	}
+	// 常驻自愈：三态。ServiceAt 为空 = 老 CLI 没报过，Known 保持 false，页面不下结论。
+	if upgrade.ServiceAt.Valid {
+		row.ServiceReadyKnown = true
+		row.ServiceReady = upgrade.ServiceReady
+		row.ServiceDetail = upgrade.ServiceDetail
+		row.ServiceAt = upgrade.ServiceAt.Time.UTC().Format(time.RFC3339)
+	}
 	row.UpgradeStatus = upgrade.Status
 	row.UpgradeTarget = upgrade.TargetVersion
 	if upgrade.ErrorCode != "" {
@@ -402,17 +428,26 @@ func (h *Handler) clawAdminAttachUpgrade(row clawAdminNodeRow, rec clawAdminNode
 	return row
 }
 
-// clawAdminNodeControl 是 rongcloud_node_control 的一行（运维期望状态）。
+// clawAdminNodeControl 是 rongcloud_node_control 的一行（运维期望状态 + 设备回执）。
 type clawAdminNodeControl struct {
 	DesiredState   string
 	DesiredVersion int64
+	// Applied* 是设备对这条指令的执行回执（迁移 611）。从未上报时 AppliedAt 无效，
+	// 页面据此显示「待设备确认」而不是「失败」—— 这两件事必须分开，否则离线设备
+	// 会被误判成故障。
+	AppliedState   string
+	AppliedVersion int64
+	AppliedError   string
+	AppliedAt      pgtype.Timestamptz
 }
 
 // clawAdminNodeControls 取全部已下发的期望状态指令，键是 rongcloud_node.id 的
 // 文本形式。表量级 = 被操作过的节点数，全量取比在页面循环里逐条查便宜。
 func (h *Handler) clawAdminNodeControls(ctx context.Context) map[string]clawAdminNodeControl {
 	out := make(map[string]clawAdminNodeControl, 4)
-	rows, err := h.DB.Query(ctx, `SELECT node_id, desired_state, desired_version FROM rongcloud_node_control`)
+	rows, err := h.DB.Query(ctx, `SELECT node_id, desired_state, desired_version,
+		applied_state, applied_version, applied_error, applied_at
+		FROM rongcloud_node_control`)
 	if err != nil {
 		return out
 	}
@@ -420,7 +455,8 @@ func (h *Handler) clawAdminNodeControls(ctx context.Context) map[string]clawAdmi
 	for rows.Next() {
 		var nodeUUID pgtype.UUID
 		var ctl clawAdminNodeControl
-		if err := rows.Scan(&nodeUUID, &ctl.DesiredState, &ctl.DesiredVersion); err != nil {
+		if err := rows.Scan(&nodeUUID, &ctl.DesiredState, &ctl.DesiredVersion,
+			&ctl.AppliedState, &ctl.AppliedVersion, &ctl.AppliedError, &ctl.AppliedAt); err != nil {
 			continue
 		}
 		out[uuidToText(nodeUUID)] = ctl
@@ -522,6 +558,15 @@ func (h *Handler) clawAdminNodeRowFor(rec clawAdminNodeRecord, name, description
 		Controllable:     rongcloud.IsDisplayNode(rec.dbNode()),
 		DesiredState:     ctl.DesiredState,
 		DesiredVersion:   ctl.DesiredVersion,
+	}
+	// 指令结论只在**真的下发过**时才有意义：DesiredState 为空 = 这台 agent 从未被
+	// 启停过（服务端基线就是 running），此时给个「已生效」会凭空多出一条状态。
+	if ctl.DesiredState != "" {
+		row.ControlState, row.ControlDetail = clawAppliedOutcome(ctl.DesiredState, ctl.DesiredVersion, ctl)
+		row.AppliedState = ctl.AppliedState
+		if ctl.AppliedAt.Valid {
+			row.ControlAt = ctl.AppliedAt.Time.UTC().Format(time.RFC3339)
+		}
 	}
 	if claimant != "" {
 		row.UserID = claimant

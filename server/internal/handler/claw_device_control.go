@@ -73,6 +73,15 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		// 供后台详情页给用户精确到路径的排查指引。旧 CLI 不带：为空则 upsert
 		// 保留库里已有值，不会把已上报的目录擦掉。
 		InstallDir string `json:"installDir"`
+		// ServiceReady 是这台机器的**常驻自愈**是否就位（掉线后会不会自己回来）。
+		// 用 *bool 而不是 bool：老 CLI 根本不带这个字段，若按 false 处理会把所有
+		// 存量设备误标成「不会自愈」；只有明确带了才落库。
+		ServiceReady *bool `json:"serviceReady"`
+		// ServiceDetail 是没就位的原因，给人看的一句话（页面直接显示）。
+		ServiceDetail string `json:"serviceDetail"`
+		// Observed 是设备对本机各 agent **实际状态**的回执（见 clawDeviceObservedState）。
+		// 服务端把它贴在对应的控制指令行上，页面才能把「已下发」与「已生效/失败」分开。
+		Observed []clawDeviceObservedState `json:"observed"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
 		req.NodeID == "" || req.CredentialID == "" || req.Secret == "" {
@@ -140,6 +149,18 @@ func (h *Handler) ClawDeviceControl(w http.ResponseWriter, r *http.Request) {
 		// （服务端看到的就是这台机器出口）。同样是失败不影响启停。
 		if err := h.clawDeviceRecordRemoteIP(r.Context(), machineNode, clawDeviceObservedIP(r)); err != nil {
 			slog.Warn("claw: device remote ip record failed",
+				"machine", machineIDForDevice(machineNode), "error", err)
+		}
+		// 常驻自愈状态：没就位就意味着「这台机器掉线后不会自己回来」，页面要能说出来。
+		// 与版本上报一样，失败不影响启停。
+		if err := h.clawDeviceRecordServiceHealth(r.Context(), machineNode, req.ServiceReady, req.ServiceDetail); err != nil {
+			slog.Warn("claw: device service health record failed",
+				"machine", machineIDForDevice(machineNode), "error", err)
+		}
+		// 启停回执：设备说它现在实际是什么状态。写在读期望状态之后、返回之前都行，
+		// 因为这一轮的响应已经按「读到的期望」构造好了 —— 回执只影响管理端页面。
+		if err := h.clawDeviceRecordAppliedStates(r.Context(), refs, req.Observed); err != nil {
+			slog.Warn("claw: device control ack record failed",
 				"machine", machineIDForDevice(machineNode), "error", err)
 		}
 		intent, err := h.clawDeviceUpgradeIntent(r.Context(), machineNode, version)
