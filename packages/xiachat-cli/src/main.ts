@@ -1560,6 +1560,21 @@ export const SUPERVISOR_RESTART_BACKOFF_MS = 5 * 60_000;
 export const SUPERVISOR_HEALTHY_UPTIME_MS = 60_000;
 /** How often the supervisor asks the server for operator-desired run-states. */
 export const SUPERVISOR_CONTROL_POLL_MS = 10_000;
+
+/**
+ * 看门狗节奏（修复②）：检测周期与「心跳陈旧」阈值。
+ *
+ * 周期 = 轮询间隔 × 3（生产 10s → 30s 查一次），下限 1s 防 0/负值；
+ * 阈值 = 轮询间隔 × 5（生产 50s）：比「一个轮询周期 + 网络余量」宽，
+ * 慢网络下一次失败的轮询不会误报；真断了则最迟 ~80s（周期+阈值余量）
+ * 内告警并重建定时器。
+ */
+export function controlWatchdogSpec(controlPollMs: number): { periodMs: number; staleMs: number } {
+  return {
+    periodMs: Math.max(controlPollMs * 3, 1_000),
+    staleMs: Math.max(controlPollMs * 5, 1_000),
+  };
+}
 /**
  * 设备要「安静」多久才允许自动升级重启。
  *
@@ -2273,22 +2288,68 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
   void finishInflightUpgrade();
 
   const controlPollMs = supervisor.controlPollIntervalMs ?? SUPERVISOR_CONTROL_POLL_MS;
-  const controlTimer = setInterval(() => {
+  // 轮询心跳 + 看门狗（2026-11-04 事故修复②）。
+  //
+  // 事故形态：supervisor 的 setInterval 定时器链断裂后进程仍活着（子进程照常
+  // 收发 IM），但轮询静默停止 —— 权限快照被写成空表、启停/升级意图再也收不到，
+  // 没有任何日志能暴露它。marker 实验（手写一个 updatedAt 很旧的 marker 快照，
+  // 35s 不被恢复）才确认定时器已死。
+  //
+  // 兜底分两层：
+  //  1. lastControlPollAt：每次轮询回调（无论成功失败）都刷新的时间戳；
+  //  2. 独立看门狗定时器：发现时间戳陈旧（> poll*5，留足余量）就告警并
+  //     **重建** controlTimer —— 重新 setInterval 即可修复定时器链断裂类故障。
+  // 看门狗自身不能成为新故障源：检测与重建全部 try/catch 包裹。
+  let lastControlPollAt = Date.now();
+  const runControlPoll = (): void => {
+    lastControlPollAt = Date.now();
     void fetchControlSnapshot().then(({ desired, upgrade }) => {
       applyControlStates(desired);
       handleUpgradeIntent(upgrade);
       // 顺手重投之前没送达的进度回传（网络刚恢复时最先该做的事）。
       void flushPendingReports();
     });
-  }, controlPollMs);
+  };
+  let controlTimer: NodeJS.Timeout = setInterval(runControlPoll, controlPollMs);
+  const armControlTimer = (): void => {
+    controlTimer = setInterval(runControlPoll, controlPollMs);
+    if (typeof controlTimer.unref === "function") controlTimer.unref();
+  };
   // The poll must never be the reason the process stays alive; `await stopped`
   // is what holds the supervisor open.
   if (typeof controlTimer.unref === "function") controlTimer.unref();
+
+  // 看门狗节奏见 controlWatchdogSpec：周期 = 轮询 × 3，阈值 = 轮询 × 5。
+  const { periodMs: watchdogPeriodMs, staleMs: watchdogStaleMs } = controlWatchdogSpec(controlPollMs);
+  const controlWatchdog: NodeJS.Timeout = setInterval(() => {
+    try {
+      const stalledMs = Date.now() - lastControlPollAt;
+      if (stalledMs <= watchdogStaleMs) return;
+      console.error(
+        `supervisor: CONTROL POLL STALLED for ${Math.round(stalledMs / 1000)}s`
+        + ` (threshold ${Math.round(watchdogStaleMs / 1000)}s) — rebuilding the poll timer`
+        + " (permissions/start-stop/upgrade intents were not being received)",
+      );
+      clearInterval(controlTimer);
+      // 重建即修复：新的 setInterval 重新挂上完整定时器链。立即先跑一次，
+      // 别等下一个完整周期（权限快照可能已经陈旧很久了）。
+      runControlPoll();
+      armControlTimer();
+    } catch (err) {
+      // 看门狗绝不能把 supervisor 弄挂：它只是兜底，检测失败就等下一轮再试。
+      console.error(
+        "supervisor: control poll watchdog check failed:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }, watchdogPeriodMs);
+  if (typeof controlWatchdog.unref === "function") controlWatchdog.unref();
 
   const shutdown = (): void => {
     const first = !stopping;
     stopping = true;
     clearInterval(controlTimer);
+    clearInterval(controlWatchdog);
     for (const entry of managed.values()) {
       if (entry.timer) {
         clearTimeout(entry.timer);

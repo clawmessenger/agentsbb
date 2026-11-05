@@ -408,6 +408,35 @@ describe("operator-driven start/stop", () => {
   });
 });
 
+// 看门狗（2026-11-04 事故修复②）：轮询定时器链断裂时 supervisor 进程活着、
+// 子进程照常收发 IM，唯独轮询静默死亡 —— 权限快照变空表、启停/升级意图失联。
+// 这里钉住三件事：节奏公式（×3 / ×5）、健康轮询不误报、失败轮询也不误报
+// （心跳按「回调跑到」刷新，与轮询成败无关）。
+describe("control poll watchdog", () => {
+  it("controlWatchdogSpec: period = 3x poll, stale threshold = 5x poll, 1s floor", async () => {
+    const { controlWatchdogSpec } = await import("./main.js");
+    expect(controlWatchdogSpec(10_000)).toEqual({ periodMs: 30_000, staleMs: 50_000 });
+    expect(controlWatchdogSpec(20)).toEqual({ periodMs: 1_000, staleMs: 1_000 });
+  });
+
+  it("healthy polling never trips the watchdog (no false STALLED alarm)", async () => {
+    const h = await startSupervisor();
+    // 真实时钟上跑过多个看门狗窗口（tick 20ms → 周期 1s / 阈值 1s），
+    // 轮询健康时看门狗必须全程沉默。
+    await realSleep(2_500);
+    expect(errorLog.some((m) => m.includes("CONTROL POLL STALLED"))).toBe(false);
+    // 轮询确实活着（control 被反复调用过），不是「没人轮询所以没人告警」。
+    expect(vi.mocked(h.api.fetchDeviceControl).mock.calls.length).toBeGreaterThan(5);
+  });
+
+  it("a failing poll still refreshes the heartbeat — no false STALLED alarm", async () => {
+    const h = await startSupervisor();
+    vi.mocked(h.api.fetchDeviceControl).mockRejectedValue(new Error("network down"));
+    await realSleep(2_500);
+    expect(errorLog.some((m) => m.includes("CONTROL POLL STALLED"))).toBe(false);
+  });
+});
+
 // 按账号重启：服务端 action=restart 时状态仍是 running、只把 version +1。
 // supervisor 必须只杀那一个子进程 —— 这是运维助手「只操作本账号」的执行端。
 describe("per-agent restart via control version", () => {
