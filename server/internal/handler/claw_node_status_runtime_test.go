@@ -118,9 +118,9 @@ func TestClawNodeStatusCarriesTheRuntimeEnvFields(t *testing.T) {
 
 	seed := `INSERT INTO rongcloud_node_upgrade
 		(machine_id, workspace_id, reported_version, reported_platform, reported_hostname,
-		 install_dir, reported_at, reported_generation)
+		 install_dir, remote_ip, remote_ip_at, reported_at, reported_generation)
 		VALUES ($1, $2::uuid, '1.3.19', 'win32-x64', 'host-qa',
-		        'C:\qa\bin', now(), 0)`
+		        'C:\qa\bin', '203.0.113.9', now(), now(), 0)`
 	if _, err := testPool.Exec(context.Background(), seed, machine, testWorkspaceID); err != nil {
 		t.Fatalf("seed upgrade row: %v", err)
 	}
@@ -135,6 +135,7 @@ func TestClawNodeStatusCarriesTheRuntimeEnvFields(t *testing.T) {
 		"exe_platform": "win32-x64",
 		"hostname":     "host-qa",
 		"install_dir":  `C:\qa\bin`,
+		"remote_ip":    "203.0.113.9",
 	} {
 		if got, _ := data[field].(string); got != want {
 			t.Fatalf("%s = %q, want %q", field, got, want)
@@ -146,6 +147,18 @@ func TestClawNodeStatusCarriesTheRuntimeEnvFields(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, rawAt); err != nil {
 		t.Fatalf("reported_at %q is not RFC3339: %v", rawAt, err)
+	}
+	// 公网 IP 三件套（服务端观测）：值 + 是否公网 + 观测时间。public 用 bool 而不是
+	// 字符串，前端据此决定要不要打「内网」标记；时间同 RFC3339。
+	if got, ok := data["remote_ip_public"].(bool); !ok || !got {
+		t.Fatalf("remote_ip_public = %v (%T), want true", data["remote_ip_public"], data["remote_ip_public"])
+	}
+	rawIPAt, _ := data["remote_ip_at"].(string)
+	if rawIPAt == "" {
+		t.Fatal("remote_ip_at must be present together with remote_ip")
+	}
+	if _, err := time.Parse(time.RFC3339, rawIPAt); err != nil {
+		t.Fatalf("remote_ip_at %q is not RFC3339: %v", rawIPAt, err)
 	}
 }
 
@@ -165,7 +178,7 @@ func TestClawNodeStatusOmitsRuntimeEnvForANeverReportedMachine(t *testing.T) {
 	if _, ok := data["online"]; !ok {
 		t.Fatal("online must always be present — the status probe is the primary duty")
 	}
-	for _, field := range []string{"exe_version", "exe_platform", "hostname", "install_dir", "reported_at"} {
+	for _, field := range []string{"exe_version", "exe_platform", "hostname", "install_dir", "reported_at", "remote_ip", "remote_ip_public", "remote_ip_at"} {
 		if _, ok := data[field]; ok {
 			t.Fatalf("%s must be omitted for a never-reported machine, got %v", field, data[field])
 		}

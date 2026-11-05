@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -110,8 +112,7 @@ func TestClawDeviceObservedIP(t *testing.T) {
 	}
 }
 
-func TestClawIPIsPublic(t *testing.T) {
-	cases := map[string]bool{
+func TestClawIPIsPublic(t *testing.T) {	cases := map[string]bool{
 		"203.0.113.9":   true,
 		"8.8.8.8":       true,
 		"2001:db8::1":   true,
@@ -238,5 +239,44 @@ func TestClawDeviceRecordRemoteIP(t *testing.T) {
 	}
 	if merged.RemoteIP != "198.51.100.7" {
 		t.Fatalf("version writes must not clobber remote_ip, got %q", merged.RemoteIP)
+	}
+}
+
+// TestClawAdminAttachUpgradeCarriesRemoteIP 钉住后台投影的字段名与 public 判定：
+// 详情页读的是 row.RemoteIP / RemoteIPPublic / RemoteIPAt 这三个 json 字段，
+// 少一个就是「服务端存了、页面看不到」。判定必须在服务端做 —— 三端 UI 各写一份
+// 「这是不是内网地址」迟早会漂。
+func TestClawAdminAttachUpgradeCarriesRemoteIP(t *testing.T) {
+	h := &Handler{}
+	seenAt := time.Date(2026, 11, 5, 4, 0, 0, 0, time.UTC)
+
+	public := h.clawAdminAttachUpgrade(clawAdminNodeRow{}, clawAdminNodeRecord{MachineID: "m-pub"},
+		map[string]clawNodeUpgrade{
+			"m-pub": {RemoteIP: "203.0.113.9", RemoteIPAt: pgtype.Timestamptz{Time: seenAt, Valid: true}},
+		}, nil)
+	if public.RemoteIP != "203.0.113.9" {
+		t.Fatalf("remote_ip = %q, want 203.0.113.9", public.RemoteIP)
+	}
+	if !public.RemoteIPPublic {
+		t.Fatal("a globally routable address must be marked public")
+	}
+	if public.RemoteIPAt != seenAt.Format(time.RFC3339) {
+		t.Fatalf("remote_ip_at = %q, want %q", public.RemoteIPAt, seenAt.Format(time.RFC3339))
+	}
+
+	private := h.clawAdminAttachUpgrade(clawAdminNodeRow{}, clawAdminNodeRecord{MachineID: "m-lan"},
+		map[string]clawNodeUpgrade{
+			"m-lan": {RemoteIP: "10.1.1.225", RemoteIPAt: pgtype.Timestamptz{Time: seenAt, Valid: true}},
+		}, nil)
+	if private.RemoteIPPublic {
+		t.Fatal("a 10/8 address must not be presented as a public IP")
+	}
+
+	// 从没轮询过的机器：三个字段都留空，页面回退「-」，不该冒出一个 public=true。
+	never := h.clawAdminAttachUpgrade(clawAdminNodeRow{}, clawAdminNodeRecord{MachineID: "m-none"},
+		map[string]clawNodeUpgrade{"m-none": {}}, nil)
+	if never.RemoteIP != "" || never.RemoteIPAt != "" || never.RemoteIPPublic {
+		t.Fatalf("a never-polled machine must not carry remote ip fields (ip=%q at=%q public=%v)",
+			never.RemoteIP, never.RemoteIPAt, never.RemoteIPPublic)
 	}
 }
