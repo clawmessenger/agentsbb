@@ -20,6 +20,14 @@ import {
   type ModelCatalogRequest,
 } from "./model-catalog.js";
 import {
+  buildDeviceStatusReport,
+  buildRuntimeDiagnostics,
+  isStaleDeviceStatusRequest,
+  parseDeviceStatusRequest,
+  sessionsFromTable,
+  type DeviceStatusRequest,
+} from "./device-status.js";
+import {
   buildRuntimeRecoveryResponse,
   parseRuntimeRecoveryRequest,
   type RuntimeRecoveryAction,
@@ -35,7 +43,7 @@ import {
   ROLE_RECOMMEND_ACTION,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
-import { formatUseModelAck, parseUseModelCommand, type UseModelCommand } from "./use-model.js";
+import { formatUseModelAck, parseUseModelCommand, routeInCatalog, type UseModelCommand } from "./use-model.js";
 import type { UserModelStore } from "./user-models.js";
 import type { AgentDefaultModelStore } from "./agent-default-model.js";
 import {
@@ -166,6 +174,13 @@ export interface DispatcherDeps {
   // Echoed back in the response's data.agent so the web can show which runtime
   // it was talking to. Purely informational.
   agentName?: string;
+  // 设备详情页「系统健康状态 / 会话列表」的数据来源（见 device-status.ts）。
+  // 会话表来自 agent-sessions：sessionKey → agent 会话 id。用**函数**而不是对象，
+  // 因为 dispatcher 在 run.ts 里先于 agentSessions 构造（同一份快照要等它建好）。
+  loadAgentSessions?: () => Record<string, string>;
+  // 面板上显示的设备端版本号。省略时回空串（面板会隐藏那一行），
+  // 由 run.ts 传 CLI 自身版本 —— im.ts 不该自己读 package.json。
+  nodeVersion?: string;
   // Streams a chat_stream frame into a conversation (1 private / 3 group /
   // 4 chatroom). The web renders these incrementally (chat-stream.ts there);
   // when omitted the dispatcher degrades to the old single-shot reply.
@@ -438,12 +453,14 @@ export class MessageDispatcher {
   }
 
   /**
-   * 私聊闸门的日志：四条分支必须一眼可分（任务书 success_criteria #2）。
+   * 私聊闸门的日志：每条分支必须一眼可分（任务书 success_criteria #2）。
    *
    * 规则（队长 2026-10-27 裁决 + 审查 S3）：
    *  · `unrestricted`（有快照且 allowPrivate 不是 false）不记 —— 正常路径不刷屏；
    *  · `no-snapshot`（整份快照都没有）**每条 warn** —— fail-open，必须与
    *    「有快照且允许」一眼可分；
+   *  · `empty-agents`（快照在但一条都没有）**每条 warn** —— 同为 fail-open，
+   *    且几乎总是「控制轮询停摆把快照写成空表」的信号（2026-11-05）；
    *  · `no-agent-entry`（有快照但没这个节点）**每条 warn** —— 现在是**拒绝**，
    *    不放行，但仍要留痕，否则现场只看到「不回私聊」查不到原因；
    *  · `denied-stranger` **每条 warn** —— 安全事件，宁多勿少；
@@ -456,6 +473,16 @@ export class MessageDispatcher {
       console.warn(
         "im in: 私聊闸门无权限快照，降级放行（fail-open，不是 allowPrivate=true）"
         + ` from=${fromUserId} node=${node} — supervisor 尚未落盘快照，或本机是独立 run 模式`,
+      );
+      return;
+    }
+    if (reason === "empty-agents") {
+      // 快照在、内容却是空的：几乎总是 supervisor 控制轮询停摆后写坏的产物。
+      // 每条都 warn（同 no-snapshot 的理由）：现场必须先看到这一行，才知道
+      // 「不是设备没收到消息，是权限快照坏了」。
+      console.warn(
+        "im in: 权限快照为空表，私聊闸门降级放行（empty-agents）"
+        + ` from=${fromUserId} node=${node} — 检查 supervisor 的 10s 控制轮询是否还在跑`,
       );
       return;
     }
@@ -499,7 +526,7 @@ export class MessageDispatcher {
    *  · **绝不抛错**：发送失败只记日志 —— 回执是善意提示，不能反过来打断
    *    消息循环；
    *  · 只覆盖两个「确定拒绝」的分支（no-agent-entry / denied-stranger）；
-   *    fail-open 分支（no-snapshot / unclaimed-fail-open）本来就会继续执行，
+   *    fail-open 分支（no-snapshot / empty-agents / unclaimed-fail-open）本来就会继续执行，
    *    无需占位。
    */
   private async sendGateRejectNotice(reason: PrivateGateReason, fromUserId: string): Promise<void> {
@@ -594,8 +621,9 @@ export class MessageDispatcher {
         requestMessageId: msg.messageUId || `req-${Date.now()}`,
         requesterId: msg.fromUserId,
         prompt: text,
-        // per-user 模型：这个人自己选过的就用他的，没选过则跟随节点默认。
-        model: this.deps.userModels?.get(msg.fromUserId),
+        // per-user 模型：这个人自己选过的就用他的，没选过则跟随节点默认；
+        // 选过但已失效（provider 下架 / 旧客户端写进内部名）会被清掉并回退。
+        model: await this.resolveTurnModel(msg.fromUserId),
         // 私聊按对端分桶：不给键的话 openclaw 会把私聊也塞进主会话，和群聊、
         // 讨论组共享一串上下文。
         sessionKey: turnSessionKey("private", msg.fromUserId),
@@ -622,6 +650,15 @@ export class MessageDispatcher {
     }
 
     if (msg.objectName === "command") {
+      // 设备运行状态（设备详情页的「系统健康状态 / 会话列表 / 任务队列」）。
+      // 必须排在 decodeCommandContent 之前：请求体是空对象，既没有 service 也没有
+      // action，走到下面只会被当成「不是讨论指令」静默丢掉 —— 前端就干等 15 秒
+      // 再报「设备可能离线」，而设备其实一直在线（2026-11-05 现场）。
+      const statusRequest = parseDeviceStatusRequest(msg.content);
+      if (statusRequest) {
+        await this.handleDeviceStatusRequest(msg, statusRequest);
+        return;
+      }
       // The model catalog request carries no request_id/action (web protocol
       // v2), so it can never decode as a discussion command — match it first.
       const catalogRequest = parseModelCatalogRequest(msg.content);
@@ -715,8 +752,8 @@ export class MessageDispatcher {
         // 轮次模型：用户自己 `/use-model` 选过的优先 —— 那是运行期的最新意图
         // （web 的圆桌「角色模型」就是给该角色节点私发这条命令，不写服务端
         // 角色配置）；没选过才用服务端按角色下发的 params.model；两者都没有
-        // 则交给 run.ts 回落到节点的 --model。
-        model: this.deps.userModels?.get(requesterId) ?? params.model,
+        // 则交给 run.ts 回落到节点的 --model。选过但已失效的会被清掉并回退。
+        model: await this.resolveTurnModel(requesterId, params.model),
         // 讨论组/群聊/聊天室各按自己的会话 id 分桶，讨论组里聊出来的共识
         // 不会顺着 agent 的共享会话爬进普通群聊。
         sessionKey: turnSessionKey(venue, replyTo),
@@ -1425,6 +1462,46 @@ export class MessageDispatcher {
     return "（本轮没有产出内容）";
   }
 
+  /**
+   * 本节点的模型目录；取不到 / 为空一律返回 null（= 「不知道有哪些模型」）。
+   *
+   * loader 自带 TTL 缓存与 inflight 去重，正常路径上这次调用是内存命中。
+   */
+  private async loadCatalogOrNull(): Promise<DiscussionModelCatalog | null> {
+    try {
+      const catalog = await this.deps.loadModelCatalog?.();
+      if (!catalog || !Array.isArray(catalog.providers) || catalog.providers.length === 0) return null;
+      return catalog;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 这一轮实际用于 agent 的模型。
+   *
+   * 优先级不变（per-user `/use-model` 优先，其次服务端下发的角色模型），但多一步
+   * **自愈**：per-user 偏好指向一个本节点已经没有的 route 时，清掉它并回退 ——
+   * 否则这个人之后每一轮 agent 都起不来（2026-11-05：设备上存着
+   * `quukk_direct/glm-5.2`，目录里只有 `quukk`，用户看到的就是「发什么都不回」）。
+   *
+   * 目录取不到时不校验也不清除：枚举失败是设备的问题，不该顺手丢掉用户的选择。
+   */
+  private async resolveTurnModel(requesterId: string, fallback?: string): Promise<string | undefined> {
+    const store = this.deps.userModels;
+    const route = store?.get(requesterId);
+    if (!route) return fallback;
+    const catalog = await this.loadCatalogOrNull();
+    if (!catalog) return route;
+    if (routeInCatalog(catalog, route)) return route;
+    store?.set(requesterId, null);
+    console.warn(
+      `turn model: dropped stale per-user route=${route} user=${requesterId}`
+      + ` (not in this node's catalog) — falling back to ${fallback ?? "node default"}`,
+    );
+    return fallback;
+  }
+
   // `/use-model`：改「这个人」在本节点上用的模型，并立即回执。
   //
   // 刻意不进 agent、也不占用会话队列：用户点一下模型下拉就在等一个响应，spawn
@@ -1442,8 +1519,27 @@ export class MessageDispatcher {
       return;
     }
 
-    if (command.kind === "set") store.set(fromUserId, command.route);
-    else if (command.kind === "clear") store.set(fromUserId, null);
+    if (command.kind === "set") {
+      // 只接受节点上真的有的 route。写进来的值会被无限期沿用，写错一个就
+      // 等于给这个人按了「以后每轮都别回」的开关（见 routeInCatalog 注释）。
+      const catalog = await this.loadCatalogOrNull();
+      if (catalog && !routeInCatalog(catalog, command.route)) {
+        console.log(
+          `use-model: rejected unknown route=${command.route} user=${fromUserId}`,
+        );
+        await this.deps.send(
+          fromUserId,
+          "RC:TxtMsg",
+          JSON.stringify({
+            content: `节点上没有 ${command.route} 这个模型，未切换。发送 /use-model 查看当前模型。`,
+          }),
+        ).catch(() => { });
+        return;
+      }
+      store.set(fromUserId, command.route);
+    } else if (command.kind === "clear") {
+      store.set(fromUserId, null);
+    }
 
     const current = store.get(fromUserId);
     const ack = formatUseModelAck(command, current);
@@ -1560,6 +1656,43 @@ export class MessageDispatcher {
   //    requestId arrives again and again — answer each id at most once.
   // Without these, a single reconnect fires dozens of responses in one tick
   // and RongCloud rejects them all with 20604 (SEND_FREQUENCY_TOO_FAST).
+  /**
+   * 设备运行状态（`device_status_request` → `device_status_report`）。
+   *
+   * 面板的「系统健康状态 / 会话列表 / 任务队列」全靠这一条。以前 CLI 根本没接，
+   * 三端详情页固定等满 15 秒超时，再报「设备可能离线」—— 而设备一直在线，
+   * 这条误导文案让排查方向整体跑偏（2026-11-05 现场）。
+   *
+   * 只读、无副作用：面板每展开一次就请求一次，绝不写盘。
+   */
+  private async handleDeviceStatusRequest(
+    msg: InboundIMMessage,
+    request: DeviceStatusRequest,
+  ): Promise<void> {
+    if (isStaleDeviceStatusRequest(request)) {
+      console.log(`device status: skipping stale request ${request.requestId}`);
+      return;
+    }
+    const sessions = sessionsFromTable(this.deps.loadAgentSessions?.() ?? {});
+    const report = buildDeviceStatusReport(request, {
+      version: this.deps.nodeVersion ?? "",
+      ...(this.deps.agentName ? { agentName: this.deps.agentName } : {}),
+      sessions,
+      diagnostics: buildRuntimeDiagnostics({
+        pid: process.pid,
+        uptimeSec: process.uptime(),
+        rssBytes: process.memoryUsage().rss,
+        ...(this.deps.agentName ? { agentName: this.deps.agentName } : {}),
+        sessionCount: sessions.length,
+      }),
+    });
+    // 回给请求方本人：面板只关心自己那台设备的快照。
+    await this.deps.send(msg.fromUserId, "command", report);
+    console.log(
+      `device status: answered ${request.requestId} (${sessions.length} session(s), ${process.uptime().toFixed(0)}s up)`,
+    );
+  }
+
   private async handleModelCatalogRequest(
     msg: InboundIMMessage,
     request: ModelCatalogRequest,

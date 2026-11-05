@@ -265,6 +265,23 @@ export function mergePermissionSnapshot(
     : previous?.ownerUserId ?? "";
   if (!previous) return { ...next, ownerUserId, ownerUserIdPresent: true };
 
+  // 整份空表：**保留上一份的条目**，绝不用空数组覆盖（2026-11-05 现场）。
+  //
+  // 事故形态：supervisor 的控制轮询定时器停摆后，磁盘上落的是
+  // `{ ownerUserId: "881638", agents: [] }`。服务端真要对所有 agent 收紧权限时，
+  // 下发的是 N 行 `allowPrivate=false` 的完整列表 —— 空数组只可能表示「这一轮
+  // 没拿到数据」。一旦写进快照，`decidePrivateChat` 就再也查不到任何一行，
+  // 主人自己的每条私聊都被判 `no-agent-entry` 丢弃，用户侧表现是「发什么都没人回」。
+  // 保留上一份，等于把「快照被写坏」这种事故限制在「权限可能陈旧」而不是「全灭」。
+  if (next.agents.length === 0) {
+    return {
+      ownerUserId,
+      ownerUserIdPresent: true,
+      agents: previous.agents,
+      updatedAt: next.updatedAt,
+    };
+  }
+
   const agents = next.agents.map((entry) => {
     const prior = findPermissionEntry(previous, { nodeId: entry.nodeId, agent: entry.agent });
     if (!prior) return entry;
@@ -335,7 +352,17 @@ export type PrivateGateReason =
    * 比拒绝危险得多 —— 服务端加一个 agent、设备端就白送一个无限制入口。
    * 注意与 `no-snapshot` 区分：那是「整份都没有」（旧服务端），已裁决放行。
    */
-  | "no-agent-entry";
+  | "no-agent-entry"
+  /**
+   * 有快照，但里面**一条 agent 都没有**（整份空表）→ 放行。
+   *
+   * 这与 `no-agent-entry` 必须分开：后者是「服务端在管权限，只是没给这一行」，
+   * 前者是「这份快照里压根没有权限数据」—— 服务端从未用空数组表达「全禁」
+   * （真要全禁会下发 N 行 allowPrivate=false）。空表只可能来自轮询异常后的落盘
+   * （2026-11-05：定时器停摆，快照被写成空表，主人自己的私聊全被拒，零回复）。
+   * 已由 mergePermissionSnapshot 挡住写入；这里是读侧的兜底，防止旧文件已经空。
+   */
+  | "empty-agents";
 
 export interface PrivateGateDecision {
   allow: boolean;
@@ -349,11 +376,13 @@ export interface PrivateGateDecision {
  * 服务端**没有**私聊派发点（私聊是设备端收到 RC:TxtMsg 直接跑），所以「关掉
  * 私聊」只能在这一层执行。
  *
- * fail-open 点只有两个，且都必须能说清理由：
+ * fail-open 点只有三个，且都必须能说清理由：
  *   1. `no-snapshot`：整份快照都没有（旧服务端 / 尚未轮询 / 独立 run）——
  *      已由队长裁决放行，否则升级瞬间所有设备私聊哑掉；
- *   2. `unclaimed-fail-open`：`ownerUserId` 为空，无法判定谁是主人。
- * 除这两条外一律「判不了就拒绝」：`no-agent-entry` 是有快照但没这个节点，
+ *   2. `empty-agents`：快照在但一条 agent 都没有（2026-11-05：轮询停摆把快照
+ *      写成空表）—— 空数组从不表示「全禁」，只表示「这轮没数据」；
+ *   3. `unclaimed-fail-open`：`ownerUserId` 为空，无法判定谁是主人。
+ * 除这三条外一律「判不了就拒绝」：`no-agent-entry` 是有快照但没这个节点，
  * 说明服务端已在管权限，只是没给这一行 —— 放行等于凭空开一个无限制入口（审查 S3）。
  */
 export function decidePrivateChat(
@@ -361,8 +390,21 @@ export function decidePrivateChat(
   query: { fromUserId: string; nodeId?: string; agent?: string },
 ): PrivateGateDecision {
   if (!snapshot) return { allow: true, reason: "no-snapshot" };
+  // 空表 = 这一份快照里没有任何权限数据（写坏了，不是「全禁」）→ 与 no-snapshot 同档
+  if (snapshot.agents.length === 0) return { allow: true, reason: "empty-agents" };
   const entry = findPermissionEntry(snapshot, query);
-  if (!entry) return { allow: false, reason: "no-agent-entry" };
+  if (!entry) {
+    // 快照里没有本节点（绑定关系不同步 / 服务端漏写 / 快照被写坏）。
+    //
+    // 陌生人仍然拒绝（审查 S3：查不到不能凭空开一个无限制入口）。但**主人放行**：
+    // allowPrivate=false 时主人本来就豁免（见下），「查不到这一行」不该比「明确
+    // 禁止」更严；而 2026-11-05 现场证明了这份快照本身会出错 —— 服务端 13 条
+    // 完整权限，设备端落盘的却只有一条 `node_ops`，fail-closed 把主人锁在自己
+    // 的设备外面，表现就是「发什么都没人回」。
+    const owner = snapshot.ownerUserId.trim();
+    if (owner && query.fromUserId === owner) return { allow: true, reason: "owner" };
+    return { allow: false, reason: "no-agent-entry" };
+  }
   if (entry.allowPrivate !== false) return { allow: true, reason: "unrestricted", entry };
   const owner = snapshot.ownerUserId.trim();
   if (!owner) return { allow: true, reason: "unclaimed-fail-open", entry };

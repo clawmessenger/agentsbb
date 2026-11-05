@@ -65,3 +65,29 @@ export function formatUseModelAck(command: UseModelCommand, current: string | un
         : "当前使用节点默认模型。\n发送 /use-model <provider>/<model> 切换，例如 /use-model quukk/glm-5.3。";
   }
 }
+
+/**
+ * `provider/model` 是否在这份模型目录里。
+ *
+ * 用途只有一个：**别让一个不存在的 route 生效**。设备上的 per-user 偏好会被
+ * 无限期沿用，一旦指向已下架的 provider（2026-11-05 现场：偏好里是
+ * `quukk_direct/glm-5.2`，而节点目录里只有 `quukk`），这个人之后每一轮 agent
+ * 都起不来 —— 用户看到的是「发什么都不回」，日志里却只有一条 agent 启动失败。
+ *
+ * 空目录（枚举失败 / 尚未加载）**不参与判定**：那是「不知道」，不是「没有」。
+ * 调用方必须先自己判 `providers.length > 0`，否则会把用户的合法选择误删。
+ */
+export function routeInCatalog(
+  catalog: { defaultModel: string | null; providers: Array<{ id: string; models: Array<{ id: string; name: string }> }> } | null,
+  route: string,
+): boolean {
+  if (!catalog || !Array.isArray(catalog.providers) || catalog.providers.length === 0) return false;
+  if (catalog.defaultModel === route) return true;
+  const slash = route.indexOf("/");
+  if (slash <= 0) return false;
+  const providerId = route.slice(0, slash);
+  const modelId = route.slice(slash + 1);
+  const provider = catalog.providers.find((item) => item && item.id === providerId);
+  if (!provider || !Array.isArray(provider.models)) return false;
+  return provider.models.some((model) => model && (model.id === modelId || model.name === modelId));
+}

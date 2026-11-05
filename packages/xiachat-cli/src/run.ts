@@ -18,6 +18,7 @@ import {
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { loadPermissionSnapshot } from "./agent-permissions.js";
+import { cliVersion } from "./version.js";
 import { defaultUserModelsPath, FileUserModelStore } from "./user-models.js";
 import { defaultAgentModelPath, FileAgentDefaultModelStore } from "./agent-default-model.js";
 import {
@@ -188,7 +189,14 @@ export function resolveTurnModel(
 export interface InboundReplayDedupe {
   // true when this UID has already been dispatched. A missing UID is never a
   // duplicate, so an SDK that omits it degrades to the old behaviour.
+  // Read-only: checking never records. Recording happens only in
+  // markProcessed, after the message has actually been dispatched.
   isDuplicate(messageUId: string | undefined): boolean;
+  // Record a UID as dispatched. Call this ONLY after a successful dispatch —
+  // never for queue-rejected (agent_busy) or chat_stop-dropped messages: a
+  // UID recorded before dispatch would make RongCloud's offline replay of the
+  // never-executed message silently vanish (2026-11 replay bug).
+  markProcessed(messageUId: string | undefined): void;
   // Persist immediately instead of waiting for the debounce (flush on shutdown).
   flush(): void;
   readonly size: number;
@@ -234,11 +242,13 @@ export function createInboundReplayDedupe(
   return {
     isDuplicate(messageUId) {
       if (!messageUId) return false;
-      if (seen.has(messageUId)) return true;
+      return seen.has(messageUId);
+    },
+    markProcessed(messageUId) {
+      if (!messageUId || seen.has(messageUId)) return;
       seen.add(messageUId);
       evict();
       if (path && !timer) timer = setTimeout(flush, flushDelayMs);
-      return false;
     },
     flush,
     get size() {
@@ -465,6 +475,11 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     onDefaultModelChanged: () => catalogLoader.invalidate(),
     probeRuntime,
     agentName: opts.agentName,
+    // 设备详情页「系统健康状态 / 会话列表」的数据源（见 device-status.ts）。
+    // 会话表在下面才构造，这里用闭包延迟读取 —— dispatcher 的生命周期比它长。
+    loadAgentSessions: () => agentSessions.snapshot(),
+    // 面板上显示的设备端版本号（沿用面板既有的「OpenClaw版本」一行）。
+    nodeVersion: cliVersion(),
     selfUserId: opts.transport.getSelfUserId?.(),
     nodeId: opts.transport.getSelfUserId?.(),
     // 私聊闸门的权限来源：supervisor 轮询落盘的那份快照（带 5s 缓存）。
@@ -636,21 +651,32 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       console.log(`im in: dropping replayed message uid=${msg.messageUId}`);
       return;
     }
+    // 记账纪律：只有「真的派发过」的消息才 markProcessed。isDuplicate 变成
+    // 纯查询后，到达 ≠ 记账 —— 队列满被丢、chat_stop 撤排队、进程重启等一切
+    // 未派发路径都不记账，融云重放这条消息时还能再执行（修 2026-11 重放丢
+    // 消息缺陷）。各路径在 handle 成功完成后才调用 markProcessed。
+    const markDispatched = (uid: string | undefined): void => {
+      replayDedupe.markProcessed(uid);
+    };
     const key = conversationKeyOf(msg);
     // 模型目录请求是廉价的协议查询，web 侧只等 8s。若走会话队列，一次长 agent
     // 回合（最长 120s）会把它拖过超时，或因为队列只有 1 个等待位而被直接丢弃。
     if (msg.objectName === "command" && parseModelCatalogRequest(msg.content)) {
-      void dispatcher.handle(msg, turns).catch((err: unknown) => {
-        console.error("dispatch failed:", err instanceof Error ? err.message : err);
-      });
+      void dispatcher.handle(msg, turns)
+        .then(() => markDispatched(msg.messageUId))
+        .catch((err: unknown) => {
+          console.error("dispatch failed:", err instanceof Error ? err.message : err);
+        });
       return;
     }
     // 写默认模型同理：一次写盘 + 一条回执，绝不能排在长 agent 回合后面 —— 面板
     // 保存后要立刻回显，丢进队列（深度 1）会被上一条消息直接挤掉。
     if (msg.objectName === "command" && parseAgentDefaultModelRequest(msg.content)) {
-      void dispatcher.handle(msg, turns).catch((err: unknown) => {
-        console.error("dispatch failed:", err instanceof Error ? err.message : err);
-      });
+      void dispatcher.handle(msg, turns)
+        .then(() => markDispatched(msg.messageUId))
+        .catch((err: unknown) => {
+          console.error("dispatch failed:", err instanceof Error ? err.message : err);
+        });
       return;
     }
     // Same reason as the catalog above, and one more: a recover can spend up to
@@ -659,9 +685,11 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     if (msg.objectName === "command") {
       const recoveryRequest = parseRuntimeRecoveryRequest(msg.content);
       if (recoveryRequest) {
-        void dispatcher.handleRuntimeRecovery(msg, recoveryRequest).catch((err: unknown) => {
-          console.error("runtime recovery failed:", err instanceof Error ? err.message : err);
-        });
+        void dispatcher.handleRuntimeRecovery(msg, recoveryRequest)
+          .then(() => markDispatched(msg.messageUId))
+          .catch((err: unknown) => {
+            console.error("runtime recovery failed:", err instanceof Error ? err.message : err);
+          });
         return;
       }
     }
@@ -673,9 +701,11 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     if (msg.objectName === "command") {
       const recommendCmd = decodeCommandContent(msg.content);
       if (recommendCmd?.service === "discussion" && recommendCmd.action === ROLE_RECOMMEND_ACTION) {
-        void dispatcher.handle(msg, turns).catch((err: unknown) => {
-          console.error("role recommend failed:", err instanceof Error ? err.message : err);
-        });
+        void dispatcher.handle(msg, turns)
+          .then(() => markDispatched(msg.messageUId))
+          .catch((err: unknown) => {
+            console.error("role recommend failed:", err instanceof Error ? err.message : err);
+          });
         return;
       }
     }
@@ -686,9 +716,11 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     if (msg.objectName === "chat_stop") {
       const dropped = queue.dropWaiting(key);
       if (dropped > 0) console.log(`chat_stop: dropped ${dropped} queued message(s) for ${key}`);
-      void dispatcher.handle(msg, turns).catch((err: unknown) => {
-        console.error("dispatch failed:", err instanceof Error ? err.message : err);
-      });
+      void dispatcher.handle(msg, turns)
+        .then(() => markDispatched(msg.messageUId))
+        .catch((err: unknown) => {
+          console.error("dispatch failed:", err instanceof Error ? err.message : err);
+        });
       return;
     }
     const accepted = queue.enqueue(
@@ -696,6 +728,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
       async () => {
         try {
           await dispatcher.handle(msg, turns);
+          // 任务体真正跑完（成功派发）才记账；抛错不记 —— 重放时还能再执行。
+          markDispatched(msg.messageUId);
         } catch (err) {
           // Carried fix from Task 7 review: dispatcher.handle rejections
           // (including error-path send failures that escape) must never crash
@@ -704,6 +738,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         }
       },
       // 这条消息若在排队时被 chat_stop 撤掉，给它的占位气泡补 cancelled 终帧。
+      // 撤掉 = 从未派发，绝不 markProcessed（onDropped 里只发通知，不记账）。
       () => sendStopDropNotice(opts.transport, msg, selfUserId),
     );
     if (!accepted) {

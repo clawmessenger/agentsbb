@@ -2474,6 +2474,232 @@ describe("MessageDispatcher /use-model", () => {
   });
 });
 
+describe("模型路由失效自愈（2026-11-05：坏 route 让每轮 agent 都起不来）", () => {
+  const privateMsg = (text: string) => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user-1",
+    toUserId: "node-a",
+    targetId: "node-a",
+    conversationType: 1,
+    content: JSON.stringify({ content: text }),
+  });
+
+  const ackOf = (sent: Array<{ content: string }>) => JSON.parse(sent[0].content).content as string;
+
+  /** 与现场一致：节点目录只有 quukk / agent-plan，没有 quukk_direct。 */
+  const catalog = () => ({
+    defaultModel: "quukk/glm-5.2",
+    providers: [
+      { id: "quukk", name: "quukk", models: [{ id: "glm-5.2", name: "glm-5.2" }, { id: "k3", name: "k3" }] },
+      { id: "agent-plan", name: "agent-plan", models: [{ id: "glm-5.3", name: "glm-5.3" }] },
+    ],
+  });
+
+  it("私聊轮次：偏好指向目录里没有的 provider → 清掉并回退节点默认", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk_direct/glm-5.2" });
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      userModels: store,
+      loadModelCatalog: async () => catalog(),
+    });
+
+    await dispatcher.handle(privateMsg("你好"), {
+      runTurn: async (_prompt, model) => `out(${model})`,
+    });
+
+    // 不再把坏 route 传给 agent，偏好被清掉（下次进来自然回落到节点默认）
+    expect(ackOf(deps.sent)).toContain("out(undefined)");
+    expect(store.get("user-1")).toBeUndefined();
+  });
+
+  it("私聊轮次：偏好合法时原样使用（自愈不能误伤）", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk/k3" });
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      userModels: store,
+      loadModelCatalog: async () => catalog(),
+    });
+
+    await dispatcher.handle(privateMsg("你好"), {
+      runTurn: async (_prompt, model) => `out(${model})`,
+    });
+
+    expect(ackOf(deps.sent)).toContain("out(quukk/k3)");
+    expect(store.get("user-1")).toBe("quukk/k3");
+  });
+
+  it("目录取不到时不校验也不清除：枚举失败不该丢掉用户的选择", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk_direct/glm-5.2" });
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      userModels: store,
+      loadModelCatalog: async () => {
+        throw new Error("opencode models failed");
+      },
+    });
+
+    await dispatcher.handle(privateMsg("你好"), {
+      runTurn: async (_prompt, model) => `out(${model})`,
+    });
+
+    expect(ackOf(deps.sent)).toContain("out(quukk_direct/glm-5.2)");
+    expect(store.get("user-1")).toBe("quukk_direct/glm-5.2");
+  });
+
+  it("圆桌轮次：坏偏好清掉后回退到服务端下发的角色模型", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk_direct/glm-5.2" });
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      userModels: store,
+      loadModelCatalog: async () => catalog(),
+    });
+
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "host_node",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({
+          request_id: "turn_bad_1",
+          service: "discussion",
+          action: "your_turn",
+          params: {
+            round: 1,
+            speaking_order: 1,
+            role_name: "reviewer",
+            model: "agent-plan/glm-5.3",
+            requester_id: "user-1",
+            chatroom_id: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+          },
+        }),
+      },
+      { runTurn: async (_prompt, model) => `out(${model})` },
+    );
+
+    expect(deps.sent.at(-1)!.content).toContain("out(agent-plan/glm-5.3)");
+    expect(store.get("user-1")).toBeUndefined();
+  });
+
+  it("/use-model 写一个目录里没有的 route：拒绝并回执，偏好保持不变", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore({ "user-1": "quukk/glm-5.2" });
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      userModels: store,
+      loadModelCatalog: async () => catalog(),
+    });
+
+    await dispatcher.handle(privateMsg("/use-model quukk_direct/glm-5.2"), {
+      runTurn: async () => {
+        throw new Error("a rejected command must not reach the agent");
+      },
+    });
+
+    expect(store.get("user-1")).toBe("quukk/glm-5.2");
+    expect(ackOf(deps.sent)).toContain("节点上没有");
+  });
+
+  it("/use-model 写合法 route：照旧生效", async () => {
+    const deps = makeDeps();
+    const store = new MemoryUserModelStore();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      userModels: store,
+      loadModelCatalog: async () => catalog(),
+    });
+
+    await dispatcher.handle(privateMsg("/use-model agent-plan/glm-5.3"), {
+      runTurn: async () => {
+        throw new Error("a /use-model command must not reach the agent");
+      },
+    });
+
+    expect(store.get("user-1")).toBe("agent-plan/glm-5.3");
+    expect(ackOf(deps.sent)).toContain("已切换模型：agent-plan/glm-5.3");
+  });
+});
+
+describe("设备运行状态（设备详情页的仪表盘 / 会话列表）", () => {
+  const statusMsg = (payload: Record<string, unknown>) => ({
+    objectName: "command",
+    fromUserId: "user-1",
+    toUserId: "node-a",
+    targetId: "node-a",
+    conversationType: 1,
+    content: JSON.stringify(payload),
+  });
+
+  it("收到 device_status_request → 回 device_status_report，且不进 agent", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName: "codex",
+      nodeVersion: "1.3.19",
+      loadAgentSessions: () => ({ "private:user-1": "sess-a" }),
+    });
+
+    await dispatcher.handle(
+      statusMsg({ msg_type: "device_status_request", request_id: "req-ds-1" }),
+      {
+        runTurn: async () => {
+          throw new Error("状态查询绝不能被送进 agent");
+        },
+      },
+    );
+
+    const raw = JSON.parse(deps.sent.at(-1)!.content) as {
+      msg_type: string;
+      request_id: string;
+      data: { version: string; sessions: Array<{ sessionKey: string }>; diagnostics: Record<string, string> };
+      content: string;
+    };
+    expect(raw.msg_type).toBe("device_status_report");
+    expect(raw.request_id).toBe("req-ds-1");
+    expect(raw.data.version).toBe("1.3.19");
+    expect(raw.data.sessions[0].sessionKey).toBe("private:user-1");
+    expect(raw.data.diagnostics.Agent).toBe("codex");
+    // 同一份数据也放在字符串 content 里（小程序只读那一处）
+    expect(JSON.parse(raw.content).data).toEqual(raw.data);
+  });
+
+  it("没有会话表 / 版本号时照样回执（空面板好过超时）", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+
+    await dispatcher.handle(
+      statusMsg({ msg_type: "device_status_request", request_id: "req-ds-2" }),
+      { runTurn: async () => "should not run" },
+    );
+
+    const raw = JSON.parse(deps.sent.at(-1)!.content);
+    expect(raw.msg_type).toBe("device_status_report");
+    expect(raw.data.sessions).toEqual([]);
+    expect(raw.data.version).toBe("");
+  });
+
+  it("过期请求直接跳过（不刷旧快照到面板）", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+
+    await dispatcher.handle(
+      statusMsg({
+        msg_type: "device_status_request",
+        request_id: "req-ds-old",
+        timestamp: Math.floor((Date.now() - 10 * 60 * 1000) / 1000),
+      }),
+      { runTurn: async () => "should not run" },
+    );
+
+    expect(deps.sent).toHaveLength(0);
+  });
+});
+
 // ---- 帧节流：正文走短窗口（200ms），思考/过程流维持 900ms ----
 //
 // 背景（2026-10-26 现场）：opencode 改走 serve+SSE 后 agent 已经是 token 级增量

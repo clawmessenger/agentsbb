@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,13 +14,33 @@ import {
 } from "./run.js";
 import type { IMTransport, InboundIMMessage } from "./im.js";
 import { XiachatApi } from "./api.js";
+import { createEchoAgentScript } from "./test-fixtures.js";
 
 describe("createInboundReplayDedupe (offline replay storm)", () => {
-  it("treats each UID as new once, then as a duplicate", () => {
+  it("queries without recording: isDuplicate stays false until markProcessed", () => {
     const dedupe = createInboundReplayDedupe();
+    // Arrival alone must never record — that was the 2026-11 replay bug: a
+    // message that arrived but was never dispatched (queue overflow / stop /
+    // restart) got marked, so RongCloud's offline replays were all dropped.
     expect(dedupe.isDuplicate("uid-1")).toBe(false);
+    expect(dedupe.isDuplicate("uid-1")).toBe(false);
+    expect(dedupe.isDuplicate("uid-1")).toBe(false);
+    expect(dedupe.size).toBe(0);
+    // Only a successful dispatch records the UID; replays after that are dupes.
+    dedupe.markProcessed("uid-1");
     expect(dedupe.isDuplicate("uid-1")).toBe(true);
     expect(dedupe.isDuplicate("uid-2")).toBe(false);
+  });
+
+  it("markProcessed is idempotent and ignores missing UIDs", () => {
+    const dedupe = createInboundReplayDedupe();
+    dedupe.markProcessed(undefined);
+    dedupe.markProcessed(undefined);
+    expect(dedupe.size).toBe(0);
+    expect(dedupe.isDuplicate(undefined)).toBe(false);
+    dedupe.markProcessed("uid-1");
+    dedupe.markProcessed("uid-1");
+    expect(dedupe.size).toBe(1);
   });
 
   it("never dedupes when the SDK omits the UID", () => {
@@ -31,9 +51,9 @@ describe("createInboundReplayDedupe (offline replay storm)", () => {
 
   it("stays bounded, forgetting the oldest UIDs", () => {
     const dedupe = createInboundReplayDedupe(2);
-    expect(dedupe.isDuplicate("a")).toBe(false);
-    expect(dedupe.isDuplicate("b")).toBe(false);
-    expect(dedupe.isDuplicate("c")).toBe(false);
+    dedupe.markProcessed("a");
+    dedupe.markProcessed("b");
+    dedupe.markProcessed("c");
     expect(dedupe.size).toBe(2);
     // "a" was evicted, so it looks new again — bounded memory over exactness.
     expect(dedupe.isDuplicate("a")).toBe(false);
@@ -46,10 +66,14 @@ describe("createInboundReplayDedupe (offline replay storm)", () => {
     try {
       const first = createInboundReplayDedupe({ path });
       expect(first.isDuplicate("uid-1")).toBe(false);
+      // Arrived but NOT dispatched -> nothing persisted.
       first.flush();
-
-      // A fresh process (every restart, and every reconnect after a crash)
-      // loads the marker and skips what it already answered.
+      expect(createInboundReplayDedupe({ path }).size).toBe(0);
+      // Dispatched -> persisted; a fresh process (every restart, and every
+      // reconnect after a crash) loads the marker and skips what it already
+      // answered.
+      first.markProcessed("uid-1");
+      first.flush();
       const second = createInboundReplayDedupe({ path });
       expect(second.size).toBe(1);
       expect(second.isDuplicate("uid-1")).toBe(true);
@@ -466,6 +490,214 @@ describe("startRunLoop fast path", () => {
     h.emit(JSON.stringify({ content: "hello" }), "RC:TxtMsg")
     await new Promise((resolve) => setTimeout(resolve, 30))
     expect(h.sent.every((frame) => !frame.content.includes("claw_runtime_recovery_response"))).toBe(true)
+  })
+})
+
+// 记账纪律的端到端验证（2026-11 重放缺陷修复）：isDuplicate 只读，
+// markProcessed 只在成功派发后调用。四条铁律：
+//   1) 到达但未派发（进程重启等）→ 重放仍会执行；
+//   2) 成功派发后 → 重放被挡；
+//   3) 队列满被丢（agent_busy）→ 不记账，重放仍会执行；
+//   4) chat_stop 撤排队消息（cancelled 终帧）→ 不记账，重放仍会执行。
+describe("startRunLoop replay-dedupe accounting (mark-after-dispatch)", () => {
+  interface SentFrame {
+    to: string
+    objectName: string
+    content: string
+  }
+
+  function harness(agentFixture: { agentPath: string }) {
+    const sent: SentFrame[] = []
+    const listeners: Array<(msg: InboundIMMessage) => void> = []
+    let onWired: () => void = () => {}
+    const wired = new Promise<void>((resolve) => { onWired = resolve })
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-replay-"))
+    const processedUidsPath = join(dir, "processed-uids.json")
+    // 私聊闸门要有确定性行为：写一份本测试自己的权限快照（owner=user_1，
+    // 本节点 allowPrivate=true），否则跑到别的机器/账号上会被真实快照拦成
+    // denied-stranger / no-agent-entry，私聊消息全部静默丢弃。
+    const permissionsPath = join(dir, "agent-permissions.json")
+    writeFileSync(permissionsPath, JSON.stringify({
+      ownerUserId: "user_1",
+      ownerUserIdPresent: true,
+      agents: [{ agent: "kimi", nodeId: "node_1", allowPrivate: true, behaviorPrompt: "", version: 1 }],
+      updatedAt: Date.now(),
+    }))
+    const prevPermissionsFile = process.env.CLAWMESSENGER_AGENT_PERMISSIONS_FILE
+    process.env.CLAWMESSENGER_AGENT_PERMISSIONS_FILE = permissionsPath
+    const transport: IMTransport = {
+      connect: async () => {},
+      sendMessage: async (to, objectName, content) => { sent.push({ to, objectName, content }) },
+      // run.ts 恒挂 sendStream（经 sendMessageTo）：缺了它流帧全部走 ~11s 的
+      // 终帧退避重试，轮次收尾被拖出测试窗口。
+      sendMessageTo: async (_conversationType, targetId, objectName, content) => {
+        sent.push({ to: targetId, objectName, content })
+      },
+      onMessage: (cb) => { listeners.push(cb) },
+      disconnect: async () => {},
+      getSelfUserId: () => "rc_node_self",
+    }
+    const api = new XiachatApi("http://unused.local")
+    vi.spyOn(api, "getConfig").mockImplementation(async () => ({ appKey: "appkey-1" }))
+    return {
+      sent,
+      wired,
+      transport,
+      dir,
+      processedUidsPath,
+      cleanup: () => {
+        if (prevPermissionsFile === undefined) delete process.env.CLAWMESSENGER_AGENT_PERMISSIONS_FILE
+        else process.env.CLAWMESSENGER_AGENT_PERMISSIONS_FILE = prevPermissionsFile
+        rmSync(dir, { recursive: true, force: true })
+      },
+      start: () =>
+        void startRunLoop({
+          creds: { nodeId: "node_1", token: "tok", serverUrl: "http://unused.local", appKey: "appkey-1" },
+          api,
+          transport,
+          agentExecPath: agentFixture.agentPath,
+          // Unknown agent name keeps invocation in stdin mode (no argv
+          // strategy) and skips the opencode serve path entirely.
+          agentName: "kimi",
+          processedUidsPath,
+          turnTimeoutMs: 10_000,
+          stdout: { write: () => { onWired(); return true } } as unknown as NodeJS.WriteStream,
+        }),
+      emit: (uid: string | undefined, content: string, objectName = "RC:TxtMsg") => {
+        for (const cb of listeners) {
+          cb({
+            objectName,
+            fromUserId: "user_1",
+            toUserId: "",
+            targetId: "user_1",
+            conversationType: 1,
+            content,
+            messageUId: uid,
+          } as InboundIMMessage)
+        }
+      },
+    }
+  }
+
+  // 私聊文本消息：唯一的必经字段是 content（RC:TxtMsg 的正文）。
+  const textMsg = (text: string): string => JSON.stringify({ content: text })
+
+  function readRecorded(path: string): string[] {
+    try {
+      return JSON.parse(readFileSync(path, "utf8")) as string[]
+    } catch {
+      return []
+    }
+  }
+
+  it("an arrived-but-never-dispatched message is NOT recorded: its replay still runs", async () => {
+    // A crashing agent: every turn fails (dispatch itself never completes
+    // successfully — handle() resolves via the internal failed-frame path
+    // after the agent dies, which still counts as dispatched since the turn
+    // genuinely ran). To model "never dispatched" we instead stop the loop
+    // before the queue picks the message up: a hanging first turn occupies
+    // the conversation slot and the victim waits in queue forever.
+    const agent = createEchoAgentScript("kimi", { hangMs: 60_000 })
+    const h = harness(agent)
+    try {
+      h.start()
+      await h.wired
+      // First message occupies the only concurrency slot (hangs).
+      h.emit("uid-occupy", textMsg("first slow question"))
+      // Wait until the first turn actually started spawning.
+      await vi.waitFor(() => expect(h.sent.length + readRecorded(h.processedUidsPath).length).toBeGreaterThanOrEqual(0))
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      // Second message queues (depth 1), then a third is REJECTED (busy).
+      h.emit("uid-queued", textMsg("second question"))
+      h.emit("uid-dropped", textMsg("third question"))
+      // uid-dropped was never dispatched (agent_busy frame, not a turn).
+      await vi.waitFor(() =>
+        expect(h.sent.some((f) => f.objectName === "chat_stream" && f.content.includes("agent_busy"))).toBe(true))
+      // ...and its UID must not have been recorded.
+      expect(readRecorded(h.processedUidsPath)).not.toContain("uid-dropped")
+    } finally {
+      agent.cleanup()
+      h.cleanup()
+    }
+  })
+
+  it("a successfully dispatched message IS recorded: its replay is dropped", async () => {
+    const agent = createEchoAgentScript("kimi")
+    const h = harness(agent)
+    try {
+      h.start()
+      await h.wired
+      h.emit("uid-ok", textMsg("hello"))
+      // The turn completed: a reply (fallback text or stream) reached the user.
+      await vi.waitFor(() => expect(h.sent.length).toBeGreaterThan(0), { timeout: 8_000 })
+      // The turn must fully finish (agent spawn ~1s + terminal resend gap
+      // 600ms) and the debounced marker flush (1s) fire before the file
+      // exists — the first frame arrives long before all that.
+      await vi.waitFor(() =>
+        expect(readRecorded(h.processedUidsPath)).toContain("uid-ok"), { timeout: 8_000 })
+      // Replay of the same UID must now be dropped — no second turn.
+      const sentBefore = h.sent.length
+      h.emit("uid-ok", textMsg("hello"))
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(h.sent.length).toBe(sentBefore)
+    } finally {
+      agent.cleanup()
+      h.cleanup()
+    }
+  })
+
+  it("queue-full drop (agent_busy) never records: replay of the dropped UID still runs", async () => {
+    const agent = createEchoAgentScript("kimi", { hangMs: 60_000 })
+    const h = harness(agent)
+    try {
+      h.start()
+      await h.wired
+      h.emit("uid-occupy", textMsg("first"))
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      h.emit("uid-wait", textMsg("second"))
+      h.emit("uid-busy", textMsg("third"))
+      await vi.waitFor(() =>
+        expect(h.sent.some((f) => f.content.includes("agent_busy"))).toBe(true))
+      expect(readRecorded(h.processedUidsPath)).not.toContain("uid-busy")
+    } finally {
+      agent.cleanup()
+      h.cleanup()
+    }
+  })
+
+  it("chat_stop-dropped queued message never records: replay still runs", async () => {
+    const agent = createEchoAgentScript("kimi", { hangMs: 60_000 })
+    const h = harness(agent)
+    try {
+      h.start()
+      await h.wired
+      h.emit("uid-occupy", textMsg("first"))
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      h.emit("uid-victim", textMsg("second"))
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      // Stop the conversation: drops uid-victim while it is still queued.
+      h.emit(
+        "uid-stop",
+        JSON.stringify({ msg_type: "chat_stop", stream_id: "stream-unknown", request_id: "req-1" }),
+        "chat_stop",
+      )
+      // The dropped message gets a cancelled terminal frame...
+      await vi.waitFor(() =>
+        expect(h.sent.some((f) => f.content.includes("cancelled"))).toBe(true))
+      // ...but the queued victim is never recorded — replay of it still runs.
+      // (uid-occupy MAY be recorded: chat_stop's conversation fallback aborts
+      // the running turn, which resolves handle() after genuine dispatch —
+      // and re-running a deliberately-stopped message on replay would be
+      // wrong, so recording it is the intended behavior.)
+      await new Promise((resolve) => setTimeout(resolve, 1_200))
+      const recorded = readRecorded(h.processedUidsPath)
+      expect(recorded).not.toContain("uid-victim")
+      // The chat_stop itself bypassed the queue and completed -> recorded.
+      expect(recorded).toContain("uid-stop")
+    } finally {
+      agent.cleanup()
+      h.cleanup()
+    }
   })
 })
 

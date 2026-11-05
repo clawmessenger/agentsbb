@@ -156,13 +156,22 @@ describe("decidePrivateChat —— 四条分支 + 唯一的 fail-open", () => {
     expect(decidePrivateChat(null, { fromUserId: "x", nodeId: "node-1" }).reason).toBe("no-snapshot");
   });
 
-  it("有快照但快照里没有这个节点：拒绝（审查 S3：查不到不能放行）", () => {
+  it("有快照但快照里没有这个节点：陌生人拒绝（审查 S3：查不到不能放行）", () => {
     expect(decidePrivateChat(snap, { fromUserId: "x", nodeId: "other" })).toMatchObject({
       allow: false,
       reason: "no-agent-entry",
     });
-    // 连主人也不行：没有这一行就无从判断这个节点该不该服务任何人。
-    expect(decidePrivateChat(snap, { fromUserId: OWNER, nodeId: "other" }).allow).toBe(false);
+  });
+
+  it("有快照但缺这一行：主人仍放行（2026-11-05：快照被写坏把主人锁在门外）", () => {
+    // 语义与 allowPrivate=false 时一致 —— 那时候主人本来就豁免。
+    // 「查不到这一行」不该比「明确禁止」更严，否则快照一坏，主人自己都发不进话。
+    expect(decidePrivateChat(snap, { fromUserId: OWNER, nodeId: "other" })).toMatchObject({
+      allow: true,
+      reason: "owner",
+    });
+    // 陌生人照旧不放行：S3 的口径不变。
+    expect(decidePrivateChat(snap, { fromUserId: "stranger", nodeId: "other" }).allow).toBe(false);
   });
 
   it("nodeId 不在时按 agent 名兜底（服务端把 nodeId 换了也不至于全放行/全拦）", () => {
@@ -180,6 +189,59 @@ describe("decidePrivateChat —— 四条分支 + 唯一的 fail-open", () => {
       decidePrivateChat(snapshot([{ nodeId: "n", agent: "a", allowPrivate: false }], ""), { fromUserId: "s", nodeId: "n" }).reason,
     ]);
     expect(reasons.size).toBe(4);
+  });
+});
+
+describe("空表快照（2026-11-05 现场：控制轮询停摆把快照写成空表）", () => {
+  const emptyFrozen: PermissionSnapshot = {
+    ownerUserId: OWNER,
+    ownerUserIdPresent: true,
+    agents: [],
+    updatedAt: 1_793_844_078_189,
+  };
+
+  it("私聊闸门对空表 fail-open（主人不被自己的设备锁在门外，原因是 empty-agents）", () => {
+    expect(decidePrivateChat(emptyFrozen, { fromUserId: OWNER, nodeId: "node-1" })).toMatchObject({
+      allow: true,
+      reason: "empty-agents",
+    });
+    expect(decidePrivateChat(emptyFrozen, { fromUserId: "stranger", nodeId: "node-1" }).allow).toBe(true);
+  });
+
+  it("空表 / 没有快照 / 有快照但没这行：三个分支互不相同（日志可区分）", () => {
+    const reasons = new Set([
+      decidePrivateChat(null, { fromUserId: OWNER, nodeId: "n" }).reason,
+      decidePrivateChat(emptyFrozen, { fromUserId: OWNER, nodeId: "n" }).reason,
+      decidePrivateChat(snapshot([{ agent: "codex", nodeId: "n1" }]), { fromUserId: OWNER, nodeId: "n" }).reason,
+    ]);
+    expect(reasons.size).toBe(3);
+  });
+
+  it("空表不覆盖上一份有效快照（写盘前挡住，磁盘上不会再出现空 agents）", () => {
+    const previousFull = snapshot([
+      { agent: "codex", nodeId: "n1", allowPrivate: true },
+      { agent: "ops", nodeId: "n2", allowPrivate: true },
+    ]);
+    const merged = mergePermissionSnapshot(previousFull, {
+      ownerUserId: OWNER,
+      ownerUserIdPresent: true,
+      agents: [],
+      updatedAt: 2,
+    });
+    expect(merged.agents).toHaveLength(2);
+    expect(merged.agents.map((a) => a.nodeId)).toEqual(["n1", "n2"]);
+    expect(merged.updatedAt).toBe(2);
+  });
+
+  it("首次写入本就没有上一份：空表可以落地，由读侧 fail-open 兜底", () => {
+    const merged = mergePermissionSnapshot(null, {
+      ownerUserId: OWNER,
+      ownerUserIdPresent: true,
+      agents: [],
+      updatedAt: 2,
+    });
+    expect(merged.agents).toHaveLength(0);
+    expect(decidePrivateChat(merged, { fromUserId: OWNER, nodeId: "n" }).allow).toBe(true);
   });
 });
 
@@ -467,15 +529,22 @@ describe("MessageDispatcher 接线：私聊闸门真的挡住了 agent", () => {
     expect(ran[0]?.opts).toMatchObject({ behaviorPrompt: "每句话都要简短。" });
   });
 
-  it("有快照但快照里没有本节点：拒绝执行，但回占位（审查 S3 + 修复①占位契约）", async () => {
+  it("有快照但快照里没有本节点：陌生人拒绝执行，但回占位（审查 S3 + 修复①占位契约）", async () => {
     const { dispatcher, turns, sent, ran } = build(
       snapshot([{ agent: "codex", nodeId: "other-node", allowPrivate: true }]),
     );
-    await dispatcher.handle(privateMsg(OWNER), turns);
+    await dispatcher.handle(privateMsg("stranger"), turns);
     expect(ran).toEqual([]);
-    // 同上：连主人也不放行，但占位照回（否则 UI 永远转圈）。
     expect(sent).toHaveLength(1);
-    expect(sent[0]).toMatchObject({ to: OWNER, objectName: "RC:TxtMsg" });
+    expect(sent[0]).toMatchObject({ to: "stranger", objectName: "RC:TxtMsg" });
+  });
+
+  it("有快照但缺本节点这一行：主人照常执行（2026-11-05：快照写坏不能把主人锁在门外）", async () => {
+    const { dispatcher, turns, ran } = build(
+      snapshot([{ agent: "codex", nodeId: "other-node", allowPrivate: true }]),
+    );
+    await dispatcher.handle(privateMsg(OWNER), turns);
+    expect(ran).toHaveLength(1);
   });
 
   it("无快照放行时每条都打 warn，且与「有快照且允许」的日志可区分", async () => {

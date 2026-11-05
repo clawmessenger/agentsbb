@@ -381,6 +381,15 @@ export interface ModelCatalogLoader {
 
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
 
+/**
+ * 配置里已经声明了模型清单时，给 CLI 列举的**短预算**。
+ *
+ * 声明清单足够让面板先有内容，但它是手写的一份子集：opencode 还会列出自己的
+ * 内置模型（`opencode/*`）和配置里没声明的 provider（`deepseek/*`），这些只在
+ * `opencode models` 的输出里。实测热启动 ~1.4s，4s 足够；超时就退回声明清单。
+ */
+const DECLARED_CLI_TIMEOUT_MS = 4_000;
+
 function groupsFromCatalog(catalog: DiscussionModelCatalog): GroupedProviders {
   const grouped: GroupedProviders = new Map();
   for (const provider of catalog.providers) {
@@ -444,21 +453,26 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
       );
     }
 
-    // 配置里已经有合法清单时，不再等 CLI 列举：`opencode models` 热启动就要 3–5s、
-    // 未登录/配置异常时能拖满 30s 超时，而 web 只等 8s。配置清单是同步拿到手的，
-    // 让它先出目录是本轮修复的全部意义；为了多列几个内置 provider 而把 8s 窗口
-    // 输掉，是本末倒置。
+    // 配置里已经有合法清单时，CLI 照样要跑，但只给一小段预算。
+    //
+    // 以前这里是「有声明就整个跳过 CLI」，理由是 `opencode models` 冷启动 3–5s、
+    // 超时上限 30s，会吃掉 web 的 8s 窗口。代价是**目录永远缺一块**：opencode
+    // 自己列出的内置 `opencode/*` 免费模型、以及配置里没声明的 provider
+    // （这台机器上是 `deepseek/*`）只存在于这条命令的输出里 —— 现场实测
+    // `opencode models` = 32 条（opencode 10 / agent-plan 14 / quukk 6 /
+    // deepseek 2），而面板只显示配置里那 20 条，用户看到的就是「模型列表不全」。
+    //
+    // 折中：跑，但把超时压到 DECLARED_CLI_TIMEOUT_MS。实测热启动 ~1.4s，4s 足够
+    // 吸收抖动；真的超时/报错就退回声明清单，与旧行为等价，不会让面板变空。
     const hasDeclared = declaredAdded > 0;
-    if (spec && hasDeclared) {
-      opts.logger?.(
-        `model catalog: ${opts.agentName} skipping \`${spec.argv.join(" ")}\` — ${declaredAdded} model(s) already declared in config`,
-      );
-    }
 
-    if (spec && !hasDeclared) {
+    if (spec) {
       const label = `${opts.agentName} ${spec.argv.join(" ")}`;
+      const cliTimeoutMs = hasDeclared
+        ? Math.min(spec.timeoutMs, DECLARED_CLI_TIMEOUT_MS)
+        : spec.timeoutMs;
       try {
-        const stdout = await opts.runCommand(spec.argv, spec.timeoutMs, spec.maxOutputBytes);
+        const stdout = await opts.runCommand(spec.argv, cliTimeoutMs, spec.maxOutputBytes);
         const fromCli = parseModelCatalogOutput(opts.agentName, stdout);
         // 并集而不是覆盖：同一个 provider 既在配置里声明了清单、CLI 又回报了
         // 一份时（opencode 两条路都会命中），覆盖会把配置里那份**更完整**的
@@ -477,7 +491,11 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
         if (!defaultModel) defaultModel = fromCli.defaultModel;
         opts.logger?.(`model catalog: ${label} -> ${fromCli.providers.length} provider(s)`);
       } catch (err) {
-        opts.logger?.(`model catalog: ${label} failed: ${describe(err)}`);
+        opts.logger?.(
+          hasDeclared
+            ? `model catalog: ${label} failed (${describe(err)}); keeping ${declaredAdded} declared model(s)`
+            : `model catalog: ${label} failed: ${describe(err)}`,
+        );
       }
     }
 

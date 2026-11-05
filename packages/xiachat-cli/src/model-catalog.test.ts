@@ -478,12 +478,18 @@ describe("createModelCatalogLoader with config-declared models", () => {
     expect(catalog.providers[1].models.map((model) => model.id)).toEqual(["glm-5.2"]);
   });
 
-  // 配置声明了清单时，CLI 列举**完全不必跑**：它既可能只回报一部分（把面板
-  // 缩小），也可能把 30s 超时拖进 web 的 8s 窗口。声明即权威。
-  it("treats the declaration as authoritative and never lets the CLI shrink it", async () => {
+  // 声明清单是**下限**，不是上限。
+  //
+  // 现场（2026-11-05，运维对话「切换模型」）：配置只声明 quukk 6 个 + agent-plan
+  // 14 个，而 `opencode models` 实际列 32 条 —— 多出来的是 10 个内置
+  // `opencode/*` 免费模型与 2 个 `deepseek/*`。以前「有声明就整个跳过 CLI」，
+  // 这 12 个永远不进面板，用户看到的就是「模型列表获取不全」。
+  it("declaration is a floor: CLI cannot shrink it, and its extra providers are merged", async () => {
     // 真实现场：配置声明 6 个，`opencode models` 只回报其中 2 个。整组替换会把
-    // 面板从 6 个缩成 2 个 —— 声明式目录的价值就是「配置说了算」。
-    const runCommand = vi.fn().mockResolvedValue("quukk/glm-5.2\nquukk/beam-free\n");
+    // 面板从 6 个缩成 2 个 —— 所以只能是并集，不能覆盖。
+    const runCommand = vi.fn().mockResolvedValue(
+      "quukk/glm-5.2\nopencode/beam-free\ndeepseek/deepseek-v4-pro\n",
+    );
     const loader = createModelCatalogLoader({
       agentName: "opencode",
       runCommand,
@@ -495,25 +501,31 @@ describe("createModelCatalogLoader with config-declared models", () => {
     });
 
     const catalog = await loader.load();
-    expect(runCommand).not.toHaveBeenCalled();
-    expect(catalog.providers).toHaveLength(1);
-    expect(catalog.providers[0].models.map((model) => model.id)).toEqual([
-      "glm-5.2", "glm-5.3", "k3",
+    expect(runCommand).toHaveBeenCalledTimes(1);
+
+    const quukk = catalog.providers.find((provider) => provider.id === "quukk");
+    // 配置里的三个一个都不能少（CLI 只回报了其中一个）
+    expect(quukk?.models.map((model) => model.id)).toEqual(["glm-5.2", "glm-5.3", "k3"]);
+    // CLI 独有、配置里没有的 provider 照样进面板（这正是「不全」的那一块）
+    expect(catalog.providers.map((provider) => provider.id)).toEqual([
+      "deepseek", "opencode", "quukk",
     ]);
-    // CLI 独有但配置没声明的模型不会混进来：这一轮目录的来源只有配置。
-    expect(catalog.providers[0].models.map((model) => model.id)).not.toContain("beam-free");
     expect(catalog.defaultModel).toBe("quukk/glm-5.2");
   });
 
-  // 这条钉的是**延迟语义**，不是结果：web 只等 8s，而 `opencode models` 冷启
-  // 3-5s、超时上限 30s。只要 `if (spec && !hasDeclared)` 被改回 `if (spec)`，
-  // 结果类断言依然全绿，但线上会重新变成「拿不到模型列表」—— 所以这里必须
-  // 断言「一个子进程都没起」且「毫秒级返回」。
-  it("returns declared models without spawning the list command at all", async () => {
-    const runCommand = vi.fn(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
-      return "quukk/from-cli";
-    });
+  // 这条钉的是**延迟语义**：CLI 必须跑（否则目录永远缺块），但预算只有 4s。
+  // 两个方向都要钉死 ——
+  //   · 改回「整个跳过」→ 模型列表重新变不全（见上一条）；
+  //   · 改回 `spec.timeoutMs`（30s）→ web 的 8s 窗口被拖死，面板直接超时。
+  // 断言参数而不是墙钟时间：注入的 runCommand 不一定自己执行超时，用耗时断言
+  // 只会测到 mock 的睡眠。
+  it("runs the list command with a 4s budget when models are already declared", async () => {
+    // 显式声明参数类型：默认推断是空 tuple，取 calls[0][1] 会被 tsc 挡下
+    const runCommand = vi.fn(
+      async (_argv: string[], _timeoutMs: number, _maxBytes: number): Promise<string> => {
+        throw new Error("spawn opencode models ETIMEDOUT");
+      },
+    );
     const loader = createModelCatalogLoader({
       agentName: "opencode",
       runCommand,
@@ -524,16 +536,30 @@ describe("createModelCatalogLoader with config-declared models", () => {
       }),
     });
 
-    const startedAt = Date.now();
     const catalog = await loader.load();
-    const elapsedMs = Date.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(100);
-    expect(runCommand).not.toHaveBeenCalled();
+    expect(runCommand).toHaveBeenCalledTimes(1);
+    expect(runCommand.mock.calls[0][0]).toEqual(["models"]);
+    // 第二个参数是超时预算，第三个是输出上限
+    expect(runCommand.mock.calls[0][1]).toBe(4_000);
+    expect(runCommand.mock.calls[0][2]).toBe(256 * 1024);
+    // 超时/失败不等于没有目录：声明清单照常交付（旧行为等价，不倒退）
     expect(catalog.providers).toEqual([
       { id: "quukk", name: "quukk", models: [{ id: "glm-5.2", name: "glm-5.2" }] },
     ]);
     expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("uses the command's own 30s budget when nothing is declared", async () => {
+    const runCommand = vi.fn().mockResolvedValue("quukk/glm-5.2\n");
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand,
+      readConfig: () => ({ endpoints: [], defaultModel: null }),
+    });
+
+    await loader.load();
+    expect(runCommand.mock.calls[0][1]).toBe(30_000);
   });
 
   // 配置是用户手写的，provider key 里带空格完全可能。wire 上的 id 必须能拼成
