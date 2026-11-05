@@ -1673,6 +1673,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// upgrade_download.go。
 	r.Get("/api/agent/upgrade/download", h.ClawUpgradeDownload)
 	r.Get("/api/claw/nodes/{nodeId}/status", h.ClawNodeStatus)
+	// 用户态「重启这个智能体」：只有设备主人能调；设备离线时照样写入（排队，设备
+	// 上线第一轮轮询执行）。补的是「device/control/set 只认设备凭据、App 拿不到」
+	// 那个洞 —— 见 internal/handler/claw_node_restart.go 顶部。
+	r.Post("/api/claw/nodes/{nodeId}/restart", h.ClawRestartNode)
 	// 绑定智能体的使用权限（私聊/群聊/讨论组/聊天室/读写文件 + 行为规范）。
 	// 读对任何登录用户开放，写只允许 claimed_by_user_id 本人 —— 见
 	// internal/handler/claw_agent_permission.go 顶部。
