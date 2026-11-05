@@ -278,6 +278,131 @@ describe("private gate reject notice", () => {
   });
 });
 
+// 私聊轮次超时兜底（2026-11-04 事故修复③）：群聊有服务端
+// relayTurnTimeoutFloor=600s + relayTurnFailedNote 占位，私聊完全由设备端执行 ——
+// 超时后必须回「（{agent} 本轮响应超时，请重试）」占位，否则发送方 UI 永远转圈。
+describe("private turn timeout fallback", () => {
+  const inbound = (fromUserId: string): Parameters<MessageDispatcher["handle"]>[0] => ({
+    objectName: "RC:TxtMsg",
+    fromUserId,
+    toUserId: "rc_node_x",
+    targetId: "rc_node_x",
+    conversationType: 1,
+    content: JSON.stringify({ content: "慢问题" }),
+  });
+
+  it("a turn_timeout failure (degraded path) sends the placeholder text to the sender", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send, agentName: "kimi" });
+    await dispatcher.handle(inbound("user_slow"), {
+      runTurn: async () => { throw new Error("agent turn timeout after 300000ms"); },
+    });
+    const notice = deps.sent.find((f) => f.objectName === "RC:TxtMsg");
+    expect(notice).toBeDefined();
+    expect(notice!.to).toBe("user_slow");
+    const parsed = JSON.parse(notice!.content) as { content: string };
+    expect(parsed.content).toBe("（kimi 本轮响应超时，请重试）");
+  });
+
+  it("other failures (quota/auth) do NOT get the timeout placeholder", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send, agentName: "kimi" });
+    await dispatcher.handle(inbound("user_q"), {
+      runTurn: async () => { throw new Error("HTTP 429: quota exceeded"); },
+    });
+    expect(deps.sent.some((f) => f.content.includes("响应超时"))).toBe(false);
+  });
+
+  it("the 600s guard fires when the inner timeout never does: failed frame + placeholder + abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const sent: Array<{ to: string; objectName: string; content: string }> = [];
+      const streams: string[] = [];
+      const deps = {
+        send: async (to: string, objectName: string, content: string) => {
+          sent.push({ to, objectName, content });
+        },
+        sendStream: async (_c: 1 | 3 | 4, _id: string, _o: string, content: string) => {
+          streams.push(content);
+        },
+        agentName: "kimi",
+      };
+      const dispatcher = new MessageDispatcher(deps);
+      let aborted = false;
+      // runTurnStreamed 永不结束（模拟 opencode serve 悬挂、abort 才肯退）。
+      const pending = dispatcher.handle(inbound("user_hang"), {
+        runTurn: async () => "unused",
+        runTurnStreamed: (_p, _m, _d, signal) =>
+          new Promise<string>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(new Error("agent turn aborted"));
+            }, { once: true });
+          }),
+      });
+      // 处理帧（processing）先发出去；然后快进 600s：兜底墙钟必须到点。
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(600_000);
+      await pending;
+      // 占位发送是 fire-and-forget（不阻塞收尾），刷一轮微任务再断言。
+      await vi.advanceTimersByTimeAsync(10);
+      expect(aborted).toBe(true);
+      // failed 终帧（error_code=turn_timeout）。
+      const failedFrame = streams.find((c) => c.includes("\"failed\"") && c.includes("turn_timeout"));
+      expect(failedFrame).toBeDefined();
+      // 文本占位。
+      const notice = sent.find((f) => f.objectName === "RC:TxtMsg");
+      expect(notice).toBeDefined();
+      const parsed = JSON.parse(notice!.content) as { content: string };
+      expect(parsed.content).toBe("（kimi 本轮响应超时，请重试）");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("guard never fires for non-private venues (no placeholder in group turns)", async () => {
+    vi.useFakeTimers();
+    try {
+      const sent: Array<{ to: string; objectName: string; content: string }> = [];
+      const streams: string[] = [];
+      const dispatcher = new MessageDispatcher({
+        send: async (to, objectName, content) => { sent.push({ to, objectName, content }); },
+        sendStream: async (_c, _id, _o, content) => { streams.push(content); },
+        agentName: "kimi",
+      });
+      // your_turn 群聊轮次（conversation_type=3），agent 悬挂 —— 兜底墙钟不该存在，
+      // 轮次由 runAgentTurn 的 timeoutMs（测试外）与服务端超时负责。
+      const pending = dispatcher.handle(
+        {
+          objectName: "command",
+          fromUserId: "server_node",
+          toUserId: "rc_node_x",
+          targetId: "rc_node_x",
+          conversationType: 1,
+          content: JSON.stringify({
+            service: "discussion",
+            action: "your_turn",
+            request_id: "req-g-1",
+            params: { conversation_type: 3, chatroom_id: "group_1", requester_id: "user_g", role_prompt: "[group chat] x：用户刚在群里发言，请直接回应用户。" },
+          }),
+        },
+        {
+          runTurn: async () => "unused",
+          runTurnStreamed: () => new Promise<string>(() => {}),
+        },
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(700_000);
+      // 悬挂的 promise 永不结束 —— pending 仍 pending 是预期；只要没有占位即可。
+      const notice = sent.find((f) => f.objectName === "RC:TxtMsg" && f.content.includes("响应超时"));
+      expect(notice).toBeUndefined();
+      void pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("MessageDispatcher html cards", () => {
   const REPLY_WITH_HTML = [
     "这是页面：",

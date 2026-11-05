@@ -341,6 +341,19 @@ const STREAM_FRAME_INTERVAL_MS = 900;
 const STREAM_TEXT_FRAME_INTERVAL_MS = 200;
 // 终帧补发前的间隔：足够让第一份走完 IM 链路，又不至于让用户多等。
 const TERMINAL_RESEND_GAP_MS = 600;
+// 私聊轮次的外层兜底墙钟（修复③）：对齐服务端中继保底 relayTurnTimeoutFloor
+// =600s。正常超时由 runAgentTurn 自己的 timeoutMs（默认 300s）先触发；这道
+// 墙钟只在「内层超时机制本身没生效」（如 opencode serve 的 HTTP 悬挂、进程
+// 不响应 abort）时才会到点 —— 到点即 abort + failed 终帧 + 文本占位。
+export const PRIVATE_TURN_TIMEOUT_MS = 600_000;
+
+/**
+ * 私聊超时占位文案（修复③）：群聊有服务端 relayTurnFailedNote 兜底，私聊
+ * 完全由设备端执行 —— 超时后必须回一条明确占位，发送方 UI 才能落定。
+ */
+export function privateTurnTimeoutNotice(agent: string): string {
+  return `（${agent} 本轮响应超时，请重试）`;
+}
 // 流式心跳间隔：比服务端轮次超时（默认 60s）短一个量级，服务端每收到一次
 // 心跳就把该轮 deadline 重置成完整超时 —— 只要流还在动就永不超时。
 const STREAM_PING_INTERVAL_MS = 15_000;
@@ -937,6 +950,57 @@ export class MessageDispatcher {
     let terminalSent = false;
     /** 轮次开始时刻：日志里打 elapsed，用来回答「这一轮到底跑了多久」。 */
     const turnStartedAt = Date.now();
+    /** 超时占位只发一次（内层失败路径与外层兜底都可能触发）。 */
+    let timeoutNoticeSent = false;
+    /**
+     * 私聊超时占位（修复③）：任何路径把本轮判成 turn_timeout（内层 agent
+     * 超时，或下面的外层兜底墙钟）都向发送者回一条文本占位 —— 群聊有服务端
+     * relayTurnFailedNote 兜底，私聊没有，不补这条用户就只能靠 web 端解析
+     * failed 终帧（旧 web / 降级链路收不到帧 = 永远转圈）。
+     * 发送失败只记日志；只在私聊会话生效。
+     */
+    const sendTimeoutNoticeIfPrivate = (errorCode: string): void => {
+      if (ctx.conversationType !== 1 || errorCode !== "turn_timeout") return;
+      if (timeoutNoticeSent) return;
+      timeoutNoticeSent = true;
+      const agent = this.deps.agentName || this.deps.nodeId || this.deps.selfUserId || "agent";
+      console.error(
+        `private turn timeout notice: conv=${ctx.conversationId} req=${ctx.requestMessageId}`
+        + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s`,
+      );
+      void this.deps
+        .send(ctx.conversationId, "RC:TxtMsg", JSON.stringify({ content: privateTurnTimeoutNotice(agent) }))
+        .catch((err: unknown) => {
+          console.error(
+            "private turn timeout notice send failed:",
+            err instanceof Error ? err.message : err,
+          );
+        });
+    };
+    // 外层兜底墙钟（仅私聊）：runAgentTurn 自带 timeoutMs（默认 300s），但那套
+    // 机制失效时（serve 悬挂、abort 不响应）本轮会无限挂着 —— 到点强制 abort
+    // + failed 终帧 + 文本占位。fire-and-forget：真正收尾仍由主流程的 abort 分支
+    // / catch 完成，这里只保证「一定有终态」。
+    const privateGuardTimer: ReturnType<typeof setTimeout> | null = ctx.conversationType === 1
+      ? setTimeout(() => {
+          try {
+            if (controller.signal.aborted || terminalSent) return;
+            terminalSent = true;
+            console.error(
+              `private turn guard fired: conv=${ctx.conversationId} req=${ctx.requestMessageId}`
+              + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s — aborting`,
+            );
+            void emit(seq, "failed", "", undefined, "turn_timeout");
+            sendTimeoutNoticeIfPrivate("turn_timeout");
+            controller.abort();
+          } catch (err) {
+            console.error(
+              "private turn guard failed:",
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }, PRIVATE_TURN_TIMEOUT_MS)
+      : null;
     try {
       // 流式心跳：**所有服务端按序派发的轮次**都从轮次一开始发，不分流式/降级
       // 路径 —— openclaw 这类不流式的运行时全程沉默、只在结束时发一帧，若只挂在
@@ -1002,6 +1066,9 @@ export class MessageDispatcher {
           // 即可（这条流不会有别的帧）。老 web 不认 error_code 也能看到
           // 「生成失败」。「没答完」时把已产出的正文一起带走。
           await emit(0, "failed", incomplete?.partialText ?? "", undefined, errorCode);
+          if (ctx.conversationType === 1 && errorCode === "turn_timeout") {
+            sendTimeoutNoticeIfPrivate(errorCode);
+          }
           if (opts.onError) {
             await opts.onError(errMsg);
             return;
@@ -1103,7 +1170,11 @@ export class MessageDispatcher {
           break;
         } catch (err) {
         if (controller.signal.aborted) {
-          await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
+          // 兜底墙钟已经发过 failed 终帧时不再补 cancelled 帧（首终帧不可变，
+          // 补了也会被 web 丢弃，徒增日志噪音）。
+          if (!terminalSent) {
+            await emit(seq, "cancelled", snapshot, reasoningSnapshot || undefined, undefined, activitySnapshot, timeline);
+          }
           return;
         }
         const incomplete = err instanceof TurnIncompleteError ? err : undefined;
@@ -1132,6 +1203,10 @@ export class MessageDispatcher {
           + ` text=${failedText.length} err=${errMsg}`,
         );
         await emit(seq, "failed", failedText, reasoningSnapshot || undefined, errorCode, activitySnapshot, timeline);
+        if (ctx.conversationType === 1 && errorCode === "turn_timeout") {
+          // 私聊超时占位（修复③）：群聊有服务端占位，私聊这条只能设备端补。
+          sendTimeoutNoticeIfPrivate(errorCode);
+        }
         if (opts.onError) {
           await opts.onError(errMsg);
           return;
@@ -1248,12 +1323,19 @@ export class MessageDispatcher {
       if (!controller.signal.aborted && !terminalSent) {
         await emit(seq, "failed", incomplete?.partialText ?? "", undefined, errorCode);
       }
+      if (ctx.conversationType === 1 && errorCode === "turn_timeout") {
+        sendTimeoutNoticeIfPrivate(errorCode);
+      }
       // 中继轮（your_turn）必须回 command_result：服务端靠它推进下一位，
       // 不回就只能干等超时。重复回包由服务端按 requestID 吞掉，安全。
       if (opts.onError) {
         await opts.onError(errMsg).catch(() => {});
       }
     } finally {
+      // 私聊兜底墙钟随轮次结束撤掉：正常完成/内层超时先收尾，它就不该再响。
+      if (privateGuardTimer !== null) {
+        clearTimeout(privateGuardTimer);
+      }
       // 心跳随轮次结束：终帧/取消/失败之后都不再发。
       if (pingTimer !== null) {
         clearInterval(pingTimer);
