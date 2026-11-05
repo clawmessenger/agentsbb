@@ -2541,7 +2541,12 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
           : {}),
         // 启停回执：本机各 agent 现在实际是什么状态。服务端据此把「已下发」升级成
         // 「已生效 / 执行失败（原因）」。老服务端忽略这个字段。
-        observed: observedNow(),
+        //
+        // **spawn 之前那次拉取不能带**：那时 managed 还是空表，observedAgentStates
+        // 会把每一个绑定过的 agent 都判成 missing，服务端当场落库成「执行失败：本机
+        // PATH 上没有 xxx 命令」—— 每次开机都假报警 10 秒（下一次轮询才纠正）；
+        // 万一进程在这 10 秒里退出，这条假结论就永久留在页面上了。
+        ...(managed.size > 0 ? { observed: observedNow() } : {}),
       });
       // 权限快照：先落盘，再收敛启停 —— 闸门依赖它，落盘失败只记日志（最坏
       // 结果是沿用上一份，不能因为写不了文件就把轮询判失败）。

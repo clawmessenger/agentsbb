@@ -1355,4 +1355,21 @@ describe("常驻自愈与启停回执随轮询上报", () => {
     const calls = vi.mocked(h.api.fetchDeviceControl).mock.calls;
     expect(calls[calls.length - 1][3]?.serviceReady).toBe(true);
   });
+
+  it("spawn 之前的首次拉取不带 observed（那时 managed 还是空的）", async () => {
+    const h = makeHarness([], BOUND_OPS, {
+      serviceHealth: () => ({ ready: true, detail: "systemd 服务" }),
+    });
+    await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
+
+    const first = vi.mocked(h.api.fetchDeviceControl).mock.calls[0][3];
+    // 空表上报会把每个绑定 agent 判成 missing → 服务端记成「执行失败」，纯属捏造。
+    expect(first?.observed).toBeUndefined();
+    // 常驻健康是启动时算出来的常量，首轮就该带上，不受影响。
+    expect(first?.serviceReady).toBeDefined();
+
+    await realSleep(CONTROL_TICK_MS * 3);
+    const last = vi.mocked(h.api.fetchDeviceControl).mock.calls.at(-1)?.[3];
+    expect(last?.observed).toEqual([{ agent: "ops", state: "running", version: 0 }]);
+  });
 });
