@@ -64,9 +64,20 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		return errRelayResult(409, "该群没有可发言的 AI 成员")
 	}
 	bgCtx := context.WithoutCancel(ctx)
+	// 群主点了「暂停 OpenClaw」：这条消息不派发。
+	//
+	// 暂停的语义是**优雅停止**（2026-11-06 拍板）：点击时正在发言的那一位把话
+	// 说完，之后谁都不再开口；恢复也一样，不会把暂停期间攒下的消息补跑一遍。
+	// 所以这里拒绝的是「新的起头」，进行中的那段由 pump 自己在派下一位前收尾
+	// （见 pump 里的 groupPaused 检查）。
+	//
+	// 放在权限校验之后：不是群成员的人不该通过这条例外文字探到群设置。
+	rounds, paused := h.groupOpenclawSettings(ctx, groupID)
+	if paused {
+		return errRelayResult(409, "本群 AI 对话已暂停，恢复后才会继续发言")
+	}
 	// 定向即唯一（方案 A）：@ 谁=谁说一轮，AI 对话轮数收口为 1，
 	// 不再自动接力 —— 这是本次拍板语义与旧「定向只影响先手」的核心差异。
-	rounds := h.groupRelayRounds(ctx, groupID)
 	if targeted {
 		rounds = 1
 	}
@@ -91,21 +102,47 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 // openclaw_max_rounds）：用户发一条消息后，AI 成员之间最多接力讨论几轮。
 // 群镜像没配或查不到时回落默认值 —— 这个设置项取不到不该让整次发言失败。
 func (h *chatroomRelayHub) groupRelayRounds(ctx context.Context, groupID string) int {
+	rounds, _ := h.groupOpenclawSettings(ctx, groupID)
+	return rounds
+}
+
+// groupOpenclawSettings 一次读出群的两个 OpenClaw 开关：接力轮数 + 是否暂停。
+//
+// 两件事每次都从同一行取，因为它们的真值都只有一处：rongcloud_group 的
+// openclaw_max_rounds / openclaw_stopped（群主在会话页点暂停 → group/update
+// → 服务端写这两列）。客户端传参、本地缓存都不作数 —— 多端（web / 小程序 /
+// App）必须看到同一个结论。
+//
+// 查询失败按「未暂停 + 默认轮数」处理：数据库抖一下不该让全群的 AI 永久闭嘴，
+// 那比「暂停晚生效一轮」严重得多。失败留 warn，便于事后核对。
+func (h *chatroomRelayHub) groupOpenclawSettings(ctx context.Context, groupID string) (rounds int, stopped bool) {
+	rounds = defaultGroupRelayRounds
 	if h.groupMirror == nil || h.groupMirror.GroupProfiles == nil {
-		return defaultGroupRelayRounds
+		return rounds, false
 	}
 	profiles, err := h.groupMirror.GroupProfiles(ctx, []string{groupID})
 	if err != nil {
-		h.rt.logger.Warn("relay: group rounds lookup",
+		h.rt.logger.Warn("relay: group settings lookup",
 			"group", groupID, "error", err)
-		return defaultGroupRelayRounds
+		return rounds, false
 	}
 	for _, profile := range profiles {
-		if profile.GroupID == groupID && profile.MaxRounds > 0 {
-			return profile.MaxRounds
+		if profile.GroupID != groupID {
+			continue
 		}
+		if profile.MaxRounds > 0 {
+			rounds = profile.MaxRounds
+		}
+		return rounds, profile.Stopped
 	}
-	return defaultGroupRelayRounds
+	return rounds, false
+}
+
+// groupPaused 报告本群的 OpenClaw 对话是否被群主暂停。pump 在每次派发下一位
+// 成员之前调它 —— 这就是「正在发言的说完、其他人都别开口」的唯一闸门。
+func (h *chatroomRelayHub) groupPaused(ctx context.Context, groupID string) bool {
+	_, stopped := h.groupOpenclawSettings(ctx, groupID)
+	return stopped
 }
 
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。

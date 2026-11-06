@@ -151,6 +151,15 @@ type relaySession struct {
 	// ——长思考轮下尤其明显（等 3 分钟才轮到自己说话，却说不上）。
 	// 现在改为排队：当前中继跑完，接着用 pending 起一段新的。
 	pending *relayPending
+	// stopped 表示本次中继是被群主「暂停 OpenClaw」提前收尾的。
+	//
+	// 语义（2026-11-06 拍板）：暂停不打断**正在发言**的那一位 —— 它的回包照常
+	// 广播进群，pump 在派下一位之前看到 stopped 才结束整段接力。没开口的成员
+	// 一律不再派发，排队中的用户消息也一并丢弃（恢复后从下一条新消息重新开始，
+	// 不会把暂停期间攒下的轮次在一次恢复里全放出来）。
+	//
+	// 只由 pump goroutine 写；defer 收尾与 AcceptResponse 读，读写都在 h.mu 内。
+	stopped bool
 }
 
 // relayPending 是中继忙时排队的用户消息（同一房间只留最新一条，多条按
@@ -533,9 +542,15 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 			"chatroom", s.chatroomRCID, "timeout", timeout)
 	}
 	defer func() {
+		// 提前收尾（暂停 / 上下文取消）时本轮可能还有已发言内容没并入累计：
+		// closeRoundLocked 把 s.replies 折进 history 与 allReplies 并清空，重复
+		// 调用是安全的（replies 已空就直接返回）。少了这一步，暂停后重新开始
+		// 对话时上下文里会丢掉「暂停前最后那位的发言」。
+		h.closeRoundLocked(s)
 		h.mu.Lock()
 		replies := append([]relayReply(nil), s.allReplies...)
 		pending := s.pending
+		stopped := s.stopped
 		if cur, ok := h.sessions[s.chatroomRCID]; ok && cur == s {
 			delete(h.sessions, s.chatroomRCID)
 		}
@@ -543,12 +558,36 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 		// 本轮结束后并入滚动缓存，供下一条用户消息携带上下文。
 		h.recordRound(s.chatroomRCID, relayRound{userText: s.userText, replies: replies})
 		// 用户在中继期间发的消息：现在接着跑，不再静默丢弃。
-		if pending != nil {
+		//
+		// 例外是「被群主暂停」：排队的那条不能在暂停期间接着跑（否则用户点了
+		// 暂停，AI 还会把攒下的消息一条条回完），也不能留到恢复后补跑（恢复
+		// 只对**之后**的新消息生效）。直接丢弃并留日志，方便排查「我说的话
+		// 怎么没人接」。
+		switch {
+		case pending == nil:
+		case stopped:
+			h.rt.logger.Info("relay: dropping queued message because group is paused",
+				"chatroom", s.chatroomRCID, "chars", len([]rune(pending.userText)))
+		default:
 			h.startQueued(ctx, s, pending)
 		}
 	}()
 	for s.roundIndex < s.totalRounds {
 		for s.index < len(s.members) {
+			// 群主暂停：当前这一位已经说完（回包在 AcceptResponse 里广播完毕），
+			// 在派下一位**之前**收尾。检查放在派发前而不是每个成员回包后，是为了
+			// 保证「正在发言的说完、没发言的不再开口」这条语义。
+			//
+			// 聊天室/讨论组没有这个开关（openclaw_stopped 是群镜像列），不查。
+			if s.isGroup && h.groupPaused(ctx, s.chatroomRCID) {
+				h.mu.Lock()
+				s.stopped = true
+				h.mu.Unlock()
+				h.rt.logger.Info("relay: group paused by owner, stopping before next speaker",
+					"group", s.chatroomRCID, "round", s.roundIndex+1,
+					"spoke", len(s.replies), "remaining", len(s.members)-s.index)
+				return
+			}
 			member := s.members[s.index]
 			requestID := fmt.Sprintf("relay_%d_%d_%d", time.Now().UnixNano(), s.roundIndex, member.order)
 			done := make(chan struct{})
@@ -588,6 +627,7 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 			// 可重置的等待：成员每发一个流帧就把 deadline 往后推 —— 流还在
 			// 动说明它还在产出，绝不能按固定超时把长思考轮掐掉。轮询间隔
 			// 500ms，与派发粒度同量级；「deadline 后仍无回执」才判超时。
+			pauseCheckedAt := time.Now()
 		waitLoop:
 			for {
 				h.mu.Lock()
@@ -646,6 +686,35 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 				case <-ctx.Done():
 					return
 				case <-time.After(minDuration(remaining, 500*time.Millisecond)):
+					// 群主可能在成员思考期间点了暂停：
+					//   · 已经产出过流帧（renews>0）→ 它正在说，继续等它把话说完；
+					//   · 一直没有产出 → 视同「还没开口」，不必再等满超时（默认 60s
+					//     起），否则用户点了暂停还要干等一分钟才看到停下。
+					// 查库节流到 2s 一次：500ms 的轮询节奏打一次库没意义，暂停
+					// 晚一两秒生效用户无感（本来就要等当前这句说完）。
+					if s.isGroup && time.Since(pauseCheckedAt) >= 2*time.Second {
+						pauseCheckedAt = time.Now()
+						h.mu.Lock()
+						quiet := ext.renews == 0
+						h.mu.Unlock()
+						if quiet && h.groupPaused(ctx, s.chatroomRCID) {
+							h.rt.logger.Info("relay: group paused before the dispatched member produced anything",
+								"group", s.chatroomRCID, "target", member.rcID,
+								"round", s.roundIndex+1)
+							h.mu.Lock()
+							// 作废这一轮：迟到的回包会被 AcceptResponse 吞掉，
+							// 不会再冒出一条「暂停之后才出现」的发言。
+							if s.requestID == requestID {
+								s.requestID = ""
+							}
+							if s.turnExt == ext {
+								s.turnExt = nil
+							}
+							s.stopped = true
+							h.mu.Unlock()
+							return
+						}
+					}
 					// 回头重新检查 deadline（可能已被流帧推后）。
 				}
 			}
