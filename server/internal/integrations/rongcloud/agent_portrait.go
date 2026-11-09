@@ -107,7 +107,8 @@ func AgentKindForCLIName(name string) (string, bool) {
 // 明确不认（返回 false，调用方保持统一默认图）：
 //
 //	rc_node_<machineKey>            机器主节点，不是 agent
-//	..._ops / ops_<key>             运维节点，头像不该跟着 agent 走
+//	..._ops / ops_<key>             运维节点，用统一的机器人图（OpsPortraitURI），
+//	                                不跟 agent 的品牌图走
 //	未知 CLI 名（如 omp）            没有对应官方图标
 func AgentKindFromRCUserID(rcUserID string) (string, bool) {
 	id := strings.TrimSpace(rcUserID)
@@ -154,6 +155,99 @@ func AgentPortraitURI(kind string) (string, bool) {
 	return AgentPortraitBase() + "/" + k + "-256.png", true
 }
 
+// AgentPortraitForCLIName 按 CLI 命令名（节点 ai_type）给出品牌头像。
+//
+// 绑定链路手里只有 CLI 名（`opencode` / `kimi` / `cursor-agent`），没有 kind，
+// 所以必须走一次归一化 —— 少一层映射，opencode 的节点就会静默落回统一默认图。
+func AgentPortraitForCLIName(cliName string) (string, bool) {
+	kind, ok := AgentKindForCLIName(cliName)
+	if !ok {
+		return "", false
+	}
+	return AgentPortraitURI(kind)
+}
+
+// OpsPortraitKind 是运维（终端）账号共用头像的文件名主干（`ops-256.png`）。
+//
+// 运维账号服务的是「运维能力本身」而不是某个 agent：一台机器上每个 agent 各有
+// 一条 `<agentRC>_ops`，若各自用 agent 的品牌图，好友列表里会出现两个一模一样
+// 的 claude（本体 + 运维），用户分不清哪个是终端会话。所以它们共用一张中性的
+// 机器人图，靠名字区分服务对象。
+const OpsPortraitKind = "ops"
+
+// OpsNodeFallbackName 是判断不出「服务哪个 agent」时运维节点的显示名
+// （机器级运维节点：`ops_<machineKey>`、`rc_node_<machineKey>_ops`）。
+const OpsNodeFallbackName = "运维"
+
+// OpsNodeNameSuffix 是 per-agent 运维节点的显示名后缀：`claude 运维`。
+const OpsNodeNameSuffix = " 运维"
+
+// OpsPortraitURI 返回运维账号的统一头像（<base>/ops-256.png）。
+func OpsPortraitURI() string {
+	return AgentPortraitBase() + "/" + OpsPortraitKind + "-256.png"
+}
+
+// IsOpsPortraitURI 判断 portrait 是不是运维账号那张统一机器人图。
+func IsOpsPortraitURI(url string) bool {
+	return portraitFileStem(url) == OpsPortraitKind
+}
+
+// IsOpsNodeRCUserID 判断融云 id 是不是运维节点。
+//
+// 两种在野命名都要认：per-agent 的 `<agentRC>_ops`、机器级的 `ops_<machineKey>`
+// 与旧世代 `rc_node_<machineKey>_ops`（同样以 `_ops` 结尾）。
+func IsOpsNodeRCUserID(rcUserID string) bool {
+	id := strings.TrimSpace(rcUserID)
+	if id == "" {
+		return false
+	}
+	return id == OpsAgentType || strings.HasPrefix(id, OpsAgentType+"_") || strings.HasSuffix(id, "_ops")
+}
+
+// OpsNodeDisplayName 给运维节点算显示名：能看出服务哪个 agent 就叫
+// `<agent> 运维`，否则退回 `运维`。
+//
+// 运维节点的融云 id 是 `<agentRC>_ops`，去掉后缀就是一个真实 agent 的 id，
+// 因此不需要额外传参 —— 调用点（ensureAgentNodeWithRC）手上只有 `ops` 这个
+// ai_type，agent 归属全在这段 id 里。
+func OpsNodeDisplayName(opsRCUserID string) string {
+	id := strings.TrimSpace(opsRCUserID)
+	base := strings.TrimSuffix(id, "_ops")
+	if base != "" && base != id {
+		if kind, ok := AgentKindFromRCUserID(base); ok {
+			return kind + OpsNodeNameSuffix
+		}
+	}
+	return OpsNodeFallbackName
+}
+
+// portraitFileStem 抽出「本方案自己写的头像文件」的主干名（`claude` / `ops`），
+// 不是本 base 下的 URL 一律返回空串。只认 `<base>/<stem>-256.png` 这一种形态，
+// 绝不用 `%agent%` 式模糊匹配 —— 否则会误伤用户自定义头像。
+func portraitFileStem(rawURL string) string {
+	clean := strings.TrimSpace(rawURL)
+	if clean == "" {
+		return ""
+	}
+	if i := strings.IndexAny(clean, "?#"); i >= 0 {
+		clean = clean[:i]
+	}
+	clean = strings.TrimRight(clean, "/")
+	prefix := AgentPortraitBase() + "/"
+	if !strings.HasPrefix(clean, prefix) {
+		return ""
+	}
+	name := strings.TrimPrefix(clean, prefix)
+	if name == "" || strings.Contains(name, "/") {
+		return ""
+	}
+	const suffix = "-256.png"
+	if !strings.HasSuffix(name, suffix) {
+		return ""
+	}
+	return strings.TrimSuffix(name, suffix)
+}
+
 // rcUserNotFoundCode 是融云「该 userId 不存在」的业务错误码。
 //
 // 存量库里确实有这种行：`rongcloud_user` 有记录，但融云侧从来没注册过这个
@@ -178,26 +272,10 @@ func IsRCUserNotFound(err error) bool {
 //  2. 别人家的 URL 一律不碰 —— 只认自己 base 下的 25 个固定文件名，
 //     绝不用 `%agent%` 这类模糊匹配，否则会误伤用户自定义头像。
 func IsAgentPortraitURI(url string) bool {
-	clean := strings.TrimSpace(url)
-	if clean == "" {
+	stem := portraitFileStem(url)
+	if stem == "" {
 		return false
 	}
-	if i := strings.IndexAny(clean, "?#"); i >= 0 {
-		clean = clean[:i]
-	}
-	clean = strings.TrimRight(clean, "/")
-	prefix := AgentPortraitBase() + "/"
-	if !strings.HasPrefix(clean, prefix) {
-		return false
-	}
-	name := strings.TrimPrefix(clean, prefix)
-	if name == "" || strings.Contains(name, "/") {
-		return false
-	}
-	const suffix = "-256.png"
-	if !strings.HasSuffix(name, suffix) {
-		return false
-	}
-	_, ok := agentPortraitKinds[strings.TrimSuffix(name, suffix)]
+	_, ok := agentPortraitKinds[stem]
 	return ok
 }

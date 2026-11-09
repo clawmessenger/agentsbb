@@ -38,6 +38,7 @@ func portraitTestClearEnv(t *testing.T) {
 	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "")
 	t.Setenv("CLAW_AI_NODE_PORTRAIT_URI", "")
 	t.Setenv("MULTICA_PUBLIC_URL", "")
+	t.Setenv(AgentPortraitBaseEnv, "")
 }
 
 // newPortraitTestDB 打开测试库；不可达时 Skip。
@@ -194,9 +195,12 @@ func TestDefaultUserPortraitEnvChain(t *testing.T) {
 	if got := DefaultUserPortrait(); got != DefaultUserPortraitURI {
 		t.Fatalf("removed CLAW_AI_NODE_PORTRAIT_URI must not affect the default, got %q", got)
 	}
-	// AI 节点入口也必须是同一张图（不是 agent 维度分叉）。
-	if got := DefaultAgentNodePortrait("openclaw"); got != DefaultUserPortraitURI {
-		t.Fatalf("AI node portrait = %q, want the unified %q", got, DefaultUserPortraitURI)
+	// AI 节点走「谁家 agent 用谁家图」：认得出的 CLI 发品牌图，认不出的才落回统一图。
+	if got := DefaultAgentNodePortrait("openclaw"); got != AgentPortraitBaseURL+"/openclaw-256.png" {
+		t.Fatalf("AI node portrait = %q, want the openclaw brand art", got)
+	}
+	if got := DefaultAgentNodePortrait("omp"); got != DefaultUserPortraitURI {
+		t.Fatalf("unknown CLI portrait = %q, want the unified default %q", got, DefaultUserPortraitURI)
 	}
 
 	// 只剩 CLAW_DEFAULT_PORTRAIT_URI 可以覆盖。
@@ -241,28 +245,94 @@ func TestDefaultPortraitIfEmpty(t *testing.T) {
 	}
 }
 
-func TestDefaultAgentNodePortraitIsTheSameImage(t *testing.T) {
+func TestDefaultAgentNodePortraitUsesBrandArt(t *testing.T) {
 	portraitTestClearEnv(t)
 
-	for _, agent := range []string{"claude", "codex", "opencode", "openclaw", "hermes", "kimi", "", "agent-we-do-not-ship"} {
-		name := agent
-		if name == "" {
-			name = "(empty)"
+	// 每个 agent 账号用自己那家的图：opencode 的用 opencode，kimi 的用 kimi。
+	cases := []struct{ cli, file string }{
+		{"claude", "claude-256.png"},
+		{"codex", "codex-256.png"},
+		{"opencode", "opencode-256.png"},
+		{"kimi", "kimi-256.png"},
+		{"hermes", "hermes-256.png"},
+		{"openclaw", "openclaw-256.png"},
+		{"cursor-agent", "cursor-256.png"},
+		{"kiro-cli", "kiro-256.png"},
+		{"agy", "antigravity-256.png"},
+		{"ops", "ops-256.png"},
+	}
+	for _, tc := range cases {
+		want := AgentPortraitBaseURL + "/" + tc.file
+		if got := DefaultAgentNodePortrait(tc.cli); got != want {
+			t.Errorf("DefaultAgentNodePortrait(%q) = %q, want %q", tc.cli, got, want)
 		}
-		t.Run(name, func(t *testing.T) {
-			if got := DefaultAgentNodePortrait(agent); got != DefaultUserPortrait() {
-				t.Fatalf("DefaultAgentNodePortrait(%q) = %q, want the shared %q", agent, got, DefaultUserPortrait())
-			}
-			if got := DefaultAgentNodePortrait(agent); got != DefaultUserPortraitURI {
-				t.Fatalf("DefaultAgentNodePortrait(%q) = %q, want %q", agent, got, DefaultUserPortraitURI)
-			}
-		})
 	}
 
-	// env 覆盖时 AI 也跟随同一图源（不再有 openclaw.png 这类分叉）。
-	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "https://cdn.example.com/all.png")
-	if got := DefaultAgentNodePortrait("openclaw"); got != DefaultUserPortrait() {
-		t.Fatalf("AI portrait diverged from the human one: %q", got)
+	// 认不出的 CLI / 空 ai_type 只能落回统一默认图 —— 绝不随便借一张品牌图。
+	for _, cli := range []string{"", "   ", "omp", "agent-we-do-not-ship"} {
+		if got := DefaultAgentNodePortrait(cli); got != DefaultUserPortrait() {
+			t.Errorf("DefaultAgentNodePortrait(%q) = %q, want the unified default %q", cli, got, DefaultUserPortrait())
+		}
+	}
+
+	// 头像目录可被 env 覆盖：品牌图与运维机器人图都跟着走，不能钉死在常量上。
+	t.Setenv(AgentPortraitBaseEnv, "https://cdn.example.com/agent-avatars")
+	if got := DefaultAgentNodePortrait("kimi"); got != "https://cdn.example.com/agent-avatars/kimi-256.png" {
+		t.Fatalf("brand art must follow the env base, got %q", got)
+	}
+	if got := DefaultAgentNodePortrait("ops"); got != "https://cdn.example.com/agent-avatars/ops-256.png" {
+		t.Fatalf("ops art must follow the env base, got %q", got)
+	}
+}
+
+// TestOpsNodeDisplayName 锁住运维账号的命名：`ops` 一个名字铺满一屏的旧行为
+// 必须消失，能反推出服务对象的一律叫 `<agent> 运维`。
+func TestOpsNodeDisplayName(t *testing.T) {
+	cases := map[string]string{
+		"claude_3300776275_ops":   "claude 运维",
+		"opencode_3300776275_ops": "opencode 运维",
+		"cursor-agent_123_ops":    "cursor 运维",
+		// 机器级运维节点（两台机器各一条）：反推不出 agent，退回中性名。
+		"ops_3300776275":         OpsNodeFallbackName,
+		"rc_node_3300776275_ops": OpsNodeFallbackName,
+		"":                       OpsNodeFallbackName,
+	}
+	for rcID, want := range cases {
+		if got := OpsNodeDisplayName(rcID); got != want {
+			t.Errorf("OpsNodeDisplayName(%q) = %q, want %q", rcID, got, want)
+		}
+	}
+	if OpsNodeDisplayName("claude_3300776275_ops") == OpsAgentType {
+		t.Fatal("ops nodes must not keep the bare `ops` display name")
+	}
+}
+
+// TestIsReplaceableNodePortrait 锁住「能覆盖谁」的边界：我们自己写的默认图 /
+// 品牌图 / 运维图可以升级，用户自选的头像永远不许动。
+func TestIsReplaceableNodePortrait(t *testing.T) {
+	portraitTestClearEnv(t)
+
+	replaceable := []string{
+		"",
+		"   ",
+		DefaultUserPortraitURI,
+		DefaultUserPortrait(),
+		AgentPortraitBaseURL + "/claude-256.png",
+		AgentPortraitBaseURL + "/ops-256.png",
+	}
+	for _, in := range replaceable {
+		if !isReplaceableNodePortrait(in) {
+			t.Errorf("isReplaceableNodePortrait(%q) = false, want true", in)
+		}
+	}
+	keep := []string{
+		"https://cdn.example.com/uploads/u/me.png",
+		"https://newsradar.dreamdt.cn/claw-web/logo.png",
+	}
+	for _, in := range keep {
+		if isReplaceableNodePortrait(in) {
+			t.Errorf("isReplaceableNodePortrait(%q) = true, must never overwrite a user portrait", in)
+		}
 	}
 }
 

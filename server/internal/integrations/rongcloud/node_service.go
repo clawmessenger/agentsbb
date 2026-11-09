@@ -472,9 +472,18 @@ func (s *NodeService) RefreshToken(ctx context.Context, nodeID string) (string, 
 		return "", fmt.Errorf("rongcloud: get user: %w", err)
 	}
 	// getUserToken 在融云侧用户不存在时会建号：传空 name/portrait 就会落下
-	// 一个无名无头像的账号。用库内的权威资料，头像再兜一层默认图。
+	// 一个无名无头像的账号。用库内的权威资料，头像再按节点 ai_type 兜一层默认图
+	// （agent 各自品牌图 / 运维机器人图 / 统一默认图）。
 	name := rcUser.Name.String
-	portrait := DefaultPortraitIfEmpty(rcUser.PortraitUri.String)
+	if node.AiType.String == OpsAgentType {
+		if trimmed := strings.TrimSpace(name); trimmed == "" || trimmed == OpsAgentType {
+			name = OpsNodeDisplayName(node.RongcloudUserID)
+		}
+	}
+	portrait := strings.TrimSpace(rcUser.PortraitUri.String)
+	if isReplaceableNodePortrait(portrait) {
+		portrait = DefaultAgentNodePortrait(node.AiType.String)
+	}
 	token, err := s.client.getUserToken(ctx, node.RongcloudUserID, name, portrait)
 	if err != nil {
 		return "", fmt.Errorf("rongcloud: refresh token: %w", err)
@@ -1165,24 +1174,37 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 			}
 		}
 		current := strings.TrimSpace(u.PortraitUri.String)
+		// 运维节点改名：历史行的昵称就是 `ops`（当年直接把 ai_type 当名字写进去的），
+		// 一屏账号全同名。能反推出服务对象的一律迁到 `<agent> 运维`；owner 手改过的
+		// 名字（不等于 `ops`）不动。
+		wantName := u.Name.String
+		if opts.AgentPortraits && IsOpsNodeRCUserID(u.RongcloudUserID) {
+			if trimmed := strings.TrimSpace(wantName); trimmed == "" || trimmed == OpsAgentType {
+				wantName = OpsNodeDisplayName(u.RongcloudUserID)
+			}
+		}
 		target := DefaultUserPortrait()
 		// 品牌头像（`<kind>-256.png`）也是我们自己写进去的，不是用户自选 ——
 		// 统一默认图这一路把它一并纳入可覆盖集合，`-sync-portraits` 就成了
 		// 「批量换回灰人形」的现成回滚命令。用户自选的头像仍然永不覆盖。
-		overridable := NeedsDefaultPortrait(current) || IsAgentPortraitURI(current)
+		overridable := NeedsDefaultPortrait(current) || IsAgentPortraitURI(current) || IsOpsPortraitURI(current)
 		if opts.AgentPortraits {
-			// 品牌头像这一路只认「融云 id 能解析出 agent 类型」的行：机器主节点、
-			// ops 节点、真人镜像行保持统一默认图 —— 目标是给 agent 换图，不是重刷全表。
+			// 这一路给「agent 本人 + 运维节点」补各自的图：agent 用品牌图
+			// （opencode → opencode-256.png），运维用统一的机器人图。机器主节点与
+			// 真人镜像行不在这条路上 —— 目标是给 agent 换图，不是重刷全表。
 			kind, isAgent := AgentKindFromRCUserID(u.RongcloudUserID)
 			brand, hasBrand := "", false
-			if isAgent {
+			switch {
+			case isAgent:
 				brand, hasBrand = AgentPortraitURI(kind)
+			case IsOpsNodeRCUserID(u.RongcloudUserID):
+				brand, hasBrand = OpsPortraitURI(), true
 			}
 			if !hasBrand {
 				outcomes = append(outcomes, PortraitSyncOutcome{
 					Scope:  "rongcloud_user",
 					RCUser: u.RongcloudUserID,
-					Name:   u.Name.String,
+					Name:   wantName,
 					From:   current,
 					To:     "",
 					Status: "skipped",
@@ -1190,12 +1212,12 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 				continue
 			}
 			target = brand
-			// 幂等：已经是目标值就跳过，一轮重跑零融云调用。
-			if current == target {
+			// 幂等：头像已经是目标值**且**名字不用迁移才跳过，一轮重跑零融云调用。
+			if current == target && wantName == u.Name.String {
 				outcomes = append(outcomes, PortraitSyncOutcome{
 					Scope:  "rongcloud_user",
 					RCUser: u.RongcloudUserID,
-					Name:   u.Name.String,
+					Name:   wantName,
 					From:   current,
 					To:     target,
 					Status: "skipped",
@@ -1210,14 +1232,12 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 			// 所以必须单独判一次 `current == DefaultUserPortrait()`——漏掉它整批都会 skip。
 			//
 			// 用户自选的头像不属于以上任何一类，永不覆盖。
-			overridable = NeedsDefaultPortrait(current) ||
-				current == DefaultUserPortrait() ||
-				IsAgentPortraitURI(current)
+			overridable = isReplaceableNodePortrait(current)
 		}
 		outcome := PortraitSyncOutcome{
 			Scope:  "rongcloud_user",
 			RCUser: u.RongcloudUserID,
-			Name:   u.Name.String,
+			Name:   wantName,
 			From:   current,
 			To:     target,
 		}
@@ -1233,7 +1253,7 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 		}
 		// 先推融云再落库：若 refreshUser 失败，库内仍是旧值，下一次 backfill 还能
 		// 命中重试；反过来先写库会让失败记录永远 skipped。
-		if _, err := s.client.refreshUser(ctx, u.RongcloudUserID, u.Name.String, outcome.To); err != nil {
+		if _, err := s.client.refreshUser(ctx, u.RongcloudUserID, wantName, outcome.To); err != nil {
 			// 1002 = 融云侧没有这个账号（库里是残行）。这不是「推送失败」：
 			// 重试一万次也还是 1002，不该拖累整轮批量的结论。
 			if IsRCUserNotFound(err) {
@@ -1245,7 +1265,7 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 				}
 				// 显式要求补建：getToken 带 name/portraitUri 创建用户，
 				// 账号和头像一次落地，省掉再补一次 refresh。
-				if _, regErr := s.client.getUserToken(ctx, u.RongcloudUserID, u.Name.String, outcome.To); regErr != nil {
+				if _, regErr := s.client.getUserToken(ctx, u.RongcloudUserID, wantName, outcome.To); regErr != nil {
 					outcome.Status = "failed"
 					outcome.Error = fmt.Sprintf("register missing user: %v", regErr)
 					outcomes = append(outcomes, outcome)
@@ -1253,7 +1273,7 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 				}
 				if _, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
 					ID:          u.ID,
-					Name:        u.Name,
+					Name:        pgText(wantName),
 					PortraitUri: pgText(outcome.To),
 				}); err != nil {
 					outcome.Status = "failed"
@@ -1272,7 +1292,7 @@ func (s *NodeService) SyncUserPortraits(ctx context.Context, workspaceID pgtype.
 		}
 		if _, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
 			ID:          u.ID,
-			Name:        u.Name,
+			Name:        pgText(wantName),
 			PortraitUri: pgText(outcome.To),
 		}); err != nil {
 			outcome.Status = "failed"
@@ -1813,11 +1833,38 @@ func NeedsDefaultPortrait(portrait string) bool {
 	return false
 }
 
-// DefaultAgentNodePortrait 是 AI 节点默认头像的统一入口，与真人 / 机器主节点 /
-// 群 / 讨论组共用同一图源（DefaultUserPortrait），杜绝两处漂移。agent 参数保留
-// 以兼容既有调用点。
+// DefaultAgentNodePortrait 是 AI 节点默认头像的统一入口。
+//
+// 规则是「谁家的 agent 用谁家的图」：能认出 CLI 名（opencode / kimi / claude …）
+// 就发对应的品牌图 `<base>/<kind>-256.png`；认不出的（我们没有它的官方图标）
+// 才落回全平台统一默认图。运维节点不是 agent 本人，用统一的机器人图。
+//
+// 为什么不复用 DefaultUserPortrait：agent 在好友列表里全是同一张橙色虾时，
+// 用户根本分不出哪条会话是哪个 CLI —— 品牌图正是用来回答「这是谁」的。
 func DefaultAgentNodePortrait(agent string) string {
+	if uri, ok := AgentPortraitForCLIName(agent); ok {
+		return uri
+	}
+	if strings.TrimSpace(agent) == OpsAgentType {
+		return OpsPortraitURI()
+	}
 	return DefaultUserPortrait()
+}
+
+// isReplaceableNodePortrait 判断库里存的头像能不能被「当前默认图」覆盖。
+//
+// 可以覆盖的只有我们自己写过的那几类：空值 / 历史默认图 / 当前统一默认图 /
+// 上一轮写进去的品牌图或运维机器人图。owner 自选的头像永远返回 false ——
+// 换图、换 agent、补运维图都只该动我们自己的东西。
+func isReplaceableNodePortrait(current string) bool {
+	trimmed := strings.TrimSpace(current)
+	if trimmed == "" {
+		return true
+	}
+	return NeedsDefaultPortrait(trimmed) ||
+		trimmed == DefaultUserPortrait() ||
+		IsAgentPortraitURI(trimmed) ||
+		IsOpsPortraitURI(trimmed)
 }
 
 // machineDisplayName reduces the name a device registered under to the host
@@ -1984,10 +2031,17 @@ func (s *NodeService) ensureAgentNodeWithRC(ctx context.Context, machineNode db.
 		rcUserID = existing.RongcloudUserID
 	}
 	// Default display name only — a node the owner renamed keeps its name below,
-	// where the stored row wins over this value. 头像同理：默认统一默认图，
-	// 用户已设自定义头像时下方 stored-row 路径胜出。
+	// where the stored row wins over this value.
+	//
+	// 运维节点是例外：它的 ai_type 恒定是 `ops`，直接拿它当名字会让一屏账号全叫
+	// `ops`，谁也分不清是哪条终端会话。归属信息在 id 里（`<agentRC>_ops`），
+	// 所以按 id 反推出 `<agent> 运维`。
 	name := DefaultAgentNodeName(agent)
-	token, err := s.client.getUserToken(ctx, rcUserID, name, DefaultAgentNodePortrait(agent))
+	if agent == OpsAgentType {
+		name = OpsNodeDisplayName(rcUserID)
+	}
+	portrait := DefaultAgentNodePortrait(agent)
+	token, err := s.client.getUserToken(ctx, rcUserID, name, portrait)
 	if err != nil {
 		return agentNodeBinding{}, fmt.Errorf("getUserToken: %w", err)
 	}
@@ -2008,16 +2062,36 @@ func (s *NodeService) ensureAgentNodeWithRC(ctx context.Context, machineNode db.
 			ID:             rcUser.ID,
 			TokenEncrypted: pgText(encToken),
 		})
-		// getToken does not update an existing RongCloud user's nickname, so
-		// re-sync the authoritative database name on every re-bind. This also
-		// repairs devices renamed through the web before the rename flow
-		// started pushing to RongCloud. Best-effort: a stale RongCloud-side
-		// nickname must not fail the bind itself. 头像取「库内已设值，否则统一
-		// 默认图」—— 同样走 getToken 不会更新的字段，重绑时补推。
-		portrait := DefaultPortraitIfEmpty(rcUser.PortraitUri.String)
-		if rcUser.Name.Valid && rcUser.Name.String != "" {
-			if _, err := s.client.refreshUser(ctx, rcUserID, rcUser.Name.String, portrait); err != nil {
-				s.logger.Warn("rongcloud: refresh agent nickname on rebind failed",
+		// getToken does not update an existing RongCloud user's info, so re-sync
+		// the authoritative row on every re-bind. Best-effort: a stale
+		// RongCloud-side profile must not fail the bind itself.
+		//
+		// 名字：owner 改过就保留（rename 流程会自己推），只有空值或旧默认
+		// （运维节点的 `ops`）才迁移到当前默认名。
+		// 头像：库里是我们自己写过的默认图/品牌图时按当前 agent 重算，用户
+		// 自选的一律不动。
+		dbName := strings.TrimSpace(rcUser.Name.String)
+		dbPortrait := strings.TrimSpace(rcUser.PortraitUri.String)
+		wantName, wantPortrait := dbName, dbPortrait
+		if wantName == "" || (agent == OpsAgentType && wantName == OpsAgentType) {
+			wantName = name
+		}
+		if isReplaceableNodePortrait(wantPortrait) {
+			wantPortrait = portrait
+		}
+		if wantName != dbName || wantPortrait != dbPortrait {
+			if _, err := s.queries.UpdateRongCloudUserProfile(ctx, db.UpdateRongCloudUserProfileParams{
+				ID:          rcUser.ID,
+				Name:        pgText(wantName),
+				PortraitUri: pgText(wantPortrait),
+			}); err != nil {
+				s.logger.Warn("rongcloud: persist agent profile on rebind failed",
+					"rc_user", rcUserID, "error", err)
+			}
+		}
+		if wantName != "" {
+			if _, err := s.client.refreshUser(ctx, rcUserID, wantName, wantPortrait); err != nil {
+				s.logger.Warn("rongcloud: refresh agent profile on rebind failed",
 					"rc_user", rcUserID, "error", err)
 			}
 		}
@@ -2026,7 +2100,7 @@ func (s *NodeService) ensureAgentNodeWithRC(ctx context.Context, machineNode db.
 			WorkspaceID:     machineNode.WorkspaceID,
 			RongcloudUserID: rcUserID,
 			Name:            pgText(name),
-			PortraitUri:     pgText(DefaultAgentNodePortrait(agent)),
+			PortraitUri:     pgText(portrait),
 			TokenEncrypted:  pgText(encToken),
 			IsAiNode:        true,
 			NodeType:        "ai",

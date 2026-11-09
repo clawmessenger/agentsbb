@@ -860,6 +860,11 @@ type clawPairingView struct {
 	ReportedAgents []string `json:"reportedAgents,omitempty"`
 	// BoundAgents 是用户在弹窗勾选绑定后生成的 [{agent,nodeId}] 结果。
 	BoundAgents []rongcloud.BoundAgentResult `json:"boundAgents,omitempty"`
+	// CLIServerURL 只在「创建票据」时下发：设备端 CLI 二进制内置的默认服务端
+	// 地址。前端拿它当比较基准 —— 设备要连的地址与它一致时命令里省略
+	// `--server`，界面上不暴露域名；不一致（测试环境/本地代理）时必须显式传
+	// 参数，否则设备会连到另一个环境。
+	CLIServerURL string `json:"cliServerUrl,omitempty"`
 }
 
 // clawViewerUserID 是 clawRequireClawUser 的**静默版**：只探测可选身份，不写响应、
@@ -931,6 +936,42 @@ func (h *Handler) clawSingleInstallWorkspace(ctx context.Context) (pgtype.UUID, 
 	return wsID, true
 }
 
+// clawCLIServerURL 返回「设备端 CLI 二进制内置的默认服务端地址」，供绑定弹窗当
+// 比较基准：设备要连的地址与它一致时，命令里省略 `--server`，界面上不出现域名；
+// 不一致（测试环境 / 本地代理）时必须显式传，否则设备会连到另一个环境。
+//
+// 取值优先级：
+//
+//	rongcloud_system_config.config_key='cli_server_url'（后台「设备绑定」卡片）
+//	→ 环境变量 CLAW_CLI_SERVER_URL
+//	→ 空串（前端回落到自己内置的发布默认值，保持老部署行为不变）
+//
+// config 列是 jsonb：后台通用编辑框写纯文本会被包成 {"value": "..."}，而直接写
+// JSON 字符串时是裸 string，两种都认。
+func (h *Handler) clawCLIServerURL(ctx context.Context) string {
+	var raw []byte
+	err := h.DB.QueryRow(ctx,
+		`SELECT config FROM rongcloud_system_config WHERE config_key='cli_server_url' LIMIT 1`).Scan(&raw)
+	if err == nil {
+		var value interface{}
+		if json.Unmarshal(raw, &value) == nil {
+			switch typed := value.(type) {
+			case string:
+				if s := strings.TrimSpace(typed); s != "" {
+					return strings.TrimRight(s, "/")
+				}
+			case map[string]interface{}:
+				if s, isStr := typed["value"].(string); isStr {
+					if s = strings.TrimSpace(s); s != "" {
+						return strings.TrimRight(s, "/")
+					}
+				}
+			}
+		}
+	}
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("CLAW_CLI_SERVER_URL")), "/")
+}
+
 // ClawCreatePairing POST /api/claw/pairing —— 旧站「绑定设备」生成 clawmessenger 票据。
 // Bearer=claw_im_users.rongcloud_token 认证；workspace 取单安装归属；
 // candidates 留空（设备 register 带 ticket 时回填）；有效期 10 分钟。
@@ -964,9 +1005,10 @@ func (h *Handler) ClawCreatePairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clawJSON(w, 200, 200, "创建成功", clawPairingView{
-		Ticket:    session.Ticket,
-		Status:    session.Status,
-		ExpiresAt: session.ExpiresAt.Time.Format(time.RFC3339),
+		Ticket:       session.Ticket,
+		Status:       session.Status,
+		ExpiresAt:    session.ExpiresAt.Time.Format(time.RFC3339),
+		CLIServerURL: h.clawCLIServerURL(r.Context()),
 	})
 }
 
