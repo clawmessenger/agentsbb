@@ -238,7 +238,7 @@ func run() error {
 			}
 			for _, o := range outcomes {
 				summary.add(o.Status)
-				printPortrait(o.Scope, o.Status, o.RCUser, o.From, o.To, o.Error)
+				printPortraitNamed(o.Scope, o.Status, o.RCUser, o.Name, o.From, o.To, o.Error)
 			}
 		}
 		failed += summary.failed
@@ -258,7 +258,7 @@ func run() error {
 			}
 			for _, o := range outcomes {
 				summary.add(o.Status)
-				printPortrait(o.Scope, o.Status, o.RCUser, o.From, o.To, o.Error)
+				printPortraitNamed(o.Scope, o.Status, o.RCUser, o.Name, o.From, o.To, o.Error)
 			}
 		}
 		// claw_im_users：真人账号表（融云侧必须 refreshUser，SQL 改不到融云）。
@@ -893,6 +893,21 @@ func (s *portraitSummary) merge(other portraitSummary) {
 
 func printPortrait(scope, status, rcUser, from, to, errText string) {
 	line := fmt.Sprintf("%-13s %-8s rc=%-46s from=%q to=%q", scope, status, rcUser, from, to)
+	if errText != "" {
+		line += " error=" + errText
+	}
+	fmt.Println(line)
+}
+
+// printPortraitNamed 是 printPortrait 的带昵称版本，只给走 SyncUserPortraits
+// 的那两路用（-sync-agent-portraits / -sync-portraits）。
+//
+// 为什么不复用 printPortrait：那条路径上的 `to=` 是**头像**，而 agent 品牌头像
+// 这一路还会顺带把运维账号的昵称从 `ops` 迁到 `<agent> 运维`。名字的变化原先
+// 完全不打印，干跑看起来只有头像在动，运维会误判「改名没生效」，随后去手改融云
+// 控制台 —— 那是这项功能最不该发生的事故。
+func printPortraitNamed(scope, status, rcUser, name, from, to, errText string) {
+	line := fmt.Sprintf("%-13s %-8s rc=%-46s name=%q from=%q to=%q", scope, status, rcUser, name, from, to)
 	if errText != "" {
 		line += " error=" + errText
 	}
