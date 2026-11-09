@@ -372,6 +372,25 @@ func TestNeedsDefaultPortraitMatrix(t *testing.T) {
 	}
 }
 
+// 换掉默认图域名之后，存量行里那个「编译期常量」必须仍被认出是旧默认图。
+//
+// 否则这批行既不是「当前默认图」、也不在 legacy 清单里，会被当成用户自选头像
+// 永久跳过 —— 换域名之后它们就是线上最普遍的那批 404 头像。
+func TestNeedsDefaultPortraitRecognizesCanonicalAfterRebrand(t *testing.T) {
+	portraitTestClearEnv(t)
+	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "https://clawmessenger.quukk.com/default_user.png")
+
+	if got := DefaultUserPortrait(); got == DefaultUserPortraitURI {
+		t.Fatalf("precondition: default portrait should have moved off the canonical url")
+	}
+	if !NeedsDefaultPortrait(DefaultUserPortraitURI) {
+		t.Fatalf("canonical %q must stay recognized as a legacy default after rebrand", DefaultUserPortraitURI)
+	}
+	if NeedsDefaultPortrait(DefaultUserPortrait()) {
+		t.Fatalf("the live default %q must still be skipped (idempotent rerun)", DefaultUserPortrait())
+	}
+}
+
 // 显式把「用户自定义头像」列成一组回归：存量补齐绝不能覆盖它们。
 func TestNeedsDefaultPortraitNeverMatchesCustomPortraits(t *testing.T) {
 	portraitTestClearEnv(t)

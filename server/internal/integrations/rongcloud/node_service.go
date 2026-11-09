@@ -1822,6 +1822,16 @@ func NeedsDefaultPortrait(portrait string) bool {
 	if trimmed == DefaultUserPortrait() {
 		return false // 已经是统一默认图：幂等跳过
 	}
+	// 编译期常量本身也算历史取值：线上一旦把默认图换到新域名（CLAW_DEFAULT_
+	// PORTRAIT_URI 或后台 branding），存量行里那个旧 URL 就既不是「当前默认图」，
+	// 也不在 legacy 清单里（清单只收过 openclaw.png 和 im-test 那条），于是被判成
+	// 「用户自选头像」永久跳过 —— 换域名之后这是最普遍的一类残留，头像会一直 404。
+	//
+	// 顺序不能提前：上一行必须在 DefaultUserPortrait() 仍等于该常量时先返回 false，
+	// 否则幂等复跑会把每一行都判成待改。
+	if trimmed == DefaultUserPortraitURI {
+		return true
+	}
 	for _, legacy := range legacyDefaultPortraitURIs {
 		if trimmed == legacy {
 			return true
