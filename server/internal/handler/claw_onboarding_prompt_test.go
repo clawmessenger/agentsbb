@@ -46,17 +46,17 @@ func adminTestToken(t *testing.T) string {
 	return token
 }
 
-// clearOnboardingPrompt removes the config row so a test starts from the
+// clearOnboardingPrompt removes both language rows so a test starts from the
 // "not configured" state the first deploy sees.
 func clearOnboardingPrompt(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
-	if _, err := testPool.Exec(ctx, "DELETE FROM rongcloud_system_config WHERE config_key = $1", onboardingPromptConfigKey); err != nil {
-		t.Fatalf("clear onboarding prompt: %v", err)
+	clear := func() {
+		_, _ = testPool.Exec(context.Background(),
+			"DELETE FROM rongcloud_system_config WHERE config_key = ANY($1::text[])",
+			[]string{onboardingPromptConfigKey, onboardingPromptConfigKeyEN})
 	}
-	t.Cleanup(func() {
-		_, _ = testPool.Exec(context.Background(), "DELETE FROM rongcloud_system_config WHERE config_key = $1", onboardingPromptConfigKey)
-	})
+	clear()
+	t.Cleanup(clear)
 }
 
 func TestClawOnboardingPromptFallsBackWhenUnset(t *testing.T) {
@@ -165,6 +165,66 @@ func TestClawAdminOnboardingPromptClearsToDefault(t *testing.T) {
 	}
 }
 
+// The English edition lives under its own key: an English page must never be
+// served the Chinese instructions, and editing one language must not touch the
+// other.
+func TestClawOnboardingPromptLanguagesAreIndependent(t *testing.T) {
+	clearOnboardingPrompt(t)
+	h := newOnboardingPromptHandler()
+	token := adminTestToken(t)
+
+	put := func(body map[string]any) {
+		t.Helper()
+		testutil.Call(t, h.ClawAdminOnboardingPromptPut,
+			testutil.WithHeaders(
+				testutil.JSONRequest(http.MethodPut, "/api/admin/onboarding-prompt", body),
+				"Authorization", "Bearer "+token,
+			),
+		).Want(http.StatusOK)
+	}
+	get := func(url string) (text, source, lang string) {
+		t.Helper()
+		resp := testutil.Call(t, h.ClawOnboardingPrompt,
+			testutil.JSONRequest(http.MethodGet, url, nil),
+		).Want(http.StatusOK).Body
+		var payload struct {
+			Data struct {
+				Text   string `json:"text"`
+				Source string `json:"source"`
+				Lang   string `json:"lang"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp.Bytes(), &payload); err != nil {
+			t.Fatalf("decode: %v (%s)", err, resp.String())
+		}
+		return payload.Data.Text, payload.Data.Source, payload.Data.Lang
+	}
+
+	put(map[string]any{"text": "中文正文"})
+	put(map[string]any{"text": "English body", "lang": "en"})
+
+	if text, source, lang := get("/api/claw/onboarding-prompt?lang=en"); text != "English body" || source != "database" || lang != "en" {
+		t.Fatalf("en prompt = (%q, %q, %q), want the English body from the database", text, source, lang)
+	}
+	// No lang at all is the old contract: Chinese, so pre-i18n clients keep working.
+	if text, _, lang := get("/api/claw/onboarding-prompt"); text != "中文正文" || lang != "zh" {
+		t.Fatalf("default prompt = (%q, %q), want the Chinese body", text, lang)
+	}
+	// Junk lang must not fall through to English.
+	if text, _, _ := get("/api/claw/onboarding-prompt?lang=fr"); text != "中文正文" {
+		t.Fatalf("lang=fr served %q, want the Chinese fallback", text)
+	}
+
+	// Clearing English only clears English.
+	put(map[string]any{"text": "   ", "lang": "en"})
+	if text, source, _ := get("/api/claw/onboarding-prompt?lang=en"); text != "" || source != "default" {
+		t.Fatalf("cleared en = (%q, %q), want empty text and source=default", text, source)
+	}
+	if text, source, _ := get("/api/claw/onboarding-prompt?lang=zh"); text != "中文正文" || source != "database" {
+		t.Fatalf("clearing en touched zh: (%q, %q)", text, source)
+	}
+}
+
 func TestClawAdminOnboardingPromptRequiresAdmin(t *testing.T) {
 	h := newOnboardingPromptHandler()
 	// No bearer token: the admin surface must not be writable anonymously.
@@ -175,7 +235,6 @@ func TestClawAdminOnboardingPromptRequiresAdmin(t *testing.T) {
 		testutil.JSONRequest(http.MethodGet, "/api/admin/onboarding-prompt", nil),
 	).Want(http.StatusUnauthorized)
 }
-
 func TestDecodePromptConfigShapes(t *testing.T) {
 	cases := []struct {
 		name string
