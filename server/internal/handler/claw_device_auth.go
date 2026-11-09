@@ -22,10 +22,31 @@ import (
 // the machine's hostname and reported agent CLIs, and authorizes binding.
 // The ticket never needs to be copied by a human again.
 
-// defaultClawWebBaseURL is used when CLAW_WEB_BASE_URL is unset. It points
-// at the deployed web product so a locally-built server still emits working
-// verify links.
-const defaultClawWebBaseURL = "https://newsradar.dreamdt.cn/claw-web"
+// The verify link is built from a base URL, and getting that base wrong does
+// not merely look wrong: the pairing code lives in *this* deployment's
+// database, so a link pointing at another deployment opens a page that can
+// only answer "配对码无效". The base is resolved from configuration first and
+// from the incoming request second, so moving the product to a new domain is
+// an nginx change rather than an .env hunt.
+const (
+	// clawWebBaseEnv pins the whole base URL, path included
+	// (e.g. https://host/claw-web). Highest precedence: reverse proxies sometimes
+	// hide the real host, so operators need a way to state it outright.
+	clawWebBaseEnv = "CLAW_WEB_BASE_URL"
+	// clawWebPathPrefixEnv is the path the web product is mounted under, for
+	// deployments that do not serve it at the origin root. Empty means root.
+	clawWebPathPrefixEnv = "CLAW_WEB_PATH_PREFIX"
+	// legacyClawWebHost/Path describe the pre-2.0 deployment: web under
+	// /claw-web on a host that is still in production. They exist only so a
+	// server that cannot be reconfigured (and any request without a usable
+	// Host header) keeps emitting a working link; delete them once that
+	// deployment is retired.
+	legacyClawWebHost = "newsradar.dreamdt.cn"
+	legacyClawWebPath = "/claw-web"
+	// defaultClawWebBaseURL is the last-resort value when neither configuration
+	// nor the request can tell us where the web product lives.
+	defaultClawWebBaseURL = "https://" + legacyClawWebHost + legacyClawWebPath
+)
 
 // devicePairRateWindow / devicePairRateMax cap anonymous session creation
 // per machine_id: 3 sessions per 10 minutes. Enough for retries, hostile to
@@ -65,11 +86,50 @@ type clawPairingByCodeView struct {
 	ExpiresAt   string                 `json:"expires_at"`
 }
 
-func clawWebBaseURL() string {
-	if base := strings.TrimRight(os.Getenv("CLAW_WEB_BASE_URL"), "/"); base != "" {
+// clawWebBaseURL returns where the web product lives, for building the verify
+// link. Resolution order:
+//
+//  1. CLAW_WEB_BASE_URL — explicit, path included.
+//  2. CLAW_WEB_PATH_PREFIX + the origin derived from the request. Origin
+//     derivation reuses brandingPublicBaseURL, which prefers X-Forwarded-Proto /
+//     Host: behind a reverse proxy r.Host is the upstream hop, not the public
+//     name. This is what makes a domain move a pure nginx change.
+//  3. The legacy base, when the request carries no usable host.
+func clawWebBaseURL(r *http.Request) string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv(clawWebBaseEnv)), "/"); base != "" {
 		return base
 	}
-	return defaultClawWebBaseURL
+	origin := brandingPublicBaseURL(r)
+	if origin == "" {
+		return defaultClawWebBaseURL
+	}
+	return origin + clawWebPathPrefix(origin)
+}
+
+// clawWebPathPrefix is the path under the origin where the web product is
+// served: "" for a root deployment (the 2.0 layout), "/claw-web" for the old
+// one. An explicit value wins; otherwise only the legacy host keeps its prefix,
+// so an un-updated old deployment does not start printing dead links.
+func clawWebPathPrefix(origin string) string {
+	if v := strings.TrimSpace(os.Getenv(clawWebPathPrefixEnv)); v != "" {
+		trimmed := strings.Trim(v, "/")
+		if trimmed == "" {
+			return ""
+		}
+		return "/" + trimmed
+	}
+	if originHost(origin) == legacyClawWebHost {
+		return legacyClawWebPath
+	}
+	return ""
+}
+
+// originHost drops the scheme from an origin built by brandingPublicBaseURL.
+func originHost(origin string) string {
+	if i := strings.Index(origin, "://"); i >= 0 {
+		return origin[i+len("://"):]
+	}
+	return origin
 }
 
 func deviceBoundAgentsFromSession(session db.RongcloudPairingSession) []clawDeviceBoundAgent {
@@ -133,7 +193,7 @@ func (h *Handler) ClawCreateDeviceSession(w http.ResponseWriter, r *http.Request
 		clawJSON(w, 500, 500, "创建配对会话失败", nil)
 		return
 	}
-	verifyURL := clawWebBaseURL() + "/pair?code=" + session.UserCode.String
+	verifyURL := clawWebBaseURL(r) + "/pair?code=" + session.UserCode.String
 	clawJSON(w, 200, 200, "ok", map[string]interface{}{
 		"ticket":           session.Ticket,
 		"user_code":        session.UserCode.String,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -109,7 +110,7 @@ func TestClawCreateDeviceSessionReturnsUserCodeAndVerifyURL(t *testing.T) {
 			t.Fatalf("user_code %q contains %q outside the alphabet", data.UserCode, r)
 		}
 	}
-	if want := "/claw-web/pair?code=" + data.UserCode; len(data.VerifyURL) < len(want) ||
+	if want := "/pair?code=" + data.UserCode; len(data.VerifyURL) < len(want) ||
 		data.VerifyURL[len(data.VerifyURL)-len(want):] != want {
 		t.Fatalf("verify_url = %q, want suffix %q", data.VerifyURL, want)
 	}
@@ -344,4 +345,87 @@ func isUserCodeRune(r rune) bool {
 		}
 	}
 	return false
+}
+
+// TestClawWebBaseURL pins the verify-link base resolution: an operator-set
+// value wins, an unset value follows the request (so a domain move needs no
+// .env edit), and the pre-2.0 host keeps its /claw-web mount so that
+// deployment does not start printing links that 404.
+func TestClawWebBaseURL(t *testing.T) {
+	cases := []struct {
+		name     string
+		base     string
+		prefix   string
+		target   string
+		fwdHost  string
+		fwdProto string
+		want     string
+	}{
+		{
+			name:   "explicit base wins and drops the trailing slash",
+			base:   "https://clawmessenger.quukk.com/",
+			target: "http://127.0.0.1:58081/api/claw/pairing/device",
+			want:   "https://clawmessenger.quukk.com",
+		},
+		{
+			name:   "root deployment follows the request host",
+			target: "https://clawmessenger.quukk.com/api/claw/pairing/device",
+			want:   "https://clawmessenger.quukk.com",
+		},
+		{
+			name:     "forwarded host beats the upstream hop",
+			target:   "http://10.0.0.5:58081/api/claw/pairing/device",
+			fwdHost:  "clawmessenger.quukk.com",
+			fwdProto: "https",
+			want:     "https://clawmessenger.quukk.com",
+		},
+		{
+			name:   "legacy host keeps its web mount",
+			target: "https://newsradar.dreamdt.cn/im/api/claw/pairing/device",
+			want:   "https://newsradar.dreamdt.cn/claw-web",
+		},
+		{
+			name:   "path prefix env wins over the legacy default",
+			prefix: "/assets/app",
+			target: "https://newsradar.dreamdt.cn/im/api/claw/pairing/device",
+			want:   "https://newsradar.dreamdt.cn/assets/app",
+		},
+		{
+			name:   "path prefix slash means root",
+			prefix: "/",
+			target: "https://newsradar.dreamdt.cn/im/api/claw/pairing/device",
+			want:   "https://newsradar.dreamdt.cn",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(clawWebBaseEnv, tc.base)
+			t.Setenv(clawWebPathPrefixEnv, tc.prefix)
+			// A developer .env must not leak into these expectations.
+			t.Setenv(brandingPublicBaseEnv, "")
+
+			req := httptest.NewRequest(http.MethodPost, tc.target, nil)
+			if tc.fwdHost != "" {
+				req.Header.Set("X-Forwarded-Host", tc.fwdHost)
+			}
+			if tc.fwdProto != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.fwdProto)
+			}
+			if got := clawWebBaseURL(req); got != tc.want {
+				t.Fatalf("clawWebBaseURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClawWebBaseURLWithoutRequest keeps the last-resort value working: the
+// request-free call path (a locally built server, a future worker) must still
+// produce something usable rather than a relative link.
+func TestClawWebBaseURLWithoutRequest(t *testing.T) {
+	t.Setenv(clawWebBaseEnv, "")
+	t.Setenv(clawWebPathPrefixEnv, "")
+	t.Setenv(brandingPublicBaseEnv, "")
+	if got := clawWebBaseURL(nil); got != defaultClawWebBaseURL {
+		t.Fatalf("clawWebBaseURL(nil) = %q, want %q", got, defaultClawWebBaseURL)
+	}
 }
