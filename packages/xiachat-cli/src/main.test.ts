@@ -859,7 +859,7 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
   const deviceSession = {
     ticket: "pt_device",
     userCode: "ABCD2345",
-    verifyUrl: "https://newsradar.dreamdt.cn/claw-web/pair?code=ABCD2345",
+    verifyUrl: "https://clawmessenger.quukk.com/pair?code=ABCD2345",
     expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
     intervalSeconds: 2,
   };
