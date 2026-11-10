@@ -216,18 +216,21 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("cursor-agent", "a".repeat(8001))).toEqual([]);
   });
 
-  // codebuddy：Claude Code fork，argv 完整对齐上游 codebuddy.go:38-44
-  // （-p + stream-json 双向 + --verbose）。--model 不走 argv（只认自家 id），
-  // 走 CODEBUDDY_MODEL env；buildModelArgs 只保留 --port 0。
-  it("codebuddy 走 -p + stream-json 双向 + --verbose（--port 0 防端口冲突）", () => {
+  // codebuddy：Claude Code fork，argv 对齐上游 codebuddy.go:38-44 的单向形态
+  //（-p + stream-json 输出 + --verbose）。⚠️ 不带 --input-format stream-json：
+  // 该参数让 stdin 变成「流式输入消息」通道，设备端 stdin 立即关闭 → 空 stdin
+  // 让 codebuddy 静默 exit 0、零事件（2026-11-10 实测，即「本轮没有产出内容」
+  // 的真因）。--model 不走 argv（只认自家 id），走 CODEBUDDY_MODEL env；
+  // buildModelArgs 只保留 --port 0。
+  it("codebuddy 走 -p + stream-json + --verbose（无 input-format，--port 0 防冲突）", () => {
     expect(buildAgentArgs("codebuddy", "hi")).toEqual([
       "-p", "hi",
-      "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+      "--output-format", "stream-json", "--verbose",
       "--port", "0",
     ]);
     expect(buildAgentArgs("codebuddy", "hi", "quukk/glm-5.2")).toEqual([
       "-p", "hi",
-      "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+      "--output-format", "stream-json", "--verbose",
       "--port", "0",
     ]);
   });

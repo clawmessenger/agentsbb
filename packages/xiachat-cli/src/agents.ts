@@ -445,7 +445,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 对 CLI 版本的耦合。
   codebuddy: (prompt, _model, _sessionKey, ctx) => [
     "-p", prompt,
-    "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
+    "--output-format", "stream-json", "--verbose",
+    // ⚠️ 不能带 --input-format stream-json（上游 daemon 同款参数在这里是坑）：
+    // 它把 stdin 当「流式输入消息」消费，而设备的 stdin 在 spawn 后立即关闭 ——
+    // 空 stdin 让 codebuddy 静默 exit 0、一个事件都不吐（2026-11-10 实测：
+    // 同一 argv 去掉该参数即正常出 init/assistant/result）。设备端是一次性
+    // 单轮，没有第二条用户消息要喂，这个参数没有存在价值。
     // 会话续接：与 claude 同族（Claude Code fork），--resume 语义一致。
     ...(ctx?.resumeSessionId ? ["--resume", ctx.resumeSessionId] : []),
     ...buildModelArgs("codebuddy", undefined),
