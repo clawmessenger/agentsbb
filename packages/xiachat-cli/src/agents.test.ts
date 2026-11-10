@@ -303,6 +303,11 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("deveco", "quukk/glm-5.2")).toEqual([]);
   });
 
+  it("codearts 走 run 一次性入口（否则 TUI 启动横幅「正在启动中…」被当正文）", () => {
+    expect(buildAgentArgs("codearts", "hi")).toEqual(["run", "hi"]);
+    expect(buildModelArgs("codearts", "quukk/glm-5.2")).toEqual([]);
+  });
+
   it("mcode 走 exec + text（不再撞 interactive mode requires a TTY）", () => {
     expect(buildAgentArgs("mcode", "hi")).toEqual(["exec", "hi", "--output-format", "text"]);
     expect(buildModelArgs("mcode", "quukk/glm-5.2")).toEqual([]);
@@ -350,6 +355,12 @@ describe("buildAgentArgs", () => {
     // status=error 的信封如实转述，不假装成功。
     const errEnvelope = '{"status": "error", "error": "boom"}';
     expect(extractQwenpawReply(errEnvelope)).toContain("boom");
+  });
+
+  it("normalizeCodeartsOutput 剥掉 SGR 与 `|` 排版符（只留正文）", async () => {
+    const { normalizeCodeartsOutput } = await import("./agents.js");
+    const raw = "\u001b[90m|\u001b[39m\n\u001b[34m•\u001b[39m  认证失败\n\u001b[90m|\u001b[39m  请配置 AK/SK\n";
+    expect(normalizeCodeartsOutput(raw)).toBe("•  认证失败\n 请配置 AK/SK");
   });
 
   it("returns [] for agents without a strategy", () => {

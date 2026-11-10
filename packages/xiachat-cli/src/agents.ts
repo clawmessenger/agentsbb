@@ -237,7 +237,7 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   if (
     name === "deveco" || name === "mcode" || name === "qwenpaw"
     || name === "dim" || name === "grok" || name === "reasonix"
-    || name === "zeroclaw"
+    || name === "zeroclaw" || name === "codearts"
   ) return [];
   return ["--model", model];
 }
@@ -576,6 +576,16 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   deveco: (prompt) => [
     "run", prompt,
   ],
+  // codearts（华为 CodeArts Doer，同 opencode 血统）：`codearts run [message..]`
+  // 是一次性入口（run --help：run codearts with a message），默认 --format
+  // default 输出格式化正文。裸 `codearts` 是 TUI —— 2026-11-10 现场：没有策略
+  // 时 spawn 的 TUI 把启动横幅「正在启动中…」当正文发了出去（answered-turns
+  // 里落地成 `| * 正在启动中...`），看起来「有回复」其实一个字都没答。
+  // ⚠️ 与 TUI 登录态无关：headless 还要华为云 CODEARTS_CLI_AK/SK 环境变量，
+  // 缺了它会以纯文本报「认证失败」，这条错误现在会如实当正文回给用户。
+  codearts: (prompt) => [
+    "run", prompt,
+  ],
   // mcode（Minimax Code）：`mcode exec [prompt]` 官方自述「Run one prompt
   // without starting the TUI」；不带 --output-format 时默认 text。裸 `mcode`
   // 在无 TTY 下直接拒绝（"interactive mode requires a TTY"）。
@@ -797,6 +807,20 @@ const ANSI_ESCAPE_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\
 
 export function stripAnsiCodes(text: string): string {
   return text.replace(ANSI_ESCAPE_RE, "");
+}
+
+/**
+ * codearts（`codearts run <msg>`，默认 --format default）的正文清理。
+ *
+ * 它把回答排版成「`| ` + 内容」的块，并且带 SGR 颜色（`\x1b[90m|\x1b[39m`）——
+ * 原样转发给用户就是一堆转义符加竖线。这里只做两件事：剥 ANSI、去掉行首的
+ * `| `/`• ` 项目符号装饰，其余（换行、链接）保持不动。
+ */
+export function normalizeCodeartsOutput(raw: string): string {
+  const lines = stripAnsiCodes(raw).split("\n").map((line) => line.replace(/^\s*\|\s?/, ""));
+  while (lines.length > 0 && lines[0].trim() === "") lines.shift();
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+  return lines.join("\n");
 }
 
 // Log lines look like `[model-fetch] start …` / `[agents/agent-command] …`
@@ -2394,6 +2418,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             resolve(
               opts.agentName === "openclaw" ? extractOpenclawReply(stdout)
                 : opts.agentName === "qwenpaw" ? extractQwenpawReply(stdout)
+                : opts.agentName === "codearts" ? normalizeCodeartsOutput(stdout)
                 : stdout,
             );
           }
