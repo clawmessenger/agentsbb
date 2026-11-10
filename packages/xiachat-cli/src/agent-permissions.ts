@@ -362,7 +362,21 @@ export type PrivateGateReason =
    * （2026-11-05：定时器停摆，快照被写成空表，主人自己的私聊全被拒，零回复）。
    * 已由 mergePermissionSnapshot 挡住写入；这里是读侧的兜底，防止旧文件已经空。
    */
-  | "empty-agents";
+  | "empty-agents"
+  /**
+   * 发信人是**另一个 agent 节点**（2026-11-10 事故）→ 不自动续轮。
+   *
+   * 现场：拿某个 agent 的 IM token 给另一个 agent 发私聊做链路测试，
+   * 被叫方跑完回合把结果回给发起方，发起方也是 agent、也认为这是「有人找我」，
+   * 于是再跑一轮回过去 —— **两个 agent 无限互聊**，每分钟烧掉一整个回合的
+   * 额度，直到人工把一方停掉才断。双向都会复现，跟权限开没开无关
+   * （allowPrivate=true 时双方都放行，这才是真正常态）。
+   *
+   * 所以这条不是权限判定，是**回路保险**：对方是 agent 就静默丢弃、不回执
+   * （回执本身也是一条会触发对方回合的消息，等于换个方式继续循环）。
+   * 人类主人的私聊不受影响 —— 真人 userId 是纯数字，不会命中这个形状。
+   */
+  | "peer-agent";
 
 export interface PrivateGateDecision {
   allow: boolean;
@@ -385,10 +399,33 @@ export interface PrivateGateDecision {
  * 除这三条外一律「判不了就拒绝」：`no-agent-entry` 是有快照但没这个节点，
  * 说明服务端已在管权限，只是没给这一行 —— 放行等于凭空开一个无限制入口（审查 S3）。
  */
+/**
+ * 发信人是不是「另一个 agent 节点」。
+ *
+ * 融云 userId 的形状（见 config.ts 注释）：
+ *   · 真人：纯数字（`143047`）；
+ *   · agent 节点：`<agent>_<机器号>`（`codebuddy_3300776275`）；
+ *   · 机器节点：`rc_node_<机器号>`（`rc_node_3300776275_hermes`）；
+ *   · 运维别名：`ops@<agent>_<机器号>`。
+ *
+ * 只按「下划线 + 6 位以上机器号结尾」认，不按 agent 名单认 —— 新接一家
+ * agent 不需要改这里。真人 userId 是纯数字，不会命中。
+ */
+export function isPeerAgentUserId(userId: string): boolean {
+  const id = userId.trim();
+  if (!id) return false;
+  if (/^rc_node_/i.test(id)) return true;
+  return /^[A-Za-z][A-Za-z0-9@._-]*_\d{6,}$/.test(id);
+}
+
 export function decidePrivateChat(
   snapshot: PermissionSnapshot | null,
   query: { fromUserId: string; nodeId?: string; agent?: string },
 ): PrivateGateDecision {
+  // 回路保险放在所有权限判定**之前**：agent 之间的互聊是死循环，与「权限
+  // 开没开」无关（全开时双方都放行，正是最糟糕的组合）——no-snapshot 之类的
+  // fail-open 也不能给它开口子。
+  if (isPeerAgentUserId(query.fromUserId)) return { allow: false, reason: "peer-agent" };
   if (!snapshot) return { allow: true, reason: "no-snapshot" };
   // 空表 = 这一份快照里没有任何权限数据（写坏了，不是「全禁」）→ 与 no-snapshot 同档
   if (snapshot.agents.length === 0) return { allow: true, reason: "empty-agents" };

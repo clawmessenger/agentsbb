@@ -8,6 +8,7 @@ import {
   clearPermissionCache,
   decidePrivateChat,
   fsRestriction,
+  isPeerAgentUserId,
   loadPermissionSnapshot,
   mergePermissionSnapshot,
   parseControlPermissions,
@@ -189,6 +190,37 @@ describe("decidePrivateChat —— 四条分支 + 唯一的 fail-open", () => {
       decidePrivateChat(snapshot([{ nodeId: "n", agent: "a", allowPrivate: false }], ""), { fromUserId: "s", nodeId: "n" }).reason,
     ]);
     expect(reasons.size).toBe(4);
+  });
+});
+
+describe("agent ↔ agent 私聊回路保险（2026-11-10 无限互聊事故）", () => {
+  const open = snapshot([{ agent: "codex", nodeId: "node-1", allowPrivate: true }]);
+  const closed = snapshot([{ agent: "codex", nodeId: "node-1", allowPrivate: false }]);
+
+  it("识别 agent 节点的三种 userId 形状", () => {
+    expect(isPeerAgentUserId("codebuddy_3300776275")).toBe(true);
+    expect(isPeerAgentUserId("rc_node_3300776275_hermes")).toBe(true);
+    expect(isPeerAgentUserId("ops@codex_3300776275")).toBe(true);
+    // 真人是纯数字；普通陌生人也别误判成 agent。
+    expect(isPeerAgentUserId("143047")).toBe(false);
+    expect(isPeerAgentUserId("stranger")).toBe(false);
+    expect(isPeerAgentUserId("")).toBe(false);
+  });
+
+  it("权限全开时也要拦 —— 这才是最糟的组合（双方都放行，谁也不肯先闭嘴）", () => {
+    expect(decidePrivateChat(open, { fromUserId: "codebuddy_3300776275", nodeId: "node-1" })).toMatchObject({
+      allow: false,
+      reason: "peer-agent",
+    });
+  });
+
+  it("主人私聊不受影响（真人 userId 是纯数字）", () => {
+    expect(decidePrivateChat(open, { fromUserId: OWNER, nodeId: "node-1" }).allow).toBe(true);
+    expect(decidePrivateChat(closed, { fromUserId: OWNER, nodeId: "node-1" }).allow).toBe(true);
+  });
+
+  it("没有快照（独立 run / 旧服务端）同样拦：回路风险与权限无关", () => {
+    expect(decidePrivateChat(null, { fromUserId: "claude_3300776275" }).reason).toBe("peer-agent");
   });
 });
 

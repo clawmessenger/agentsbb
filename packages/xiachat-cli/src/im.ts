@@ -492,6 +492,15 @@ export class MessageDispatcher {
       );
       return;
     }
+    if (reason === "peer-agent") {
+      // 每条都 warn：一旦刷屏就说明有 agent 在给别的 agent 发消息（回路保险
+      // 正在生效），现场必须一眼看到是谁，否则只会看到「对方不回我」。
+      console.warn(
+        "im in: private chat dropped (peer-agent, 对方是另一个 agent 节点，不自动续轮)"
+        + ` from=${fromUserId} node=${node}`,
+      );
+      return;
+    }
     if (reason === "no-agent-entry") {
       console.warn(
         "im in: private chat dropped (no-agent-entry) — 权限快照里没有本节点；"
