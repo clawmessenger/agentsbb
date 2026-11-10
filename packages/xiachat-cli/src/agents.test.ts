@@ -293,8 +293,67 @@ describe("buildAgentArgs", () => {
     ]);
   });
 
+  // B 类第二批（2026-11-10 全量真机接入）：每家的 headless 入口都经实机
+  // `--help` 核对过，钉住 argv 形状防止回归成「裸 CLI = TUI」的老坑。
+  it("deveco 走 run 一次性入口（不再进 TUI 喷进度条）", () => {
+    expect(buildAgentArgs("deveco", "hi")).toEqual(["run", "hi"]);
+    expect(buildModelArgs("deveco", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("mcode 走 exec + text（不再撞 interactive mode requires a TTY）", () => {
+    expect(buildAgentArgs("mcode", "hi")).toEqual(["exec", "hi", "--output-format", "text"]);
+    expect(buildModelArgs("mcode", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("qwenpaw 走 task -i，模型不注入", () => {
+    expect(buildAgentArgs("qwenpaw", "hi")).toEqual(["task", "-i", "hi"]);
+    expect(buildModelArgs("qwenpaw", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("dim 走 exec 一次性入口（不再进 TUI 撞未信任目录）", () => {
+    expect(buildAgentArgs("dim", "hi")).toEqual(["exec", "hi"]);
+    expect(buildModelArgs("dim", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("grok 走 -p/--single（plain 正文），模型不注入", () => {
+    expect(buildAgentArgs("grok", "hi")).toEqual(["-p", "hi"]);
+    expect(buildModelArgs("grok", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("reasonix 走 -p + text（不再把 usage help 当回复）", () => {
+    expect(buildAgentArgs("reasonix", "hi")).toEqual(["-p", "hi", "--output-format", "text"]);
+    expect(buildModelArgs("reasonix", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("zeroclaw 走 agent -a default -m（缺别名时它只打 usage help）", () => {
+    expect(buildAgentArgs("zeroclaw", "hi")).toEqual(["agent", "-a", "default", "-m", "hi"]);
+    expect(buildModelArgs("zeroclaw", "quukk/glm-5.2")).toEqual([]);
+  });
+
+  it("extractQwenpawReply 从 INFO 日志 + JSON 信封里提取正文", async () => {
+    const { extractQwenpawReply } = await import("./agents.js");
+    const envelope = [
+      "INFO C:\\some\\path.py:80 | 2026-11-10 | Unified browser experimental beta is enabled",
+      "{",
+      '  "status": "success",',
+      '  "elapsed_seconds": 2.31,',
+      '  "response": "\\n\\nOK",',
+      '  "usage": {}',
+      "}",
+    ].join("\n");
+    expect(extractQwenpawReply(envelope)).toBe("OK");
+    // 无信封（日志为主）时去掉日志行兜底，绝不返回空。
+    expect(extractQwenpawReply("INFO a\nWARNING b\nhello")).toBe("hello");
+    // status=error 的信封如实转述，不假装成功。
+    const errEnvelope = '{"status": "error", "error": "boom"}';
+    expect(extractQwenpawReply(errEnvelope)).toContain("boom");
+  });
+
   it("returns [] for agents without a strategy", () => {
-    expect(buildAgentArgs("grok", "hi")).toEqual([]);
+    // copilot 至今没有 argv 策略（设备端不支持它的运行时），是「无策略」样本；
+    // 2026-11-10 起 grok/deveco/mcode/qwenpaw/dim/reasonix/zeroclaw 都有策略了，
+    // 不能再拿它们当样本。
+    expect(buildAgentArgs("copilot", "hi")).toEqual([]);
   });
 
   it("returns [] past the argv length cap (falls back to stdin)", () => {
@@ -719,12 +778,13 @@ describe("runAgentTurn", () => {
   });
 
   it("unknown agents keep stdin mode", async () => {
-    // kimi 现在有策略了，不能再拿它当「未知 agent」样本；用仍无策略的 grok。
-    const fixture = createEchoAgentScript("grok", { recordArgs: true });
+    // kimi 2026-11-04、grok 2026-11-10 都有策略了；「无策略」样本改用 copilot
+    //（设备端不支持它的运行时，至今没有 argv 策略）。
+    const fixture = createEchoAgentScript("copilot", { recordArgs: true });
     try {
       const out = await runAgentTurn({
         execPath: fixture.agentPath,
-        agentName: "grok",
+        agentName: "copilot",
         prompt: "stdin-still-works",
         timeoutMs: 30_000,
       });
@@ -754,6 +814,47 @@ describe("runAgentTurn", () => {
       expect(args).toContain("-p");
       expect(args).toContain("kimi-argv-prompt");
       expect(args).toContain("--output-format");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // pi/omp 的策略是「argv 定模式 + prompt 走 stdin」：argvMode 分支若不写
+  // stdin，omp 收到空输入只吐一行 session 事件就退出，回合「成功」但正文为空
+  // （2026-11-10 现场）。这条钉住 stdin 必写。
+  it("omp 在 argv 模式下仍把 prompt 写进 stdin", async () => {
+    const fixture = createEchoAgentScript("omp");
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "omp",
+        model: "quukk/glm-5.2",
+        prompt: "omp-stdin-prompt",
+        timeoutMs: 30_000,
+      });
+      expect(out).toContain("omp-stdin-prompt");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // kimi 的 stream-json 事件是 {role:"assistant",content:…}（没有 type 字段），
+  // 没有专属分支时整份 JSONL 会被当成正文流出去（2026-11-10 现场）。
+  it("kimi stream-json 只把 assistant 的 content 当正文", async () => {
+    const lines = [
+      '{"role":"meta","type":"system.version","version":"2.5.2"}',
+      '{"role":"assistant","content":"OK"}',
+      '{"role":"meta","type":"session.resume_hint","session_id":"s1","command":"kimi -r s1"}',
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("kimi", { stdoutText: lines });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "kimi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+      });
+      expect(out).toBe("OK");
     } finally {
       fixture.cleanup();
     }

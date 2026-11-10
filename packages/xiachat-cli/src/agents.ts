@@ -227,6 +227,18 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // stdin 里拼装（runAgentTurn 的 dsh 专用分支），argv 里没有 --model 这个
   // 旗标——这里返回空，模型信息由 stdin 命令携带。
   if (name === "dsh") return [];
+  // B 类第二批（2026-11-10）：deveco / mcode / qwenpaw / dim / grok /
+  // reasonix / zeroclaw 的模型选择都走各家自己的账户或配置文件（deveco 的
+  // auth.json、kimi 同款目录型配置、zeroclaw 的 [providers.models.custom]），
+  // 我们的 provider/model 路由它们并不认识——deveco 的 -m 虽然自称收
+  // provider/model，但凭据为 0 时注入只会把「没登录」报错提前；qwenpaw 的
+  // -m 要的是 `anthropic/claude-sonnet-4-5` 形的它家路由。没有证据就不注入，
+  // 模型跟随各家默认配置。
+  if (
+    name === "deveco" || name === "mcode" || name === "qwenpaw"
+    || name === "dim" || name === "grok" || name === "reasonix"
+    || name === "zeroclaw"
+  ) return [];
   return ["--model", model];
 }
 
@@ -245,6 +257,14 @@ export function agentRuntimeEnv(
   model: string | undefined,
   opts: { env?: NodeJS.ProcessEnv; config?: AgentConfig | null } = {},
 ): NodeJS.ProcessEnv | null {
+  // qwenpaw（Python CLI）：Windows 管道上 Python 的 stdout 默认编码跟随
+  // locale（GBK），回复里的中文会以 GBK 字节流出而我们按 UTF-8 解码 ——
+  // 整段正文乱码。PYTHONUTF8=1 强制 Python 进程全程 UTF-8（stdout/stderr/
+  // 文件系统），是唯一无需改它源码的修法。
+  if (agentName === "qwenpaw") {
+    const baseEnv = opts.env ?? process.env;
+    return { ...baseEnv, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" };
+  }
   if (agentName !== "codebuddy") return null;
   const config = opts.config === undefined ? readAgentConfig("codebuddy") : opts.config;
   const endpoint = config?.endpoints[0];
@@ -537,6 +557,63 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     "--output-format", "stream-json",
     ...buildModelArgs("agy", model),
   ],
+  // B 类第二批（2026-11-10 全量真机接入，逐家实机验证过 headless 入口）。
+  // 这一批统一走**纯文本输出**而不是各家的事件流：deveco/grok/dim 的事件或
+  // 格式化输出没有稳定协议文档，mcode/reasonix 的 stream-json 事件形状未经
+  // 真机抓包确认 —— 拿不到证据就不上解析分支，stdout 即正文（raw 通道），
+  // 思考通道如实为空。模型选择都走各家自己的账户/配置文件，不注入 --model
+  //（见 buildModelArgs 的对应分支），避免把不认的路由塞给 CLI 导致启动即退。
+  //
+  // deveco（华为 DevEco CodeGenie，opencode 血统）：`deveco run [message..]`
+  // 是官方一次性入口（deveco run --help：不进 TUI，跑完退出）；默认 --format
+  // default 输出格式化正文。裸 `deveco` 是交互 TUI —— 2026-11-10 现场：TUI
+  // 在无 console 的 spawn 下喷 80 万字节进度条后被掐，整个回合 agent_failed。
+  deveco: (prompt) => [
+    "run", prompt,
+  ],
+  // mcode（Minimax Code）：`mcode exec [prompt]` 官方自述「Run one prompt
+  // without starting the TUI」；不带 --output-format 时默认 text。裸 `mcode`
+  // 在无 TTY 下直接拒绝（"interactive mode requires a TTY"）。
+  mcode: (prompt) => [
+    "exec", prompt, "--output-format", "text",
+  ],
+  // qwenpaw（QwenPaw，Python venv CLI）：`qwenpaw task -i <instruction>` 是
+  // 官方 headless 单任务入口（task --help：Run a single task instruction
+  // headlessly）。stdout 是「INFO 日志行 + 末尾一个 JSON 信封
+  // {status, elapsed_seconds, response, usage}」，信封由 extractQwenpawReply
+  // 在收尾时整段提取（见 emitsJsonEnvelope / close 分支）。
+  // ⚠️ 中文经 .cmd shim + cmd.exe 的 %* 透传本身是 UTF-16 安全的，但 Python
+  // 在 Windows 管道上的 stdout 默认编码是 locale（GBK），回复正文会整体乱码
+  // —— agentRuntimeEnv 给 qwenpaw 注入 PYTHONUTF8=1 强制 UTF-8 输出。
+  qwenpaw: (prompt) => [
+    "task", "-i", prompt,
+  ],
+  // dim（DimAgent）：`dim exec [prompt]` 官方一次性入口；裸 `dim` 是 TUI，
+  // 且在未信任目录直接退出（"not a trusted folder"，设备 workdir 需先跑一次
+  // 交互式 dim 完成信任）。stdout 为正文文本。
+  dim: (prompt) => [
+    "exec", prompt,
+  ],
+  // grok（xAI Grok Build）：`-p/--single <PROMPT>` 官方 headless 单轮
+  // （grok --help：Single-turn prompt. Prints the response to stdout and
+  // exits），默认 --output-format plain 即纯正文。裸 `grok [PROMPT]` 是 TUI。
+  grok: (prompt) => [
+    "-p", prompt,
+  ],
+  // reasonix：`-p/--print <task>` 官方非交互入口，--output-format text 输出
+  // 纯正文（json/stream-json 的事件形状未抓包，先不上解析）。裸 `reasonix`
+  // 是 TUI；无参数时它打印 usage help —— 2026-11-10 现场 reasonix/zeroclaw
+  // 的「回复」就是这份 help。
+  reasonix: (prompt) => [
+    "-p", prompt, "--output-format", "text",
+  ],
+  // zeroclaw（ZeroClaw，Rust）：`agent` 子命令是唯一的对话入口，且**必须**
+  // 带 `-a/--agent <alias>`（没有默认 agent，缺别名直接打 usage help 退出）
+  // 与 `-m/--message`（单条消息模式，不进交互会话）。输出为纯正文。
+  // 设备约定别名固定为 "default"（~/.zeroclaw/config.toml 的 [agents.default]）。
+  zeroclaw: (prompt) => [
+    "agent", "-a", "default", "-m", prompt,
+  ],
 };
 
 // Windows CreateProcess caps the whole command line near 32k chars (and
@@ -825,7 +902,39 @@ export function extractOpenclawReply(raw: string): string {  const fromJson = pa
 // 「内容重复」的气泡（一条 JSON、一条正文）。
 // 它们只发「处理中 → 完成」两端：终帧本身携带完整正文，气泡照样填满。
 export function emitsJsonEnvelope(agentName: string | undefined): boolean {
-  return agentName === "openclaw";
+  return agentName === "openclaw" || agentName === "qwenpaw";
+}
+
+// qwenpaw `task -i` 的 stdout 是「INFO 日志行 + 末尾一个 JSON 信封」，信封形如
+// {"status":"success","elapsed_seconds":2.31,"response":"\n\nOK","usage":{}}。
+// 提取策略：从最后一个「行首 {」起整段尝试 JSON.parse（qwenpaw 用 indent=2
+// 打印信封，第一行必然是单独的 "{"），成功且带 response 字符串字段即正文；
+// 失败（日志混进花括号、或 status 非 success 的错误信封）时退回原文去掉
+// INFO 日志行 —— 绝不让这一轮变成空白回复。
+export function extractQwenpawReply(raw: string): string {
+  const start = raw.lastIndexOf("\n{");
+  const candidate = start >= 0 ? raw.slice(start + 1) : raw.trim();
+  if (candidate.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(candidate) as { status?: unknown; response?: unknown; error?: unknown };
+      if (typeof parsed.response === "string") {
+        const reply = parsed.response.trim();
+        if (reply.length > 0) return reply;
+      }
+      if (parsed.status === "error" && typeof parsed.error === "string") {
+        return `qwenpaw task failed: ${parsed.error}`;
+      }
+    } catch {
+      // 不是完整 JSON（信封后面可能还有日志）——落到底部按原文清理。
+    }
+  }
+  // 兜底：去掉 qwenpaw 的 INFO/WARNING 日志行后返回剩余正文。
+  const cleaned = raw
+    .split("\n")
+    .filter((line) => !/^(INFO|WARNING|DEBUG|ERROR) /i.test(line.trim()))
+    .join("\n")
+    .trim();
+  return cleaned || raw.trim();
 }
 
 /**
@@ -1186,6 +1295,30 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     return typeof event.text === "string" ? { reasoning: event.text } : null;
   }
 
+  // --- kimi：role 判型（kimi stream-json 的事件不带 type 字段）---
+  // 实测（2026-11-10，kimi 2.5.2 -p --output-format stream-json）：
+  //   {"role":"meta","type":"system.version",…}            ← 噪声，丢弃
+  //   {"role":"assistant","content":"OK"}                  ← 正文（权威全文）
+  //   {"role":"meta","type":"session.resume_hint",…}       ← 噪声，丢弃
+  // content 实测为字符串；兼容块数组（同 claude 形）以防版本差异。
+  // kimi 没有独立的 result 帧 —— assistant 消息即本轮回答。工具轮次可能出多
+  // 条 assistant 消息，此处按增量拼接（与 claude delta 同语义）。
+  if (event.role === "assistant") {
+    if (typeof event.content === "string" && event.content) {
+      return { text: event.content };
+    }
+    if (Array.isArray(event.content)) {
+      const parts = event.content
+        .filter((block): block is Record<string, unknown> =>
+          typeof block === "object" && block !== null
+          && (block as Record<string, unknown>).type === "text")
+        .map((block) => (block as { text?: unknown }).text)
+        .filter((t): t is string => typeof t === "string" && t.length > 0);
+      if (parts.length > 0) return { text: parts.join("") };
+    }
+    return null;
+  }
+
   // --- claude 同形的 result / assistant 快照（cursor-agent / traecli / qoder）---
   // result 是**权威全文**（整轮正文）。cursor-agent / traecli 家族没有 text
   // delta 流，这是正文上屏的来源之一；claude/qwen/codebuddy 的 delta 已逐字
@@ -1441,9 +1574,16 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
         agyResult = result.response;
       }
     }
-    if (event.type === "assistant") {
-      const message = event.message as Record<string, unknown> | undefined;
-      const content = message?.content;
+    if (event.type === "assistant" || event.role === "assistant") {
+      // kimi 的 assistant 事件是顶层 {role,content}（content 为字符串或块数组），
+      // claude 系是 {type,message.content}。两种形状都归到 texts。
+      const direct = typeof event.content === "string" && event.content ? event.content : undefined;
+      const message = (event.message ?? undefined) as Record<string, unknown> | undefined;
+      const content = direct !== undefined ? direct : message?.content;
+      if (typeof content === "string") {
+        if (content) texts.push(content);
+        continue;
+      }
       if (Array.isArray(content)) {
         const parts = content
           .map((block) => (typeof block === "object" && block !== null
@@ -2246,7 +2386,11 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             // 非流式路径：stdout 本身就是回答（信封型另有上面那条分支），缓冲
             // 上限即回答长度上限，保持「按字节截断」的老语义；流式路径的正文
             // 是解析出来的，所以缓冲满了也照样给出完整正文（见上一条分支）。
-            resolve(opts.agentName === "openclaw" ? extractOpenclawReply(stdout) : stdout);
+            resolve(
+              opts.agentName === "openclaw" ? extractOpenclawReply(stdout)
+                : opts.agentName === "qwenpaw" ? extractQwenpawReply(stdout)
+                : stdout,
+            );
           }
         } else {
           // 失败退出同样收尾：failed 帧要带着完整步骤，别留下「进行中」。
@@ -2268,7 +2412,12 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       // The agent may exit before reading all stdin (EPIPE); the close
       // handler reports the real outcome.
     });
-    if (argvMode && opts.agentName !== "dsh") {
+    // pi / omp 的策略是「argv 定模式 + prompt 走 stdin」（pi 的 npm shim 会把
+    // argv 里的提示词重新分词，pi.go:421-425）：它们**必须**把 prompt 写进
+    // stdin 再关，不能走上面那支「纯 argv 即完事」的 fast path。
+    // 2026-11-10 现场：漏写导致 omp 收到空 stdin，只吐一行 session 事件就退出，
+    // 回合「成功」但正文为空（runAgentTurn 把这行 JSON 原文当成了回答）。
+    if (argvMode && opts.agentName !== "dsh" && opts.agentName !== "pi" && opts.agentName !== "omp") {
       child.stdin.end();
     } else if (opts.agentName === "dsh") {
       // dsh 的 stdin 不是裸文本：版本化 stdio JSONL 协议要求写入
