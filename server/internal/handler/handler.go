@@ -374,12 +374,12 @@ type Handler struct {
 	TelegramOutbound *telegram.Outbound
 
 	// RongCloud integration services (nil when MULTICA_RONGCLOUD_SECRET_KEY is not set).
-	RongCloudInstall    *rongcloud.InstallService
+	RongCloudInstall *rongcloud.InstallService
 	// wechatAPIBase / wechatHTTPClient 只供测试注入假的微信 jscode2session
 	// 服务（空值走 https://api.weixin.qq.com 与 8s 超时客户端）。注入范式与
 	// rongcloud 包 systemHandler 的同名字段一致：业务代码不设置它们。
-	wechatAPIBase    string
-	wechatHTTPClient *http.Client
+	wechatAPIBase       string
+	wechatHTTPClient    *http.Client
 	RongCloudNode       *rongcloud.NodeService
 	RongCloudChatroom   *rongcloud.ChatroomService
 	RongCloudPairing    *rongcloud.PairingService
@@ -394,6 +394,9 @@ type Handler struct {
 	// command channel; see rongcloud.NodeRequestBroker. Shared with the channel
 	// via ChannelDeps, which is why it lives here rather than inside a service.
 	RongCloudNodeRequests *rongcloud.NodeRequestBroker
+	// OpsChat 是管理端「运维对话」的服务端代理：HTTP 侧发起/轮询，融云 webhook
+	// 侧认领设备回包。与 RongCloudNodeRequests 一样通过 ChannelDeps 共享实例。
+	OpsChat *rongcloud.OpsChatBroker
 	// RongCloudDiscussionRepo 是 P2 的圆桌仓库层，C 端扁平 REST（P4）读它。
 	// 与 RongCloudDiscussion（旧固定轮流链路）并存：旧链路 P6 后退役。
 	RongCloudDiscussionRepo *rongcloud.DiscussionRepository

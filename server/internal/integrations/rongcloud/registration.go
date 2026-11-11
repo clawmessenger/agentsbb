@@ -24,6 +24,10 @@ type ChannelDeps struct {
 	// admin API; the channel binds the sender and routes the answers in. Nil
 	// disables the feature.
 	NodeRequests *NodeRequestBroker
+	// OpsChat 代理管理端「运维对话」的一次 RC:TxtMsg 往返：HTTP 侧发起/轮询，
+	// channel 侧绑定发送者并把设备回包认领回来。Nil 关闭该功能。
+	// 与 NodeRequests 一样是「一个实例、两端持有」，不能各建一个。
+	OpsChat *OpsChatBroker
 	// GroupMirror supplies the database side of the `service=group` commands
 	// (the RongCloud group APIs live in this package, the tables in the HTTP
 	// layer). Nil disables the group commands.
@@ -74,6 +78,15 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			deps.NodeRequests.BindSender(func(ctx context.Context, toUserID, content string) error {
 				_, err := client.sendPrivateMessage(ctx, systemNodeID, toUserID, objectNameCommand, content)
 				return err
+			})
+		}
+		// 运维对话走的是普通文本私聊，不是 command 通道：设备端 CLI 的
+		// handle() 认 RC:TxtMsg，runStreamedTurn 收尾必回一条全文文本。
+		// msgUID 要留下来和 chat_stream 帧的 request_message_id 对上。
+		if deps.OpsChat != nil {
+			systemNodeID := creds.SystemNodeID
+			deps.OpsChat.BindSender(func(ctx context.Context, toUserID, text string) (string, error) {
+				return client.sendPrivateMessage(ctx, systemNodeID, toUserID, objectNameText, encodeTextContent(text))
 			})
 		}
 		var discussionRuntime *discussionRuntime
@@ -137,6 +150,7 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			systemHandler: systemHandler,
 			registrar:     deps.Registrar,
 			handler:       cfg.Handler,
+			opsChat:       deps.OpsChat,
 			logger:        logger,
 		}, nil
 	}

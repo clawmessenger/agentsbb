@@ -1254,6 +1254,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// One broker, two users: the channel binds the sender and routes
 			// device answers in, the admin API starts requests.
 			rcNodeRequests := rongcloud.NewNodeRequestBroker(slog.Default())
+			// 管理端运维对话：与普通文本私聊同一条链路，和 broker 一样一个实例两端持有。
+			rcOpsChat := rongcloud.NewOpsChatBroker(slog.Default())
 			// T01 配额服务：空组直建 / 群创建 / 聊天室创建三入口共用同一实例；
 			// REST（/api/quota/me）与 admin 配额 API 也挂它。
 			rcQuota := quota.New(pool)
@@ -1265,6 +1267,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				Queries:      queries,
 				Registry:     rcRegistry,
 				NodeRequests: rcNodeRequests,
+				OpsChat:      rcOpsChat,
 				Quota:        rcQuota,
 				// GroupMirror 的 callbacks 懒查 h.RongCloudNode（构造完才赋值），
 				// 所以这里可以安全地先挂上去。
@@ -1295,6 +1298,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// host node; the config row lives on the HTTP side.
 			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, h.ClawDiscussionHostPersona, slog.Default())
 			h.RongCloudNodeRequests = rcNodeRequests
+			h.OpsChat = rcOpsChat
 			// P4：C 端扁平 REST（/api/discussions/*）读 P2 的仓库层。
 			h.RongCloudDiscussionRepo = rongcloud.NewDiscussionRepository(queries, slog.Default())
 			h.RongCloudDiscussionAccess = rongcloud.NewDiscussionRoomAccess(queries)
@@ -1822,6 +1826,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Put("/api/admin/nodes/{id}", h.ClawAdminUpdateNode)
 	r.Delete("/api/admin/nodes/{id}", h.ClawAdminDeleteNode)
 	r.Get("/api/admin/nodes/{id}/status", h.ClawAdminGetNodeStatus)
+	// 运维对话：管理端浏览器没有融云 IM SDK，由服务端代理一条 RC:TxtMsg 私聊。
+	// POST 只投递并返回 request_id（设备要跑一整回合，不能让 HTTP 长等撞 nginx
+	// 的 proxy_read_timeout），GET result/ 轮询终态。设备端 CLI 无需任何改动。
+	r.Get("/api/admin/nodes/{id}/ops-chat", h.ClawAdminOpsChatContext)
+	r.Post("/api/admin/nodes/{id}/ops-chat", h.ClawAdminOpsChatSend)
+	r.Get("/api/admin/nodes/{id}/ops-chat/result/{request_id}", h.ClawAdminOpsChatResult)
 	// 启停：写期望状态，由设备 supervisor 轮询执行（见 claw_device_control.go）。
 	r.Post("/api/admin/nodes/{id}/start", h.ClawAdminStartNode)
 	r.Post("/api/admin/nodes/{id}/stop", h.ClawAdminStopNode)

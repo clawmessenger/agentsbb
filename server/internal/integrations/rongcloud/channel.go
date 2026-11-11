@@ -17,9 +17,11 @@ type rongcloudChannel struct {
 	systemHandler *systemHandler
 	registrar     WebhookRegistrar
 	handler       channel.InboundHandler
-	logger        *slog.Logger
-	ctx           context.Context
-	cancel        context.CancelFunc
+	// opsChat 与管理端 HTTP 侧共用同一实例；webhook 在这里把设备回包先交给它认领。
+	opsChat *OpsChatBroker
+	logger  *slog.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
 	// commands 用于丢弃融云重投的命令回调（见 command_dispatch.go）。
 	commands commandDedup
 }
@@ -113,6 +115,15 @@ func (c *rongcloudChannel) handleWebhook(w http.ResponseWriter, r *http.Request)
 	msg, err := parseWebhookPayload(r)
 	if err != nil {
 		c.logger.Error("rongcloud: parse webhook payload", "error", err)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// 管理端运维对话的设备回包必须最先认领：它既有 chat_stream 自定义消息
+	// （下面 isStreamMessage 只认 RC:StreamMsg，会漏进通用分发器），也有
+	// RC:TxtMsg 全文兜底（会被当成一条新的用户消息，可能触发系统账号回声）。
+	// 没有在途请求时 Accept 一律返回 false，既有链路行为完全不变。
+	if c.opsChat != nil && c.opsChat.Accept(msg) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
