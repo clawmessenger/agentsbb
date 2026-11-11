@@ -71,12 +71,119 @@ const (
 	// 8s 窗口外的结果就是「节点明明有模型，管理端却只拿到一张空目录」，用户看到
 	// 的下拉框一片空白，还以为是功能坏了。
 	//
-	// 放宽到 20s / 15s：目录查询是一次显式的人工操作，多等十秒换来「下拉里真的有
+	// 放宽到 50s / 15s：目录查询是一次显式的人工操作，多等一会儿换来「下拉里真的有
 	// 东西」是划算的；保存路径仍比查询短，免得离线节点把「改个提示词」一起拖住。
-	// 前端 axios 的超时按这两个值 +5s 夹逼（见 api/discussion-host.ts）。
-	clawAdminDiscussionHostCatalogTimeout = 20 * time.Second
+	//
+	// 50s 这个上限不是拍的：设备端 model-catalog.ts 对 `opencode models` 给 30s、
+	// 对 `openclaw models list --json` 给 60s，旧的 20s 窗口在冷启动时**结构性**
+	// 不够 —— 设备还在枚举，服务端已经回 503，页面表现就是「获取供应商模型超时」。
+	// 取 50s 是刻意的：clawmessenger.quukk.com 的 /api location 配了
+	// proxy_read_timeout 300s，但 newsradar 那套仍是 nginx 默认 60s —— 同一个
+	// 二进制要能同时跑在两套部署上，上限就压在 60s 之下，避免等到的不是后端
+	// 统一 503 而是网关 504（连错误码都拿不到）。openclaw 真跑满 60s 的极端
+	// 情形由下面的 last-good 缓存兜住：设备自己的 5 分钟缓存 + 服务端回退，
+	// 第二次进页面就不会再撞同一堵墙。
+	// 前端 axios 的超时按这个值 +5s 夹逼（见 api/discussion-host.ts）。
+	clawAdminDiscussionHostCatalogTimeout = 50 * time.Second
 	clawAdminDiscussionHostVerifyTimeout  = 15 * time.Second
+
+	// clawAdminCatalogFreshTTL：这段时间内的目录直接回缓存，不再让设备跑往返。
+	// clawAdminCatalogStaleTTL：设备这次没答上来时，旧目录仍可用来渲染下拉，
+	// 但要在响应里标 source=cache_stale，让页面明确说「这不是设备当下状态」。
+	clawAdminCatalogFreshTTL      = 5 * time.Minute
+	clawAdminCatalogStaleTTL      = 24 * time.Hour
+	clawAdminCatalogCacheMaxNodes = 256
 )
+
+// clawAdminCatalogEntry 是一次成功目录往返的结果。
+type clawAdminCatalogEntry struct {
+	catalog   rongcloud.DiscussionModelCatalog
+	fetchedAt time.Time
+}
+
+// clawAdminCatalogCache 保存每个主持节点最近一次**确实拿到过模型**的目录。
+//
+// 为什么必须有：目录接口是「服务端私发 IM → 设备跑本机 CLI → 融云回包 →
+// 服务端 webhook 认领」的四跳链路，任何一跳慢/断都会让管理端下拉变空。设备端
+// 自己有 5 分钟缓存，但服务端一超时就把这次结果丢掉，于是用户每次进页面都要
+// 重新赌一次四跳。存一份 last-good 之后：首屏直接回、设备短暂离线时回退旧值。
+//
+// 只存内存、进程重启即失效是刻意的：不引入新的持久化表，也不跨部署实例共享，
+// 避免把某个节点「曾经有过哪些模型」变成永久资产。容量护栏同上。
+type clawAdminCatalogCache struct {
+	mu      sync.Mutex
+	entries map[string]clawAdminCatalogEntry
+}
+
+var clawAdminCatalogLastGood = &clawAdminCatalogCache{
+	entries: make(map[string]clawAdminCatalogEntry),
+}
+
+// get 返回不超过 maxAge 的缓存副本。切片做一层浅拷贝，调用方过滤 provider 时
+// 不会改到缓存里的底层数组。
+func (c *clawAdminCatalogCache) get(nodeID string, now time.Time, maxAge time.Duration) (rongcloud.DiscussionModelCatalog, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[nodeID]
+	if !ok {
+		return rongcloud.DiscussionModelCatalog{}, time.Time{}, false
+	}
+	// 时钟回拨（age < 0）也当未命中，免得一份目录被永久判成「刚刚取的」。
+	age := now.Sub(entry.fetchedAt)
+	if age < 0 || age > maxAge {
+		return rongcloud.DiscussionModelCatalog{}, time.Time{}, false
+	}
+	out := entry.catalog
+	out.Providers = append([]rongcloud.DiscussionModelProvider(nil), entry.catalog.Providers...)
+	return out, entry.fetchedAt, true
+}
+
+// put 只记「设备答了、而且真有模型」的目录。空目录多半是设备端配置异常，
+// 缓存它会把一次瞬时故障固化成 24 小时的「无可用模型」。
+func (c *clawAdminCatalogCache) put(nodeID string, catalog rongcloud.DiscussionModelCatalog, now time.Time) {
+	if nodeID == "" || len(catalog.Providers) == 0 {
+		return
+	}
+	stored := catalog
+	stored.Providers = append([]rongcloud.DiscussionModelProvider(nil), catalog.Providers...)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]clawAdminCatalogEntry)
+	}
+	if _, exists := c.entries[nodeID]; !exists && len(c.entries) >= clawAdminCatalogCacheMaxNodes {
+		// 超上限时丢掉最旧的一条，避免 node_id 无界增长。
+		var oldestID string
+		var oldest time.Time
+		for id, entry := range c.entries {
+			if oldestID == "" || entry.fetchedAt.Before(oldest) {
+				oldestID, oldest = id, entry.fetchedAt
+			}
+		}
+		delete(c.entries, oldestID)
+	}
+	c.entries[nodeID] = clawAdminCatalogEntry{catalog: stored, fetchedAt: now}
+}
+
+// resetForTest 只给测试用：清掉跨用例的进程内状态。
+func (c *clawAdminCatalogCache) resetForTest() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]clawAdminCatalogEntry)
+}
+
+// backdateForTest 把某条缓存伪装成「新鲜窗口已过、但仍在回退窗口内」，
+// 用来单独验证 stale 分支（否则首屏缓存命中会先一步返回，根本走不到设备失败）。
+func (c *clawAdminCatalogCache) backdateForTest(nodeID string, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[nodeID]
+	if !ok {
+		return
+	}
+	entry.fetchedAt = at
+	c.entries[nodeID] = entry
+}
 
 // clawAdminModelSegmentCharset 是 provider / model 单段允许的字符集。`@` 保留在
 // 这里只是为了给出更准确的报错（有些网关的模型名带它），route 正则并不放行 ——
@@ -885,14 +992,48 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 	// refresh=1：「重新检测」要求的强制重枚举。设备端对「缓存还新鲜」的请求会直接
 	// 回旧清单（packages/xiachat-cli 的 ModelCatalogLoader），不带这个标志的话，
 	// 用户在设备上刚改了模型、点一下「重新检测」拿到的还是旧的那份。
+	refresh := clawAdminCatalogRefreshRequested(r)
+	now := time.Now()
+
+	// 首屏直接回最近一次成功目录：这四跳链路每次都要赌一遍设备在线 + CLI 不冷启动，
+	// 是「获取供应商模型超时」最常见的来源。节点/能力闸门在上面已经过完，回缓存
+	// 不会放宽任何权限，也不改变对外统一 503 的失败语义。
+	if !refresh {
+		if cached, _, ok := clawAdminCatalogLastGood.get(nodeID, now, clawAdminCatalogFreshTTL); ok {
+			h.clawAdminWriteDiscussionHostCatalog(w, r, ident, nodeID, cached, "cache")
+			return
+		}
+	}
+
 	catalog, code := h.clawAdminDiscussionHostFetchCatalog(
 		r.Context(), nodeUUIDValue, node.RongcloudUserID,
-		clawAdminDiscussionHostCatalogTimeout, clawAdminCatalogRefreshRequested(r))
+		clawAdminDiscussionHostCatalogTimeout, refresh)
 	if code != "" {
+		// 「重新检测」是用户明确要求看设备当下状态，旧目录不能冒充成功；常规读取
+		// 则可以回退，避免一次离线/超时就把整个下拉打空。响应里标 source=cache_stale，
+		// 前端会提示这份清单不是设备实时状态。
+		if !refresh {
+			if cached, _, ok := clawAdminCatalogLastGood.get(nodeID, now, clawAdminCatalogStaleTTL); ok {
+				slog.Warn("claw admin: serving stale discussion host model catalog",
+					"node_id", nodeID, "device_error", code)
+				h.clawAdminWriteDiscussionHostCatalog(w, r, ident, nodeID, cached, "cache_stale")
+				return
+			}
+		}
 		unavailable(code, "node_id", nodeID)
 		return
 	}
+	clawAdminCatalogLastGood.put(nodeID, catalog, now)
+	h.clawAdminWriteDiscussionHostCatalog(w, r, ident, nodeID, catalog, "device")
+}
 
+// clawAdminWriteDiscussionHostCatalog 把一份目录（设备刚回的 / 缓存里的）转成响应。
+// 抽出来是因为命中缓存、旧值回退、设备实时三条路径必须给出**完全相同**的形状，
+// 只有 source 与审计里的 provider_count 不同。
+func (h *Handler) clawAdminWriteDiscussionHostCatalog(
+	w http.ResponseWriter, r *http.Request, ident *clawAdminIdentity,
+	nodeID string, catalog rongcloud.DiscussionModelCatalog, source string,
+) {
 	providers := make([]clawAdminDiscussionHostProv, 0, len(catalog.Providers))
 	for _, provider := range catalog.Providers {
 		models := make([]clawAdminDiscussionHostMdl, 0, len(provider.Models))
@@ -913,9 +1054,9 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 	if len(providers) == 0 {
 		reason = clawAdminCatalogReasonNoModels
 		slog.Warn("claw admin: discussion host reported no usable models",
-			"node_id", nodeID, "raw_provider_count", len(catalog.Providers))
+			"node_id", nodeID, "source", source, "raw_provider_count", len(catalog.Providers))
 	}
-	h.auditCatalogFetch(r, ident, nodeID, "", "source", "device",
+	h.auditCatalogFetch(r, ident, nodeID, "", "source", source,
 		"provider_count", len(providers))
 	clawAdminOK(w, clawAdminDiscussionHostCatalog{
 		ProtocolVersion: 2,
@@ -923,7 +1064,7 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 		DefaultModel:    catalog.DefaultModel,
 		Providers:       providers,
 		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
-		Source:          "device",
+		Source:          source,
 		Reason:          reason,
 	})
 }
