@@ -419,11 +419,11 @@ describe("buildDeviceOpencodeConfig —— 限制键与指令（配置内容快�
   });
 
   it("instructions 是追加而不是覆盖（用户自己的指令文件必须留着）", () => {
-    const built = buildDeviceOpencodeConfig(raw, { instructions: ["/home/u/.clawmessenger/agent-behavior/codex.md"] });
+    const built = buildDeviceOpencodeConfig(raw, { instructions: ["/home/u/.agentsbb/agent-behavior/codex.md"] });
     const config = JSON.parse(built!.text) as { instructions: string[] };
     expect(config.instructions).toEqual([
       "/home/u/my-notes.md",
-      "/home/u/.clawmessenger/agent-behavior/codex.md",
+      "/home/u/.agentsbb/agent-behavior/codex.md",
     ]);
   });
 
@@ -475,7 +475,7 @@ describe("codex 行为规范标记块（与输出风格各用一套标记）", (
   });
 
   it("不碰输出风格段（两套标记互不覆盖）", () => {
-    const base = `<!-- clawmessenger:output-style:begin -->\n风格\n<!-- clawmessenger:output-style:end -->`;
+    const base = `<!-- agentsbb:output-style:begin -->\n风格\n<!-- agentsbb:output-style:end -->`;
     const merged = mergeCodexBehaviorPrompt(base, "行为");
     expect(merged).toContain(CODEX_OUTPUT_STYLE_BEGIN);
     expect(merged).toContain("风格");
@@ -619,7 +619,7 @@ describe("syncAgentPermissionConfig —— 权限快照变化时重算落盘", (
       snapshot([{ agent: "opencode", nodeId: "n1", allowFs: false }]),
       { env, home },
     );
-    expect(path).toBe(join(home, ".clawmessenger", "opencode-device-opencode.json"));
+    expect(path).toBe(join(home, ".agentsbb", "opencode-device-opencode.json"));
     const config = JSON.parse(readFileSync(path!, "utf8")) as Record<string, any>;
     expect(config.permission.bash).toBe("deny");
     expect(config.tools.write).toBe(false);
@@ -726,7 +726,7 @@ describe("B1 接线：serve 默认路径必须真正带上 allowFs 限制（审�
     delete process.env.CLAWMESSENGER_OPENCODE_SERVER;
 
     // 派生配置落在真实 home（生产路径），测完恢复原样，别污染开发机。
-    const deviceConfigPath = join(homedir(), ".clawmessenger", "opencode-device-opencode.json");
+    const deviceConfigPath = join(homedir(), ".agentsbb", "opencode-device-opencode.json");
     const previousConfig = (() => {
       try {
         return readFileSync(deviceConfigPath, "utf8");
@@ -812,7 +812,7 @@ describe("B1 接线：serve 默认路径必须真正带上 allowFs 限制（审�
     // 那样测不到本用例要断言的东西。
     delete process.env.OPENCODE_CONFIG;
 
-    const opsConfigPath = join(homedir(), ".clawmessenger", "opencode-device-ops.json");
+    const opsConfigPath = join(homedir(), ".agentsbb", "opencode-device-ops.json");
     const previousOpsConfig = (() => {
       try {
         return readFileSync(opsConfigPath, "utf8");
@@ -871,9 +871,9 @@ describe("快照落盘与读取", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("permissionCachePath 认环境变量覆盖，缺省落在 ~/.clawmessenger", () => {
+  it("permissionCachePath 认环境变量覆盖，缺省落在 ~/.agentsbb", () => {
     expect(permissionCachePath({ [PERMISSION_FILE_ENV]: "/tmp/x.json" }, "/home/u")).toBe("/tmp/x.json");
-    expect(permissionCachePath({}, "/home/u")).toBe(join("/home/u", ".clawmessenger", "agent-permissions.json"));
+    expect(permissionCachePath({}, "/home/u")).toBe(join("/home/u", ".agentsbb", "agent-permissions.json"));
   });
 
   it("写盘后能按 nodeId 读回", () => {

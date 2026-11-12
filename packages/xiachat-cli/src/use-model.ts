@@ -1,7 +1,7 @@
 import { splitModelRoute } from "./agents.js";
 
 // web 切模型发的是**一条普通私聊文本** `/use-model <provider>/<model>`
-// （clawmessenger-web/src/pages/Home.tsx handleConversationModelChange）。
+// （agentsbb-web/src/pages/Home.tsx handleConversationModelChange）。
 // 在这套 CLI 补上这个解析之前，那条文本会被当成用户提问送进 agent —— 用户点
 // 「角色模型」，模型回一句「我不认识这个命令」，或者干脆开始执行一个叫
 // use-model 的任务。

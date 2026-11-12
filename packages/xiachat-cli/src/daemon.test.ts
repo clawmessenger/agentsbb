@@ -19,7 +19,7 @@ import {
   type DaemonPaths,
 } from "./daemon.js";
 
-const EXE = "/opt/clawmessenger/clawmessenger";
+const EXE = "/opt/agentsbb/agentsbb";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -45,9 +45,9 @@ interface Harness {
 }
 
 function harness(overrides: Partial<DaemonOverrides> = {}, opts: { spawnPid?: number; publish?: boolean } = {}): Harness {
-  const home = mkdtempSync(join(tmpdir(), "clawmessenger-daemon-"));
+  const home = mkdtempSync(join(tmpdir(), "agentsbb-daemon-"));
   dirs.push(home);
-  const paths = defaultDaemonPaths(join(home, ".clawmessenger"));
+  const paths = defaultDaemonPaths(join(home, ".agentsbb"));
   const lines: string[] = [];
   const errors: string[] = [];
   const alive = new Set<number>();
@@ -101,9 +101,9 @@ function harness(overrides: Partial<DaemonOverrides> = {}, opts: { spawnPid?: nu
     },
     // 自启项一律落在临时目录里，绝不去碰真实的 /etc 与用户目录。
     autostartPaths: {
-      systemUnit: join(paths.stateDir, "etc", "systemd", "system", "clawmessenger.service"),
-      userUnit: join(home, ".config", "systemd", "user", "clawmessenger.service"),
-      launchAgent: join(home, "Library", "LaunchAgents", "com.clawmessenger.supervisor.plist"),
+      systemUnit: join(paths.stateDir, "etc", "systemd", "system", "agentsbb.service"),
+      userUnit: join(home, ".config", "systemd", "user", "agentsbb.service"),
+      launchAgent: join(home, "Library", "LaunchAgents", "com.agentsbb.supervisor.plist"),
     },
     ...overrides,
   });
@@ -121,8 +121,8 @@ describe("supervisorSpawnArgv", () => {
   it("re-invokes the bare exe when there is no .js entry point (SEA)", () => {
     // argv[1] 在 SEA 单文件 exe 里要么不存在、要么就是 exe 自己，都不是 .js。
     expect(supervisorSpawnArgv("")).toEqual([]);
-    expect(supervisorSpawnArgv("/usr/local/bin/clawmessenger")).toEqual([]);
-    expect(supervisorSpawnArgv("C:\\Users\\u\\.local\\bin\\clawmessenger.exe")).toEqual([]);
+    expect(supervisorSpawnArgv("/usr/local/bin/agentsbb")).toEqual([]);
+    expect(supervisorSpawnArgv("C:\\Users\\u\\.local\\bin\\agentsbb.exe")).toEqual([]);
   });
 
   it("keeps the bundle path when running under node", () => {
@@ -305,7 +305,7 @@ describe("daemon stop", () => {
   it("reports a plain no-op when there is not even a stale file", async () => {
     const h = harness();
     await h.daemon.stop();
-    expect(h.lines.join("")).toContain("no clawmessenger supervisor is running.");
+    expect(h.lines.join("")).toContain("no agentsbb supervisor is running.");
     expect(h.lines.join("")).not.toContain("stale");
   });
 
@@ -355,7 +355,7 @@ describe("daemon status", () => {
     expect(report.stale).toBe(false);
     const text = formatDaemonStatus(report, h.paths);
     expect(text).toContain("not running in the background");
-    expect(text).toContain("clawmessenger start");
+    expect(text).toContain("agentsbb start");
   });
 
   it("flags a leftover pid file as stale", () => {
@@ -437,7 +437,7 @@ describe("daemon status", () => {
   it("surfaces the configured autostart entry", () => {
     const h = harness();
     mkdirSync(join(h.home, ".config", "systemd", "user"), { recursive: true });
-    writeFileSync(join(h.home, ".config", "systemd", "user", "clawmessenger.service"), "[Unit]\n");
+    writeFileSync(join(h.home, ".config", "systemd", "user", "agentsbb.service"), "[Unit]\n");
     expect(h.daemon.status().autostart).toContain("systemd user service");
   });
 });
@@ -477,7 +477,7 @@ describe("daemon install-service (Linux)", () => {
     const h = harness({ uid: 0 });
     await h.daemon.installService({ model: "gpt-5" });
 
-    const unitPath = join(h.paths.stateDir, "etc", "systemd", "system", "clawmessenger.service");
+    const unitPath = join(h.paths.stateDir, "etc", "systemd", "system", "agentsbb.service");
     expect(existsSync(unitPath)).toBe(true);
     const unit = readFileSync(unitPath, "utf8");
     expect(unit).toContain("WantedBy=multi-user.target");
@@ -485,17 +485,17 @@ describe("daemon install-service (Linux)", () => {
     expect(unit).toContain(`WorkingDirectory=${h.home}`);
     expect(unit).toContain("Restart=always");
     expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "daemon-reload")).toBe(true);
-    expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "enable clawmessenger")).toBe(true);
-    expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "start clawmessenger")).toBe(true);
-    expect(h.lines.join("")).toContain("systemctl {start|stop|restart|status} clawmessenger");
-    expect(h.lines.join("")).toContain("journalctl -u clawmessenger -f");
+    expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "enable agentsbb")).toBe(true);
+    expect(h.commands.some((c) => c.file === "systemctl" && c.args.join(" ") === "start agentsbb")).toBe(true);
+    expect(h.lines.join("")).toContain("systemctl {start|stop|restart|status} agentsbb");
+    expect(h.lines.join("")).toContain("journalctl -u agentsbb -f");
   });
 
   it("writes a --user unit for a non-root user and tries to enable linger", async () => {
     const h = harness({ uid: 1001 });
     await h.daemon.installService();
 
-    const unitPath = join(h.home, ".config", "systemd", "user", "clawmessenger.service");
+    const unitPath = join(h.home, ".config", "systemd", "user", "agentsbb.service");
     expect(existsSync(unitPath)).toBe(true);
     const unit = readFileSync(unitPath, "utf8");
     expect(unit).toContain("WantedBy=default.target");
@@ -516,7 +516,7 @@ describe("daemon install-service (Linux)", () => {
     // 显式给 workdir：否则默认值会取带空格的 home，而它并不存在。
     await h.daemon.installService({ workdir: h.home });
 
-    const unitPath = join(h.paths.stateDir, "etc", "systemd", "system", "clawmessenger.service");
+    const unitPath = join(h.paths.stateDir, "etc", "systemd", "system", "agentsbb.service");
     const unit = readFileSync(unitPath, "utf8");
     // 有空白必须加引号，否则 systemd 会按空白拆成多个赋值，PATH 直接丢。
     expect(unit).toContain('Environment="HOME=/opt/my home"');
@@ -536,7 +536,7 @@ describe("daemon install-service (Linux)", () => {
             return {
               status: 1,
               stdout: "",
-              stderr: 'clawmessenger.service: Working directory is not absolute, ignoring: "/root"',
+              stderr: 'agentsbb.service: Working directory is not absolute, ignoring: "/root"',
             };
           }
           return { status: 0, stdout: "", stderr: "" };
@@ -554,8 +554,8 @@ describe("daemon install-service (Linux)", () => {
     expect(h.spawns).toHaveLength(0);
     expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("4242");
     // 也没 enable / start —— 否则每次开机都会再撞一次同样的失败。
-    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "enable clawmessenger")).toBe(false);
-    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "start clawmessenger")).toBe(false);
+    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "enable agentsbb")).toBe(false);
+    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "start agentsbb")).toBe(false);
     // systemd 的原话 + unit 正文都要带出来。
     const errs = h.errors.join("");
     expect(errs).toContain("Working directory is not absolute");
@@ -581,7 +581,7 @@ describe("daemon install-service (Linux)", () => {
     await h.daemon.installService();
 
     // 真的走下去了：enable + start 都发了，也没有把「校验不通过」当成结论。
-    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "start clawmessenger")).toBe(true);
+    expect(calls.some((c) => c.file === "systemctl" && c.args.join(" ") === "start agentsbb")).toBe(true);
     expect(h.errors.join("")).not.toContain("rejected the unit");
   });
 
@@ -590,17 +590,17 @@ describe("daemon install-service (Linux)", () => {
       {
         uid: 0,
         runCommand: (file, args) => {
-          if (file === "systemctl" && args.join(" ") === "start clawmessenger") {
+          if (file === "systemctl" && args.join(" ") === "start agentsbb") {
             return {
               status: 1,
               stdout: "",
-              stderr: "Failed to start clawmessenger.service: Unit clawmessenger.service has a bad unit file setting.",
+              stderr: "Failed to start agentsbb.service: Unit agentsbb.service has a bad unit file setting.",
             };
           }
           if (file === "journalctl") {
             return {
               status: 0,
-              stdout: 'clawmessenger.service: Invalid syntax in ExecStart=, ignoring: "/opt/x" run',
+              stdout: 'agentsbb.service: Invalid syntax in ExecStart=, ignoring: "/opt/x" run',
               stderr: "",
             };
           }
@@ -625,7 +625,7 @@ describe("daemon install-service (Linux)", () => {
     expect(h.lines.join("")).toContain("supervisor PID 808");
     // systemd 的原话、unit 正文都要带出来，省得用户自己去翻 journal。
     const errs = h.errors.join("");
-    expect(errs).toContain("Unit clawmessenger.service has a bad unit file setting");
+    expect(errs).toContain("Unit agentsbb.service has a bad unit file setting");
     expect(errs).toContain("Invalid syntax in ExecStart=");
     expect(errs).toContain("unit file ");
     expect(errs).toContain("WantedBy=multi-user.target");
@@ -639,7 +639,7 @@ describe("daemon install-service (macOS / Windows)", () => {
     const h = harness({ platform: "darwin" });
     await h.daemon.installService();
 
-    const plistPath = join(h.home, "Library", "LaunchAgents", "com.clawmessenger.supervisor.plist");
+    const plistPath = join(h.home, "Library", "LaunchAgents", "com.agentsbb.supervisor.plist");
     expect(existsSync(plistPath)).toBe(true);
     const plist = readFileSync(plistPath, "utf8");
     expect(plist).toContain("<key>RunAtLoad</key>");
@@ -657,7 +657,7 @@ describe("daemon install-service (macOS / Windows)", () => {
             return { status: 1, stdout: "", stderr: "Load failed: 5: Input/output error" };
           }
           if (file === "launchctl" && args[0] === "list") {
-            return { status: 0, stdout: "PID\tStatus\tLabel\n-\t0\tcom.clawmessenger.supervisor\n", stderr: "" };
+            return { status: 0, stdout: "PID\tStatus\tLabel\n-\t0\tcom.agentsbb.supervisor\n", stderr: "" };
           }
           return { status: 0, stdout: "", stderr: "" };
         },
@@ -674,17 +674,17 @@ describe("daemon install-service (macOS / Windows)", () => {
     expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("909");
     expect(h.lines.join("")).toContain("restoring the background supervisor");
     expect(h.errors.join("")).toContain("Load failed: 5: Input/output error");
-    expect(h.errors.join("")).toContain("com.clawmessenger.supervisor");
+    expect(h.errors.join("")).toContain("com.agentsbb.supervisor");
   });
 
   it("writes a hidden logon launcher into the Startup folder on Windows", async () => {
-    const appData = join(tmpdir(), `clawmessenger-appdata-${Date.now()}`);
+    const appData = join(tmpdir(), `agentsbb-appdata-${Date.now()}`);
     dirs.push(appData);
     // 带空格的安装路径是 Windows 常态（C:\Program Files\...），正好压住两层引号：
     // 内层是 shell 命令行的引号，外层是 VBScript 字符串字面量。0.2.49 及之前漏了
     // 外层开引号，落盘成 `sh.Run ""C:\...exe"" run` —— VBScript 报语法错误，自启
     // 从未生效（2026-10-22 重启后运维节点集体离线）。
-    const winExe = "C:\\Program Files\\clawmessenger\\clawmessenger.exe";
+    const winExe = "C:\\Program Files\\agentsbb\\agentsbb.exe";
     const h = harness({
       platform: "win32",
       env: { APPDATA: appData, PATH: "C:\\bin" },
@@ -692,7 +692,7 @@ describe("daemon install-service (macOS / Windows)", () => {
     });
     await h.daemon.installService();
 
-    const vbs = join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "clawmessenger.vbs");
+    const vbs = join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "agentsbb.vbs");
     expect(existsSync(vbs)).toBe(true);
     const body = readFileSync(vbs, "utf8");
     expect(body).toContain(`sh.Run """${winExe}"" run", 0, False`);
@@ -721,7 +721,7 @@ describe("daemon uninstall", () => {
   it("removes the autostart entry but leaves the pid file alone", async () => {
     const h = harness({ uid: 1001 });
     mkdirSync(join(h.home, ".config", "systemd", "user"), { recursive: true });
-    const unitPath = join(h.home, ".config", "systemd", "user", "clawmessenger.service");
+    const unitPath = join(h.home, ".config", "systemd", "user", "agentsbb.service");
     writeFileSync(unitPath, "[Unit]\n");
     state(h.paths, 4242);
     h.alive.add(4242);
@@ -731,7 +731,7 @@ describe("daemon uninstall", () => {
     expect(existsSync(unitPath)).toBe(false);
     expect(existsSync(h.paths.pidFile)).toBe(true);
     expect(h.lines.join("")).toContain("removed systemd user service");
-    expect(h.lines.join("")).toContain("clawmessenger stop");
+    expect(h.lines.join("")).toContain("agentsbb stop");
   });
 
   it("says nothing was configured when there is no autostart entry", async () => {
@@ -745,16 +745,16 @@ describe("daemon uninstall", () => {
 // spawn `target run`，不会重写 VBS，所以只能由 supervisor 启动时补（审查报告 M3a）。
 describe("logon script self-heal backfill", () => {
   const OLD_TEMPLATE = [
-    "' clawmessenger: start the agent supervisor at logon, without a console window.",
-    "' Generated by `clawmessenger install-service`. Remove with `clawmessenger uninstall`.",
+    "' agentsbb: start the agent supervisor at logon, without a console window.",
+    "' Generated by `agentsbb install-service`. Remove with `agentsbb uninstall`.",
     'Set sh = CreateObject("WScript.Shell")',
     'sh.CurrentDirectory = "C:\\\\Users\\\\op"',
-    'sh.Run """C:\\\\Program Files\\\\clawmessenger\\\\clawmessenger.exe"" run --model kimi", 0, False',
+    'sh.Run """C:\\\\Program Files\\\\agentsbb\\\\agentsbb.exe"" run --model kimi", 0, False',
     "",
   ].join("\r\n");
 
   it("injects the block in place and leaves an --model argument alone", () => {
-    const injected = injectStartupVbsSelfHeal(OLD_TEMPLATE, "C:\\Program Files\\clawmessenger\\clawmessenger.exe");
+    const injected = injectStartupVbsSelfHeal(OLD_TEMPLATE, "C:\\Program Files\\agentsbb\\agentsbb.exe");
     expect(injected).not.toBeNull();
     const body = injected as string;
     expect(body).toContain(STARTUP_VBS_TEMPLATE_MARKER);
@@ -766,24 +766,24 @@ describe("logon script self-heal backfill", () => {
   });
 
   it("is a no-op on a file that already carries the marker", () => {
-    const once = injectStartupVbsSelfHeal(OLD_TEMPLATE, "C:\\bin\\clawmessenger.exe") as string;
-    expect(injectStartupVbsSelfHeal(once, "C:\\bin\\clawmessenger.exe")).toBeNull();
+    const once = injectStartupVbsSelfHeal(OLD_TEMPLATE, "C:\\bin\\agentsbb.exe") as string;
+    expect(injectStartupVbsSelfHeal(once, "C:\\bin\\agentsbb.exe")).toBeNull();
   });
 
   it("refuses to touch a file it does not recognise", () => {
-    expect(injectStartupVbsSelfHeal('MsgBox "hello"', "C:\\bin\\clawmessenger.exe")).toBeNull();
+    expect(injectStartupVbsSelfHeal('MsgBox "hello"', "C:\\bin\\agentsbb.exe")).toBeNull();
   });
 
   it("rewrites a stale logon script exactly once on startup", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-vbs-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-vbs-"));
     dirs.push(dir);
-    const vbs = join(dir, "clawmessenger.vbs");
+    const vbs = join(dir, "agentsbb.vbs");
     writeFileSync(vbs, OLD_TEMPLATE);
     const h = harness({
       platform: "win32",
       env: { APPDATA: dir, PATH: "C:\\bin" },
       autostartPaths: { startupVbs: vbs },
-      selfArgv: () => ({ exec: "C:\\Program Files\\clawmessenger\\clawmessenger.exe", args: [] }),
+      selfArgv: () => ({ exec: "C:\\Program Files\\agentsbb\\agentsbb.exe", args: [] }),
     });
 
     const first = await h.daemon.refreshStartupScript();
@@ -798,9 +798,9 @@ describe("logon script self-heal backfill", () => {
   });
 
   it("does not create a logon script where there was none", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-vbs-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-vbs-"));
     dirs.push(dir);
-    const vbs = join(dir, "clawmessenger.vbs");
+    const vbs = join(dir, "agentsbb.vbs");
     const h = harness({ platform: "win32", env: { APPDATA: dir }, autostartPaths: { startupVbs: vbs } });
     const result = await h.daemon.refreshStartupScript();
     expect(result).toMatchObject({ updated: false, reason: "no-logon-script" });
@@ -821,14 +821,14 @@ describe("logon script self-heal backfill", () => {
 // Linux 那边 systemd 的 Restart=always 早就兜住了，Windows 没有等价物，只能拿计划任务补。
 describe("Windows 看门狗", () => {
   const winHarness = (extra: Partial<DaemonOverrides> = {}) => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-watchdog-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-watchdog-"));
     dirs.push(dir);
-    const vbs = join(dir, "Startup", "clawmessenger.vbs");
+    const vbs = join(dir, "Startup", "agentsbb.vbs");
     const cmd = join(dir, "watchdog.cmd");
     const h = harness({
       platform: "win32",
       env: { APPDATA: dir, PATH: "C://bin" },
-      selfArgv: () => ({ exec: "C://Program Files//clawmessenger//clawmessenger.exe", args: [] }),
+      selfArgv: () => ({ exec: "C://Program Files//agentsbb//agentsbb.exe", args: [] }),
       autostartPaths: { startupVbs: vbs, watchdogCmd: cmd },
       ...extra,
     });
@@ -847,7 +847,7 @@ describe("Windows 看门狗", () => {
     expect(create).toBeDefined();
     const args = create!.args;
     expect(args).toContain("/TN");
-    expect(args[args.indexOf("/TN") + 1]).toBe("clawmessenger-watchdog");
+    expect(args[args.indexOf("/TN") + 1]).toBe("agentsbb-watchdog");
     expect(args[args.indexOf("/SC") + 1]).toBe("MINUTE");
     expect(args[args.indexOf("/MO") + 1]).toBe("5");
     // /TR 指向 .cmd（含引号包裹，路径可能带空格），而不是直接拼 exe 命令行：
@@ -862,14 +862,14 @@ describe("Windows 看门狗", () => {
     expect(h.lines.join("")).toContain("every 5 min");
   });
 
-  it("看门狗脚本是薄壳：调 `clawmessenger watchdog`，并把输出重定向进日志", async () => {
+  it("看门狗脚本是薄壳：调 `agentsbb watchdog`，并把输出重定向进日志", async () => {
     const { h, cmd } = winHarness();
 
     await h.daemon.installService();
 
     const body = readFileSync(cmd, "utf8");
     // 路径带空格时必须整体加引号，否则 cmd 会把 C:/Program 当成命令。
-    expect(body).toContain('"C://Program Files//clawmessenger//clawmessenger.exe" watchdog');
+    expect(body).toContain('"C://Program Files//agentsbb//agentsbb.exe" watchdog');
     expect(body).toContain("watchdog.log");
     expect(body.startsWith("@echo off")).toBe(true);
   });
@@ -948,15 +948,15 @@ describe("Windows 看门狗", () => {
 
     const del = h.commands.find((c) => c.file === "schtasks" && c.args.includes("/Delete"));
     expect(del).toBeDefined();
-    expect(del!.args[del!.args.indexOf("/TN") + 1]).toBe("clawmessenger-watchdog");
+    expect(del!.args[del!.args.indexOf("/TN") + 1]).toBe("agentsbb-watchdog");
     expect(existsSync(cmd)).toBe(false);
     expect(h.lines.join("")).toContain("removed watchdog task");
   });
 
   it("status 的 autostart 行要能看出「只装了登录自启、没有看门狗」", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-watchdog-status-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-watchdog-status-"));
     dirs.push(dir);
-    const vbs = join(dir, "clawmessenger.vbs");
+    const vbs = join(dir, "agentsbb.vbs");
     const cmd = join(dir, "watchdog.cmd");
 
     const onlyVbs = harness({ platform: "win32", env: { APPDATA: dir }, autostartPaths: { startupVbs: vbs, watchdogCmd: cmd } });
@@ -976,14 +976,14 @@ describe("Windows 看门狗", () => {
 // 离线的那批恰恰全是存量设备。
 describe("ensureWatchdog（存量设备自愈补装）", () => {
   const setup = (extra: Partial<DaemonOverrides> = {}) => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-ensure-watchdog-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-ensure-watchdog-"));
     dirs.push(dir);
-    const vbs = join(dir, "Startup", "clawmessenger.vbs");
+    const vbs = join(dir, "Startup", "agentsbb.vbs");
     const cmd = join(dir, "watchdog.cmd");
     const h = harness({
       platform: "win32",
       env: { APPDATA: dir, PATH: "C://bin" },
-      selfArgv: () => ({ exec: "C://Program Files//clawmessenger//clawmessenger.exe", args: [] }),
+      selfArgv: () => ({ exec: "C://Program Files//agentsbb//agentsbb.exe", args: [] }),
       autostartPaths: { startupVbs: vbs, watchdogCmd: cmd },
       ...extra,
     });
@@ -1012,7 +1012,7 @@ describe("ensureWatchdog（存量设备自愈补装）", () => {
     expect(existsSync(cmd)).toBe(true);
     const create = h.commands.find((c) => c.file === "schtasks" && c.args.includes("/Create"));
     expect(create).toBeDefined();
-    expect(create!.args[create!.args.indexOf("/TN") + 1]).toBe("clawmessenger-watchdog");
+    expect(create!.args[create!.args.indexOf("/TN") + 1]).toBe("agentsbb-watchdog");
   });
 
   it("任务已经在了就一个字节都不动（/Create /F 会覆盖用户加过的触发器）", async () => {
@@ -1073,9 +1073,9 @@ describe("decodeCommandOutput（子进程输出的编码兜底）", () => {
 
 describe("serviceHealth（Windows 看门狗探测的编码兜底）", () => {
   const setup = (spawnSyncOverride: Partial<DaemonOverrides> = {}) => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-health-gbk-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-health-gbk-"));
     dirs.push(dir);
-    const vbs = join(dir, "Startup", "clawmessenger.vbs");
+    const vbs = join(dir, "Startup", "agentsbb.vbs");
     const cmd = join(dir, "watchdog.cmd");
     mkdirSync(join(vbs, ".."), { recursive: true });
     writeFileSync(vbs, "rem logon autostart\n");
@@ -1092,7 +1092,7 @@ describe("serviceHealth（Windows 看门狗探测的编码兜底）", () => {
     // 「拒绝访问」的 GBK 编码 —— 安全软件拦截 schtasks 时在中文 Windows 上就是这个。
     const spawnSyncFake = ((file: string, args: string[], options: { encoding?: string }) => {
       expect(file).toBe("schtasks");
-      expect(args).toEqual(["/Query", "/TN", "clawmessenger-watchdog"]);
+      expect(args).toEqual(["/Query", "/TN", "agentsbb-watchdog"]);
       expect(options.encoding).toBe("buffer");
       return {
         status: 1,

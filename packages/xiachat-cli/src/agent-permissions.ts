@@ -1,13 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { stateHome } from "./paths.js";
 
 // 设备端的「绑定权限」快照：服务端在 10s 轮询（POST /api/claw/device/control）
 // 里下发每个 agent 的四个准入开关、文件读写开关与行为规范。设备端把这一份
 // 快照落盘，agent 子进程按需读取 —— 私聊闸门与文件读写闸门都在这里判定。
 //
 // 为什么要落盘而不是只放内存：轮询跑在 supervisor 进程里，真正执行 agent 的是
-// 它拉起的**子进程**（`clawmessenger run --agent X`），两者不共享内存。文件是
+// 它拉起的**子进程**（`agentsbb run --agent X`），两者不共享内存。文件是
 // 唯一不需要再加一条 IPC 通道的传递方式，也顺带让「手敲 run」的单进程模式能
 // 读到同一份快照。
 //
@@ -58,7 +59,8 @@ export interface PermissionSnapshot {
 }
 
 /** 覆盖快照文件位置（测试与多实例隔离用）。 */
-export const PERMISSION_FILE_ENV = "CLAWMESSENGER_AGENT_PERMISSIONS_FILE";
+// TODO(rebrand-retire): 双读过渡，CLAWMESSENGER_ 前缀移除于 v1.6+（envCompat 兜底）
+export const PERMISSION_FILE_ENV = "AGENTSBB_AGENT_PERMISSIONS_FILE";
 
 /**
  * 快照在内存里的最长保鲜期。轮询周期是 10s，取 5s 让「用户在界面关掉私聊」
@@ -69,11 +71,15 @@ export const PERMISSION_CACHE_TTL_MS = 5_000;
 
 export function permissionCachePath(
   env: NodeJS.ProcessEnv = process.env,
-  home: string = homedir(),
+  home?: string,
 ): string {
-  const override = env[PERMISSION_FILE_ENV]?.trim();
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_AGENT_PERMISSIONS_FILE 于 v1.6+
+  const override = env[PERMISSION_FILE_ENV]?.trim() ?? env["CLAWMESSENGER_AGENT_PERMISSIONS_FILE"]?.trim();
   if (override) return override;
-  return join(home, ".clawmessenger", "agent-permissions.json");
+  // 未注入测试 home 时走 stateHome()（含迁移/回退语义）；注入了就用注入值的
+  // `.agentsbb`（与 deviceOpencodeConfigPath 的隔离策略一致）。
+  const base = home === undefined || home === homedir() ? stateHome() : join(home, ".agentsbb");
+  return join(base, "agent-permissions.json");
 }
 
 function asString(value: unknown): string {
@@ -532,7 +538,7 @@ export function sanitizeAgentId(agent: string | undefined): string {
 
 /** opencode 行为规范落盘位置（per-agent：指令文件必须和被注入的 agent 对应）。 */
 export function opencodeBehaviorPath(agent: string | undefined, home: string = homedir()): string {
-  return join(home, ".clawmessenger", "agent-behavior", `${sanitizeAgentId(agent)}.md`);
+  return join(stateHome(), "agent-behavior", `${sanitizeAgentId(agent)}.md`);
 }
 
 /**
@@ -556,7 +562,7 @@ export function writeOpencodeBehaviorFile(
     }
     mkdirSync(dirname(path), { recursive: true });
     const body = [
-      "# 行为规范（由 ClawMessenger 设备端维护，可整份删除）",
+      "# 行为规范（由 AgentsBB 设备端维护，可整份删除）",
       "",
       text,
       "",

@@ -225,7 +225,7 @@ describe("parseCodebuddyProviderConfig", () => {
     defaultModel: "glm-5.2",
   });
 
-  it("reads the self-hosted gateway described in clawmessenger-provider.json", () => {
+  it("reads the self-hosted gateway described in agentsbb-provider.json", () => {
     const config = parseCodebuddyProviderConfig(PROVIDER);
     expect(config.endpoints).toEqual([
       { id: "quukk", name: "Quukk AI", baseUrl: "https://llmapi.quukk.com/v1", apiKey: "sk-Txc" },

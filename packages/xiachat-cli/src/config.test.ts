@@ -92,7 +92,7 @@ describe("machineId", () => {
   it("returns a legacy long id verbatim instead of re-minting", () =>
     withTempDir((dir) => {
       const keystore = join(dir, "credentials.json");
-      const legacy = "clawmessenger-3cb5ee6e-eb6b-45d6-afcb-54c9ef5bac7c";
+      const legacy = "agentsbb-3cb5ee6e-eb6b-45d6-afcb-54c9ef5bac7c";
       writeFileSync(join(dir, "machine_id"), `${legacy}\n`);
       // A device already bound to the RongCloud account derived from this id
       // must keep it, otherwise re-pairing orphans the account and duplicates
@@ -111,7 +111,7 @@ describe("machineId", () => {
 });
 
 function withTempDir<T>(fn: (dir: string) => T): T {
-  const dir = mkdtempSync(join(tmpdir(), "clawmessenger-config-"));
+  const dir = mkdtempSync(join(tmpdir(), "agentsbb-config-"));
   try {
     return fn(dir);
   } finally {

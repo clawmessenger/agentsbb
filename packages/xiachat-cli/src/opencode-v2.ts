@@ -346,7 +346,7 @@ export async function runV2Session(opts: RunV2SessionOpts): Promise<RunV2Session
       "POST",
       "/api/session",
       opts.password,
-      { title: "clawmessenger", ...(model ? { model } : {}) },
+      { title: "agentsbb", ...(model ? { model } : {}) },
       agent,
       abort.signal,
     );

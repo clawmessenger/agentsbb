@@ -6,6 +6,7 @@ import { createServer as createNetServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Keystore, type StoredCredentials } from "./keystore.js";
+import { envCompat } from "./env-compat.js";
 import {
   XiachatApi,
   type DeviceUpgradeIntent,
@@ -24,6 +25,7 @@ import {
   type PermissionSnapshot,
 } from "./agent-permissions.js";
 import { DEFAULT_SERVER_URL, machineId, defaultAnsweredTurnsPath, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
+import { stateHome } from "./paths.js";
 import { agentNameFromRcUser, ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
 import {
   ALLOW_DUPLICATE_SUPERVISOR_ENV,
@@ -62,11 +64,23 @@ export function pairIdempotencyKey(ticket: string, mid: string): string {
 }
 
 /**
+ * Dual-read of a renamed variable: the new (`AGENTSBB_*`) name wins, the legacy
+ * (`CLAWMESSENGER_*`) name answers when the new one is absent.
+ *
+ * A legacy supervisor / watchdog spawned by an old install passes only the old
+ * names, so every read has to fall back.
+ * TODO(rebrand-retire): 双读过渡，移除于 v1.6+
+ */
+function envVal(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  return envCompat(name.replace(/^AGENTSBB_/, ""), env);
+}
+
+/**
  * 是否允许并排跑第二份 supervisor（见 ALLOW_DUPLICATE_SUPERVISOR_ENV）。
  * 默认不允许 —— 两份 supervisor 会派生完全相同的融云节点 id。
  */
 export function allowDuplicateSupervisor(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = (env[ALLOW_DUPLICATE_SUPERVISOR_ENV] ?? "").trim().toLowerCase();
+  const raw = (envVal(env, ALLOW_DUPLICATE_SUPERVISOR_ENV) ?? "").trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
@@ -75,27 +89,29 @@ export function allowDuplicateSupervisor(env: NodeJS.ProcessEnv = process.env): 
  *
  * 为什么要有它：运维子进程和它服务的 agent 由同一个 supervisor 拉起，但它
  * **不是**这台机器的主人 —— 同一台机器上还挂着别的账号的智能体。运维助手
- * 通过 `clawmessenger` 命令操作设备，如果允许它跑整机级的 stop/restart，
+ * 通过 `agentsbb` 命令操作设备，如果允许它跑整机级的 stop/restart，
  * 一次「帮我上下线」就会把别人的智能体一起拉下来。作用域存在即代表「只准
  * 动自己那一个账号」，CLI 因此在命令层直接拒绝连坐整机的动作。
  */
-export const OPS_SCOPE_ENV = "CLAWMESSENGER_OPS_SCOPE";
+// TODO(rebrand-retire): 双读过渡，旧名 CLAWMESSENGER_OPS_SCOPE 移除于 v1.6+
+export const OPS_SCOPE_ENV = "AGENTSBB_OPS_SCOPE";
 
 /**
  * 「我是 supervisor 拉起来的子进程」标记（supervisor 的 launch() 注入）。
  *
- * 为什么需要：`clawmessenger stop` 停的是 supervisor —— 而 agent 子进程就是
+ * 为什么需要：`agentsbb stop` 停的是 supervisor —— 而 agent 子进程就是
  * supervisor 的孩子。子进程自己执行 stop，等于当场把自己的父进程连根拔掉：
  * 命令还没返回，承载这一轮的进程已经没了，于是**失败/取消终帧永远发不出去**，
  * 前端只看到「正在思考」一直转圈（2026-10-20 11:33 的现场：运维助手执行
- * `clawmessenger stop`，整台设备的智能体全部下线，气泡卡在 3m42s）。
+ * `agentsbb stop`，整台设备的智能体全部下线，气泡卡在 3m42s）。
  *
  * 这个标记只在 supervisor 拉起的子进程里存在：用户在终端手敲 stop 不受影响。
  */
-export const SUPERVISED_ENV = "CLAWMESSENGER_SUPERVISED";
+// TODO(rebrand-retire): 双读过渡，旧名 CLAWMESSENGER_SUPERVISED 移除于 v1.6+
+export const SUPERVISED_ENV = "AGENTSBB_SUPERVISED";
 
 export function isSupervisedChild(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env[SUPERVISED_ENV] ?? "").trim() === "1";
+  return (envVal(env, SUPERVISED_ENV) ?? "").trim() === "1";
 }
 
 /**
@@ -113,18 +129,18 @@ export function supervisedSelfKillRejection(
   if (action === "update") {
     // update 与 stop/restart 不同：它可以只交换不重启，所以这里不是「拒绝」，
     // 而是「把重启这一步交给设备下次启动」—— 新版仍然会到位，这一轮也还能回话。
-    return "\n`clawmessenger update` 在智能体进程里执行时不重启 supervisor（重启会把这一轮连同回复一起杀掉）。"
+    return "\n`agentsbb update` 在智能体进程里执行时不重启 supervisor（重启会把这一轮连同回复一起杀掉）。"
       + "\n新版已换到磁盘上，设备下次启动 / 看门狗拉起时就跑新版；"
-      + "要立刻生效，请在设备本机的终端执行 `clawmessenger restart`。";
+      + "要立刻生效，请在设备本机的终端执行 `agentsbb restart`。";
   }
-  return `\`clawmessenger ${action}\` 不能在智能体自己的进程里执行：它会停掉拉起本轮的 supervisor，`
+  return `\`agentsbb ${action}\` 不能在智能体自己的进程里执行：它会停掉拉起本轮的 supervisor，`
     + "把这一轮连同回复一起杀掉（前端将一直停在「正在思考」）。\n"
     + "要停整台设备，请在设备本机的终端（不在智能体会话里）执行；只想让某个智能体上下线，"
-    + "用 `clawmessenger agent stop|start <name>`。";
+    + "用 `agentsbb agent stop|start <name>`。";
 }
 
 export function opsScope(env: NodeJS.ProcessEnv = process.env): string {
-  return (env[OPS_SCOPE_ENV] ?? "").trim();
+  return (envVal(env, OPS_SCOPE_ENV) ?? "").trim();
 }
 
 /**
@@ -138,11 +154,11 @@ export function wholeMachineActionRejection(
   const scope = opsScope(env);
   if (!scope) return null;
   if (action === "stop") {
-    return `运维助手只负责本账号（${scope}），不能整机下线：\`clawmessenger stop\` 会把本机所有智能体一起停掉。\n`
-      + "恢复本账号在线请用 `clawmessenger start`（幂等，不会动已运行的智能体）；确实要整机下线，请在虾说设备页操作。";
+    return `运维助手只负责本账号（${scope}），不能整机下线：\`agentsbb stop\` 会把本机所有智能体一起停掉。\n`
+      + "恢复本账号在线请用 `agentsbb start`（幂等，不会动已运行的智能体）；确实要整机下线，请在虾说设备页操作。";
   }
-  return `运维助手只负责本账号（${scope}），不能整机重启：\`clawmessenger restart\` 会连本机其他智能体一起重启。\n`
-    + "确实需要整机重启时，先用 `clawmessenger restart --all-agents`，并先向用户确认影响范围。";
+  return `运维助手只负责本账号（${scope}），不能整机重启：\`agentsbb restart\` 会连本机其他智能体一起重启。\n`
+    + "确实需要整机重启时，先用 `agentsbb restart --all-agents`，并先向用户确认影响范围。";
 }
 
 /** 运维作用域内要求操作别的智能体时的拒绝文案（本地拦一道，服务端还有一道）。 */
@@ -205,7 +221,7 @@ export interface BuildProgramOpts {
   // Injectable for tests; defaults to a real cross-platform supervisor daemon.
   daemon?: Daemon;
   // Injectable for tests; the state/pid files the supervisor writes about itself
-  // (default: ~/.clawmessenger). Must agree with whatever `daemon` above uses.
+  // (default: ~/.agentsbb). Must agree with whatever `daemon` above uses.
   daemonPaths?: DaemonPaths;
   // Injectable for tests; defaults to acquireSupervisorLock (loopback port
   // singleton). Tests substitute an in-memory fake so parallel test processes
@@ -346,7 +362,8 @@ export const SHUTDOWN_HARD_EXIT_MS = 8_000;
  * 先放锁再 spawn，release 与 spawn 之间又会留出窗口让第三份进程抢先。
  * 这个环境变量只由 __relaunch 传给子进程，其余入口一律 0（保持原来的严格语义）。
  */
-export const RELAUNCH_LOCK_WAIT_ENV = "CLAWMESSENGER_LOCK_WAIT_MS";
+// TODO(rebrand-retire): 双读过渡，旧名 CLAWMESSENGER_LOCK_WAIT_MS 移除于 v1.6+
+export const RELAUNCH_LOCK_WAIT_ENV = "AGENTSBB_LOCK_WAIT_MS";
 
 /** __relaunch 交给新进程的等待窗口。 */
 export const RELAUNCH_LOCK_WAIT_MS = 15_000;
@@ -377,10 +394,13 @@ export const RELAUNCH_ALIVE_MS = 1_000;
  * 一旦子进程其实还在等锁或者稍后才死，设备就是「磁盘已换新、但没有 supervisor」，
  * 而且没有任何痕迹（审查报告 B1）。所以判据改成子进程自己写出来的「我持有锁」。
  */
-export const RELAUNCH_READY_ENV = "CLAWMESSENGER_RELAUNCH_READY";
+// TODO(rebrand-retire): 双读过渡，旧名 CLAWMESSENGER_RELAUNCH_READY 移除于 v1.6+
+export const RELAUNCH_READY_ENV = "AGENTSBB_RELAUNCH_READY";
 
 /** 解析 {@link RELAUNCH_LOCK_WAIT_ENV}；非正整数一律当作 0（不放宽）。 */
-export function relaunchLockWaitMs(raw: string | undefined = process.env[RELAUNCH_LOCK_WAIT_ENV]): number {
+export function relaunchLockWaitMs(
+  raw: string | undefined = envVal(process.env, RELAUNCH_LOCK_WAIT_ENV),
+): number {
   const parsed = Number.parseInt(raw ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
@@ -522,7 +542,7 @@ export interface RelaunchReady {
  * 只为升级接力存在。
  */
 export function signalRelaunchReady(locked: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
-  const target = env[RELAUNCH_READY_ENV];
+  const target = envVal(env, RELAUNCH_READY_ENV);
   if (!target) return false;
   try {
     mkdirSync(path.dirname(target), { recursive: true });
@@ -595,11 +615,15 @@ export function openRelaunchLog(target: string): number | null {
   }
 }
 
-/** 失败标记文件放在 state 目录（`~/.clawmessenger`），与 supervisor 状态同处。 */
+/** 失败标记文件放在 state 目录（`~/.agentsbb`），与 supervisor 状态同处。 */
 export function relaunchFailureMarkerPath(): string {
   // 与 daemon 的 state 目录同一个约定：CLAWMESSENGER_HOME 可以整体挪走（测试、
   // 多实例调试）。marker 必须跟着走，否则测试会往真实家目录里写文件。
-  const stateDir = process.env.CLAWMESSENGER_HOME || path.dirname(defaultUpgradeInflightPath());
+  // 与 daemon 的 state 目录同一个约定：AGENTSBB_HOME 可以整体挪走（测试、
+  // 运维），双读兜住旧 supervisor 传旧名的过渡期。
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_HOME 于 v1.6+
+  const stateDir = process.env.AGENTSBB_HOME
+    ?? ((process.env.CLAWMESSENGER_HOME || stateHome()) || path.dirname(defaultUpgradeInflightPath()));
   return path.join(stateDir, "relaunch-failed.json");
 }
 
@@ -664,7 +688,7 @@ export function consumeRelaunchFailureMarker(
  * `buildProgram` 里调了 `.exitOverride()`：测试要在同一进程里 parse，commander 不能
  * 直接 `process.exit`。代价是它改用抛 `CommanderError` 来表达「版本/帮助已打印、该
  * 正常退出了」。生产入口（bin.ts）必须把它翻译回去 —— 漏了这一步的表现是
- * `clawmessenger --version` 打印正确版本却 **exit 1**，还把版本号往 stderr 再打一遍，
+ * `agentsbb --version` 打印正确版本却 **exit 1**，还把版本号往 stderr 再打一遍，
  * 于是发布流水线里那条 `--version == tag` 的校验永远失败（B1 修复轮发现）。
  */
 export function commanderExit(err: unknown): { exitCode: number; printMessage: boolean } | null {
@@ -682,7 +706,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   const program = new Command();
   const version = opts.version ?? cliVersion();
   program
-    .name("clawmessenger")
+    .name("agentsbb")
     .description("User-device agent CLI over RongCloud IM")
     // 版本号来自 version.ts：构建期由 scripts/build-exe.mjs 用 esbuild
     // --define 注入（等价于 Go 的 -ldflags -X），没注入时退回与 package.json
@@ -862,10 +886,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
             break;
           }
           if (state.status === "expired" || state.status === "cancelled") {
-            throw new Error("授权已过期或被拒绝，请重新运行 clawmessenger pair");
+            throw new Error("授权已过期或被拒绝，请重新运行 agentsbb pair");
           }
           if (Date.now() >= deadline) {
-            throw new Error("授权已过期，请重新运行 clawmessenger pair");
+            throw new Error("授权已过期，请重新运行 agentsbb pair");
           }
           await sleep(intervalMs);
         }
@@ -883,7 +907,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .description("Refresh the IM token for the stored node")
     .action(async () => {
       const creds = opts.keystore.load();
-      if (!creds) throw new Error("no credentials; run clawmessenger register or pair first");
+      if (!creds) throw new Error("no credentials; run agentsbb register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
       const { token } = await api.refreshToken(creds.nodeId);
       opts.keystore.save({ ...creds, token });
@@ -920,17 +944,18 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         process.exitCode = 1;
         return;
       }
-      // 运维子进程带着自己的节点凭据（CLAWMESSENGER_AGENT_CREDS），普通用户
+      // 运维子进程带着自己的节点凭据（AGENTSBB_AGENT_CREDS），普通用户
       // 走 keystore；两者都能过服务端的设备凭据校验。
-      const envCreds = process.env.CLAWMESSENGER_AGENT_CREDS;
+      // TODO(rebrand-retire): 双读过渡，旧名 AGENTSBB_AGENT_CREDS 移除于 v1.6+
+      const envCreds = process.env.AGENTSBB_AGENT_CREDS ?? process.env.AGENTSBB_AGENT_CREDS;
       const creds = (envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined) ?? opts.keystore.load();
       if (!creds) {
-        opts.stdout.write("not registered; run clawmessenger pair first\n");
+        opts.stdout.write("not registered; run agentsbb pair first\n");
         process.exitCode = 1;
         return;
       }
       if (!creds.credentialId || !creds.deviceSecret) {
-        opts.stdout.write("no device credential; run clawmessenger pair on this device first\n");
+        opts.stdout.write("no device credential; run agentsbb pair on this device first\n");
         process.exitCode = 1;
         return;
       }
@@ -938,7 +963,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       const scopeAgent = scope ? agentNameFromRcUser(scope) : "";
       const target = (name ?? scopeAgent).trim();
       if (!target) {
-        opts.stdout.write("which agent? e.g. clawmessenger agent restart opencode\n");
+        opts.stdout.write("which agent? e.g. agentsbb agent restart opencode\n");
         process.exitCode = 1;
         return;
       }
@@ -960,7 +985,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         const verb = normalized === "stop" ? "停止" : normalized === "restart" ? "重启" : "启动";
         opts.stdout.write(
           `${result.agent}：${verb}指令已下发（version ${result.version}）。`
-            + "supervisor 每 10 秒同步一次，可用 `clawmessenger status` 复核。\n",
+            + "supervisor 每 10 秒同步一次，可用 `agentsbb status` 复核。\n",
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -976,13 +1001,13 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           // 服务端还没上 control/set：别让运维助手退回整机 stop（会连坐别的账号）。
           opts.stdout.write(
             "服务端还不支持按账号启停（/api/claw/device/control/set 未上线）。"
-              + "请先升级服务端；临时恢复本账号在线可用 `clawmessenger start`，不要用整机 stop。\n",
+              + "请先升级服务端；临时恢复本账号在线可用 `agentsbb start`，不要用整机 stop。\n",
           );
         } else if (message.includes("HTTP 404")) {
           opts.stdout.write(
             `服务端没有找到智能体 \`${target}\`（它不在本机已绑定的清单里）。`
               + `本账号对应的名字是 \`${scopeAgent || "?"}\`；`
-              + "可先用 `clawmessenger agents` 核对可用名字。\n",
+              + "可先用 `agentsbb agents` 核对可用名字。\n",
           );
         } else {
           opts.stdout.write(`${message}\n`);
@@ -996,22 +1021,23 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .description(
       "Connect to RongCloud IM and dispatch agent turns. Without --agent, run every agent bound to this device (supervisor mode).",
     )
-    .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see clawmessenger agents)")
+    .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see agentsbb agents)")
     .option("--model <model>", "model override passed to the agent CLI")
     .option("--ops-suffix <suffix>", "ops agent only: per-agent workdir suffix (supervisor passes the served agent's RongCloud id)")
     .action(async (cmdOpts: { agent?: string; model?: string; opsSuffix?: string }) => {
       // Supervisor-spawned children carry their agent-specific credentials
-      // in the environment; a plain `clawmessenger run` never sees them otherwise
+      // in the environment; a plain `agentsbb run` never sees them otherwise
       // because each child overwrites nothing in the shared keystore.
-      const envCreds = process.env.CLAWMESSENGER_AGENT_CREDS;
+      // TODO(rebrand-retire): 双读过渡，旧名 AGENTSBB_AGENT_CREDS 移除于 v1.6+
+      const envCreds = process.env.AGENTSBB_AGENT_CREDS ?? process.env.AGENTSBB_AGENT_CREDS;
       const parsedEnvCreds = envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined;
       const creds = parsedEnvCreds ?? opts.keystore.load();
-      if (!creds) throw new Error("no credentials; run clawmessenger register or pair first");
+      if (!creds) throw new Error("no credentials; run agentsbb register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
       if (!cmdOpts.agent) {
         // `start` 已经会拒绝重复启动，但 supervisor 还会被别的入口直接拉起：
         // 开机自启的 .vbs、守护脚本的 `-Action run`、用户在终端里手敲
-        // `clawmessenger run`。这些入口全部绕过 start，于是能在已有一份在跑时
+        // `agentsbb run`。这些入口全部绕过 start，于是能在已有一份在跑时
         // 再起一份 —— 两份 supervisor 派生**完全相同**的融云节点 id，互相踢线
         // （设备列表一会在线一会离线），同一条私聊还会被两套各答一次
         // （重复回复）。所以 supervisor 自己必须再拦一道。
@@ -1019,11 +1045,11 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         if (conflict && conflict.pid !== process.pid && !allowDuplicateSupervisor()) {
           const agents = conflict.state?.agents.length ? `, agents: ${conflict.state.agents.join(", ")}` : "";
           opts.stdout.write(
-            `another clawmessenger supervisor is already running (PID ${conflict.pid}${agents}).\n` +
+            `another agentsbb supervisor is already running (PID ${conflict.pid}${agents}).\n` +
               "refusing to start a second one: both would log in as the same RongCloud nodes, so the\n" +
               "device would flip online/offline and every private message would be answered twice.\n\n" +
-              "  stop it       : clawmessenger stop\n" +
-              "  or restart it : clawmessenger restart\n" +
+              "  stop it       : agentsbb stop\n" +
+              "  or restart it : agentsbb restart\n" +
               `  start anyway  : set ${ALLOW_DUPLICATE_SUPERVISOR_ENV}=1\n`,
           );
           process.exitCode = 1;
@@ -1065,7 +1091,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
                   "将会在**没有**端口锁的情况下继续启动：如果另一棵进程树里还活着一份孤儿\n" +
                   "supervisor（它的 pid 文件已经指向死进程，所以上面的检查查不出来），同一条私聊\n" +
                   "会被回答两次，设备也会反复上下线。\n\n" +
-                  "  find and stop it: clawmessenger stop (or kill the stale clawmessenger.exe processes)\n" +
+                  "  find and stop it: agentsbb stop (or kill the stale agentsbb.exe processes)\n" +
                   `  start anyway     : set ${ALLOW_DUPLICATE_SUPERVISOR_ENV}=1\n`,
               );
               break;
@@ -1077,10 +1103,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           singletonLock = lock;
           if (!lock && !lockCheckError) {
             opts.stdout.write(
-              "another clawmessenger supervisor is already running (singleton lock held, no live pid file —\n" +
+              "another agentsbb supervisor is already running (singleton lock held, no live pid file —\n" +
                 "an orphaned supervisor from an earlier start is still alive). Refusing a second one: both\n" +
                 "would log in as the same RongCloud nodes and answer every private message twice.\n\n" +
-                "  find and stop it: clawmessenger stop (or kill the stale clawmessenger.exe processes)\n" +
+                "  find and stop it: agentsbb stop (or kill the stale agentsbb.exe processes)\n" +
                 `  start anyway     : set ${ALLOW_DUPLICATE_SUPERVISOR_ENV}=1\n`,
             );
             process.exitCode = 1;
@@ -1175,7 +1201,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           ...(opts.agentCliInfoProbe !== undefined
             ? { agentCliInfoProbe: opts.agentCliInfoProbe }
             : {}),
-          // 不管是 `clawmessenger start` 拉起的，还是用户在终端里直接 `run`，
+          // 不管是 `agentsbb start` 拉起的，还是用户在终端里直接 `run`，
           // supervisor 都把自己的运行状态写下来 —— 于是 status / stop 都能看到它，
           // 顺带实现「前台跑着时 start 会拒绝，避免两份 supervisor 抢同一批 agent」。
           onStarted: (agents) => {
@@ -1221,7 +1247,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           if (!/^[A-Za-z0-9_-]+$/.test(cmdOpts.opsSuffix)) {
             throw new Error(`invalid --ops-suffix ${JSON.stringify(cmdOpts.opsSuffix)}: only [A-Za-z0-9_-] allowed`);
           }
-          workdirOverride = path.join(os.homedir(), ".clawmessenger", "ops", cmdOpts.opsSuffix);
+          workdirOverride = path.join(stateHome(), "ops", cmdOpts.opsSuffix);
         }
         const workdir = await setupOpsWorkdir(
           workdirOverride,
@@ -1239,7 +1265,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       } else {
         const found = await discoverAgents({});
         const agent = found.find((a) => a.name === cmdOpts.agent);
-        if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run clawmessenger agents`);
+        if (!agent) throw new Error(`agent CLI ${cmdOpts.agent} not found on PATH; run agentsbb agents`);
         agentExecPath = agent.path;
         agentName = agent.name;
         if (agent.name === "opencode") {
@@ -1360,7 +1386,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         if (plan.release.source === "cdn") {
           opts.stdout.write(
             "note: GitHub's API was unavailable (rate limit?), so the version came from the release CDN.\n" +
-            "      set CLAWMESSENGER_UPDATE_TOKEN to raise the API quota.\n",
+            "      set AGENTSBB_UPDATE_TOKEN to raise the API quota.\n",
           );
         }
         if (!plan.updateAvailable && !cmdOpts.force) {
@@ -1379,7 +1405,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           throw new Error(
             `update check failed: ${err instanceof Error ? err.message : String(err)}\n` +
             "hint: no upgrade was scheduled for this device on the server either — " +
-            "ask the admin page to schedule one, or set CLAWMESSENGER_UPDATE_API / _WEB to a reachable mirror.",
+            "ask the admin page to schedule one, or set AGENTSBB_UPDATE_API / _WEB to a reachable mirror.",
           );
         }
         const { intent } = remote;
@@ -1414,7 +1440,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       }
 
       if (!wantRestart) {
-        opts.stdout.write("it takes effect on the next start — run `clawmessenger restart`\n");
+        opts.stdout.write("it takes effect on the next start — run `agentsbb restart`\n");
         return;
       }
 
@@ -1657,7 +1683,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     });
 
   // --- 后台常驻 -------------------------------------------------------------
-  // `clawmessenger run` 只有前台模式，关掉终端整台设备的智能体就全下线。这几个
+  // `agentsbb run` 只有前台模式，关掉终端整台设备的智能体就全下线。这几个
   // 动作把 supervisor 托管起来，命令名与随 Release 分发的守护脚本一一对应，但
   // 直接编进 exe —— 不用再去下载 / chmod 任何脚本。
   const daemonOpts = (cmd: Command): Command =>
@@ -1819,10 +1845,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
   return program;
 }
 
-// Supervisor mode: `clawmessenger run` with no --agent. Exchanges the machine
+// Supervisor mode: `agentsbb run` with no --agent. Exchanges the machine
 // node's device credential for every bound agent's IM credentials, then
-// spawns one child `clawmessenger run --agent <name>` per agent. Each child gets
-// its agent-specific credentials via CLAWMESSENGER_AGENT_CREDS (imlib-next is a
+// spawns one child `agentsbb run --agent <name>` per agent. Each child gets
+// its agent-specific credentials via AGENTSBB_AGENT_CREDS (imlib-next is a
 // module-level singleton, so one OS process per IM user is required).
 interface RunSupervisorOpts {
   opts: BuildProgramOpts;
@@ -1852,7 +1878,7 @@ interface RunSupervisorOpts {
   /** 被替换的 exe 路径覆盖，测试用（默认本平台的安装路径）。 */
   upgradeTarget?: string;
   /** Called once the agent set is known, so the caller can publish the
-   * supervisor's runtime state for `clawmessenger status`. Best-effort. */
+   * supervisor's runtime state for `agentsbb status`. Best-effort. */
   onStarted?: (agents: string[]) => void;
   /** Called when the supervisor is shutting down, so the caller can clear that
    * state. Must fire exactly once. */
@@ -1874,7 +1900,7 @@ interface RunSupervisorOpts {
 // The old supervisor only logged `agent X exited with code N`. That is the most
 // common way a device goes dark: the agent child dies, its heartbeat stops, the
 // node shows up offline in the web's device list, and the user has to walk back
-// to that machine and re-run `clawmessenger run` by hand.
+// to that machine and re-run `agentsbb run` by hand.
 //
 // Backoff: 1s -> 2s -> 4s -> 8s -> 16s for the first five consecutive failures,
 // then a slow lane of one attempt every five minutes. The slow lane exists so a
@@ -2050,7 +2076,7 @@ export function observedAgentStates(
 export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void> {
   const { opts, creds, api } = supervisor;
   if (!creds.credentialId || !creds.deviceSecret) {
-    throw new Error("no machine device credential; run clawmessenger pair on this device first");
+    throw new Error("no machine device credential; run agentsbb pair on this device first");
   }
   // Ensure the default opencode runtime is present before spawning children so
   // both the built-in ops agent and any bound opencode agent can run on a
@@ -2129,7 +2155,8 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
       {
         env: {
           ...process.env,
-          CLAWMESSENGER_AGENT_CREDS: JSON.stringify(entry.childCreds),
+          // 新代码只写新名；双读在子进程侧兜住旧 supervisor 的交接。
+          AGENTSBB_AGENT_CREDS: JSON.stringify(entry.childCreds),
           // 标记「我是 supervisor 的子进程」：这类进程执行整机 stop/restart 会
           // 把自己的父进程（连同本轮）杀掉，命令层直接拒绝（见
           // supervisedSelfKillRejection）。
@@ -2226,7 +2253,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     ?? upgradeTargetPath(devicePlatform, process.argv[1], process.execPath, os.homedir());
   const inflightPath = supervisor.upgradeInflightPath ?? defaultUpgradeInflightPath();
   const upgradeFetch: UpgradeFetch = supervisor.upgradeFetch
-    ?? ((url) => fetch(url, { headers: { "User-Agent": "clawmessenger-cli" } }) as unknown as ReturnType<FetchLike>);
+    ?? ((url) => fetch(url, { headers: { "User-Agent": "agentsbb-cli" } }) as unknown as ReturnType<FetchLike>);
   const relaunch = supervisor.relaunch ?? ((target: string, waitPid: number, passthroughArgs: string[] = []) => {
     // helper 是**新** exe：交换已经完成，process.execPath 现在指向新镜像。
     // `--args` 用 JSON 数组而不是把它摊成多个 argv：参数里可能有以 `-` 开头的
@@ -2645,7 +2672,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
 
   /**
    * 只重启这一个 agent（服务端 restart 指令）。杀进程 → exit 回调里立刻重拉，
-   * 同机其他 agent 不受影响 —— 这正是它相对 `clawmessenger restart` 的意义。
+   * 同机其他 agent 不受影响 —— 这正是它相对 `agentsbb restart` 的意义。
    */
   const restartAgent = (entry: SupervisedAgent): void => {
     entry.restarts = 0;
@@ -2692,7 +2719,7 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
 
   for (const agent of bound) {
     // The built-in ops agent has no PATH-installed CLI of its own; the child
-    // (`clawmessenger run --agent ops`) installs opencode itself before connecting.
+    // (`agentsbb run --agent ops`) installs opencode itself before connecting.
     if (agent.agent !== OPS_AGENT_NAME) {
       const local = found.find((f) => f.name === agent.agent);
       if (!local) {
@@ -2739,9 +2766,9 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     throw new Error("none of the bound agent CLIs is available on this machine's PATH");
   }
   const runningCount = [...managed.values()].filter((entry) => entry.desired === "running").length;
-  opts.stdout.write(`clawmessenger supervisor: ${runningCount} of ${managed.size} agent(s) online\n`);
+  opts.stdout.write(`agentsbb supervisor: ${runningCount} of ${managed.size} agent(s) online\n`);
   // Publish the runtime state now that the agent set is final: this is what
-  // `clawmessenger status` reads back, so it must happen after the map is built
+  // `agentsbb status` reads back, so it must happen after the map is built
   // (and not before, or it would report zero agents).
   try {
     supervisor.onStarted?.([...managed.values()].map((entry) => entry.agent));

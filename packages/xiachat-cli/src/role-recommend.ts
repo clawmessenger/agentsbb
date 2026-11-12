@@ -57,7 +57,7 @@ export function roleRecommendTargetRoleCount(maxRoles: number): number {
 
 // ---- 讨论风格 --------------------------------------------------------------
 //
-// C 端创建圆桌时先选「讨论风格」（clawmessenger-web/src/lib/
+// C 端创建圆桌时先选「讨论风格」（agentsbb-web/src/lib/
 // roundtable-draft.ts 的 DISCUSSION_STYLES），但那一步只把风格压成 goal 里的
 // 一个短语，模型看到五个风格给出的角色几乎是同一套（观察者/质疑者/总结者…），
 // 五个风格的角色于是同名同调。

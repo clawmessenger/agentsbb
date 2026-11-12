@@ -29,7 +29,7 @@ function makeHarness(agentOpts: { hangMs?: number } = {}) {
   const wired = new Promise<void>((r) => {
     resolveWired = r;
   });
-  const dir = mkdtempSync(join(tmpdir(), "clawmessenger-qa-replay-"));
+  const dir = mkdtempSync(join(tmpdir(), "agentsbb-qa-replay-"));
   const processedUidsPath = join(dir, "qa-processed-uids.json");
   // 私聊闸门确定性快照：owner=user_1、本节点 allowPrivate=true。
   const permissionsPath = join(dir, "qa-agent-permissions.json");
@@ -147,7 +147,7 @@ describe("QA: createInboundReplayDedupe 契约（只读查询 / 派发后记账�
   });
 
   it("落盘只含已派发 UID：重启视角（新实例读同一文件）裁决重放", () => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-qa-dedupe2-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-qa-dedupe2-"));
     const path = join(dir, "qa2.json");
     try {
       const live = createInboundReplayDedupe({ path, flushDelayMs: 1 });

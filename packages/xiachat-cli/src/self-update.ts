@@ -40,7 +40,8 @@ const BACKUP_SUFFIX = ".old-";
 
 /** Overridable so tests (and mirrors) can point at another endpoint. */
 export function updateApiBase(): string {
-  const custom = process.env.CLAWMESSENGER_UPDATE_API?.trim();
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_UPDATE_API 于 v1.6+
+  const custom = (process.env.AGENTSBB_UPDATE_API ?? process.env.CLAWMESSENGER_UPDATE_API)?.trim();
   return (custom || "https://api.github.com").replace(/\/+$/, "");
 }
 
@@ -49,7 +50,8 @@ export function updateApiBase(): string {
  * CDN and are not rate limited, which is what the fallback path relies on.
  */
 export function updateWebBase(): string {
-  const custom = process.env.CLAWMESSENGER_UPDATE_WEB?.trim();
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_UPDATE_WEB 于 v1.6+
+  const custom = (process.env.AGENTSBB_UPDATE_WEB ?? process.env.CLAWMESSENGER_UPDATE_WEB)?.trim();
   return (custom || "https://github.com").replace(/\/+$/, "");
 }
 
@@ -59,11 +61,26 @@ export function updateWebBase(): string {
  * a token raises the limit, and the CDN fallback covers the rest.
  */
 export function updateToken(): string {
-  return (process.env.CLAWMESSENGER_UPDATE_TOKEN ?? process.env.GITHUB_TOKEN ?? "").trim();
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_UPDATE_TOKEN 于 v1.6+
+  return (process.env.AGENTSBB_UPDATE_TOKEN ?? process.env.CLAWMESSENGER_UPDATE_TOKEN ?? process.env.GITHUB_TOKEN ?? "").trim();
 }
 
-/** Every asset name the release matrix publishes (besides SHA256SUMS). */
+/**
+ * Asset name prefix per generation. The rebrand renamed every release asset
+ * from `clawmessenger-*` to `agentsbb-*`; already-deployed v≤1.3.33 devices
+ * still request the *old* names with the code baked into their exe, so GitHub
+ * releases carry BOTH sets and the server mirror accepts both (dual whitelist,
+ * design §2.5). This process always downloads the new names.
+ */
+// TODO(rebrand-retire): 旧名单移除于 v1.6+（旧版本设备占比归零后）
 const RELEASE_ASSET_NAMES = [
+  "agentsbb-windows-x64.exe",
+  "agentsbb-windows-x64-daemon-scripts.zip",
+  "agentsbb-linux-x64",
+  "agentsbb-linux-arm64",
+  "agentsbb-linux-daemon-scripts.tar.gz",
+  "agentsbb-darwin-arm64",
+  // TODO(rebrand-retire): 旧名单移除于 v1.6+
   "clawmessenger-windows-x64.exe",
   "clawmessenger-windows-x64-daemon-scripts.zip",
   "clawmessenger-linux-x64",
@@ -91,11 +108,12 @@ export interface ReleaseInfo {
   source?: "api" | "cdn";
 }
 
-/** `clawmessenger-v1.2.3` -> `1.2.3`; leaves odd tags untouched. */
+/** `agentsbb-v1.2.3` -> `1.2.3`; leaves odd tags untouched. */
 export function versionFromTag(tag: string): string {
   const semver = tag.match(/(\d+\.\d+\.\d+)/);
   if (semver) return semver[1];
-  return tag.replace(/^clawmessenger-v?/, "");
+  // TODO(rebrand-retire): 旧 tag 前缀剥离移除于 v1.6+
+  return tag.replace(/^(agentsbb|clawmessenger)-v?/, "");
 }
 
 /** Compare dotted versions, ignoring any `-prerelease` suffix. -1 | 0 | 1. */
@@ -115,13 +133,18 @@ export function compareVersions(a: string, b: string): number {
 /**
  * Release asset name for the running platform. Mirrors the CI release matrix;
  * returns "" for combinations the matrix does not build.
+ *
+ * The rebrand renamed the assets (clawmessenger-* → agentsbb-*); new releases
+ * carry both generations (dual whitelist, design §2.5) but this process always
+ * asks for the new names — the old names only exist so already-deployed
+ * v≤1.3.33 exes (old names baked in) keep finding their assets.
  */
 export function assetNameForPlatform(platform: string, arch: string): string {
-  if (platform === "win32") return arch === "x64" ? "clawmessenger-windows-x64.exe" : "";
-  if (platform === "darwin") return arch === "arm64" ? "clawmessenger-darwin-arm64" : "";
+  if (platform === "win32") return arch === "x64" ? "agentsbb-windows-x64.exe" : "";
+  if (platform === "darwin") return arch === "arm64" ? "agentsbb-darwin-arm64" : "";
   if (platform === "linux") {
-    if (arch === "arm64") return "clawmessenger-linux-arm64";
-    if (arch === "x64") return "clawmessenger-linux-x64";
+    if (arch === "arm64") return "agentsbb-linux-arm64";
+    if (arch === "x64") return "agentsbb-linux-x64";
   }
   return "";
 }
@@ -140,7 +163,7 @@ export type FetchLike = (url: string, init?: {
 
 function apiHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
-    "User-Agent": "clawmessenger-cli",
+    "User-Agent": "agentsbb-cli",
     Accept: "application/vnd.github+json",
   };
   const token = updateToken();
@@ -158,7 +181,7 @@ export async function resolveLatestTagViaCdn(
 ): Promise<string> {
   const res = await fetchImpl(
     `${updateWebBase()}/${RELEASES_REPO}/releases/latest/download/${probeAsset}`,
-    { headers: { "User-Agent": "clawmessenger-cli" }, redirect: "manual" },
+    { headers: { "User-Agent": "agentsbb-cli" }, redirect: "manual" },
   );
   const location = res.headers?.get?.("location") ?? "";
   const tag = location.match(/\/releases\/download\/([^/]+)\//)?.[1] ?? "";
@@ -276,13 +299,13 @@ export async function stageUpdate(
   const sumsAsset = release.assets.find((a) => a.name === "SHA256SUMS");
   if (!sumsAsset) throw new Error(`release ${release.tag} has no SHA256SUMS; refusing to install unverified binary`);
 
-  const sumsRes = await fetchImpl(sumsAsset.url, { headers: { "User-Agent": "clawmessenger-cli" } });
+  const sumsRes = await fetchImpl(sumsAsset.url, { headers: { "User-Agent": "agentsbb-cli" } });
   if (!sumsRes.ok) throw new Error(`SHA256SUMS download failed: HTTP ${sumsRes.status}`);
   const sums = parseSha256Sums(Buffer.from(await sumsRes.arrayBuffer()).toString("utf8"));
   const expected = sums.get(assetName);
   if (!expected) throw new Error(`SHA256SUMS does not list ${assetName}`);
 
-  const binRes = await fetchImpl(asset.url, { headers: { "User-Agent": "clawmessenger-cli" } });
+  const binRes = await fetchImpl(asset.url, { headers: { "User-Agent": "agentsbb-cli" } });
   if (!binRes.ok) throw new Error(`download failed: HTTP ${binRes.status}`);
   const bytes = Buffer.from(await binRes.arrayBuffer());
 
@@ -475,7 +498,7 @@ export async function stageUpdateFromMirrors(
     let bytes: Buffer;
     try {
       onStage?.("downloading", url);
-      const res = await fetchImpl(url, { headers: { "User-Agent": "clawmessenger-cli" } });
+      const res = await fetchImpl(url, { headers: { "User-Agent": "agentsbb-cli" } });
       if (!res.ok) {
         failures.push(`${url}: HTTP ${res.status}`);
         continue;

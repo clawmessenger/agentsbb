@@ -163,7 +163,7 @@ export function conversationKeyOf(msg: InboundIMMessage): string {
  *                      私聊里该用户的 `/use-model`（im.ts 的 per-user 偏好）。
  *   2. `deviceDefault` —— 主人在通讯录 → 智能体详情 →「默认模型」里设的，落在设备上
  *                      （agent-default-model.ts），群聊 / 单聊 / 讨论组共用。
- *   3. `runModel`    —— 装机时 `clawmessenger run --model X` 的启动参数。
+ *   3. `runModel`    —— 装机时 `agentsbb run --model X` 的启动参数。
  *   4. 都没有 → undefined，交给 agent CLI 自己的配置。
  *
  * 为什么 2 压过 3：面板上的设置是用户**此刻在界面上**做的动作，比装机时的参数新。
@@ -375,7 +375,7 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
   // 拦不住。省略 -> 纯内存，重启后回到「重跑一遍」的旧行为。
   answeredTurnsPath?: string;
   // 按用户的模型偏好落盘位置（见 user-models.ts）。省略 -> 用默认位置
-  // （~/.clawmessenger/user-models-<nodeId>.json）。
+  // （~/.agentsbb/user-models-<nodeId>.json）。
   userModelsPath?: string;
   // 主人给这台 agent 设置的默认模型（覆盖默认路径，测试注入用）。
   agentDefaultModelPath?: string;
@@ -536,7 +536,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   //   · 圆桌轮次的 params.model —— 服务端按角色配置下发的角色级模型
   //     （discussion_interactive.go 的 params["model"] = role.Model）；
   //   · 私聊里 per-user 的模型 —— 用户自己 `/use-model` 选的（im.ts）。
-  // 原来写的是 `opts.model ?? model`，即 `clawmessenger run --model X` 会**静默
+  // 原来写的是 `opts.model ?? model`，即 `agentsbb run --model X` 会**静默
   // 压死**上面两者：设备上只要带过 `--model`，服务端给角色配的模型就永远不生效，
   // 用户在界面里换模型也看不出任何变化。默认值不该打赢显式指定，所以反过来。
   //
@@ -763,7 +763,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     }
   });
 
-  opts.stdout.write("clawmessenger run: connected and dispatching\n");
+  opts.stdout.write("agentsbb run: connected and dispatching\n");
   await new Promise<void>(() => {}); // run until process exit
 }
 
@@ -771,7 +771,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
 // 9.1): when the first connect fails, refresh the token once and retry
 // with the fresh token — a single retry, no loops. The refreshed token is
 // used for this session only; startRunLoop has no keystore access to
-// persist it (run `clawmessenger login` to store one).
+// persist it (run `agentsbb login` to store one).
 export async function connectTransport(opts: ConnectTransportOpts): Promise<void> {
   const appKey = opts.creds.appKey ?? (await opts.api.getConfig()).appKey;
   let token = opts.creds.token;

@@ -4,6 +4,7 @@ import { access, constants } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { stateHome } from "./paths.js";
 
 import {
   type ActivityStep,
@@ -1773,8 +1774,9 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
 // `session.reasoning.delta`（见 opencode-v2.ts）。判据就是那行密码 —— 有它就走
 // 2.x，没有就是 1.x。
 //
-//   CLAWMESSENGER_OPENCODE_SERVER=0        关掉，回到 run --format json
-//   CLAWMESSENGER_OPENCODE_FULL_CONFIG=1   不派生精简配置（保留 plugin / MCP）
+//   AGENTSBB_OPENCODE_SERVER=0             关掉，回到 run --format json
+//   AGENTSBB_OPENCODE_FULL_CONFIG=1        不派生精简配置（保留 plugin / MCP）
+//   （过渡期双读旧名 CLAWMESSENGER_*，TODO(rebrand-retire): 移除于 v1.6+）
 const SERVE_STARTUP_TIMEOUT_MS = 25_000;
 // 拿到 listening 行之后再等密码行的窗口。2.x 这两行是先后打出来的（实测相隔
 // 几毫秒），但**别按实测值去压这个窗口**：Windows 冷启动、首次加载配置、杀软
@@ -1786,7 +1788,8 @@ const SERVE_STARTUP_TIMEOUT_MS = 25_000;
 const SERVE_PASSWORD_GRACE_MS = 1200;
 
 export function opencodeServerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = (env.CLAWMESSENGER_OPENCODE_SERVER ?? "").trim();
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_OPENCODE_SERVER 于 v1.6+
+  const raw = (env.AGENTSBB_OPENCODE_SERVER ?? env.CLAWMESSENGER_OPENCODE_SERVER ?? "").trim();
   if (!raw) return true;
   return !/^(0|false|no|off)$/i.test(raw);
 }
@@ -1807,7 +1810,10 @@ export function deviceOpencodeConfigPath(
    */
   lean = false,
 ): string {
-  const base = join(home, ".clawmessenger");
+  // Default home → go through stateHome() (honours AGENTSBB_HOME and the
+  // migration/fallback policy); an explicitly injected home (tests) keeps its
+  // per-test isolation under `.agentsbb`.
+  const base = home === homedir() ? stateHome() : join(home, ".agentsbb");
   const suffix = lean ? "-lean" : "";
   // 没有 agent 名（老调用方 / 手工探测）时退回整机一份的老路径，行为与升级前一致。
   if (!agentName) return join(base, `opencode-device${suffix}.json`);
@@ -1843,13 +1849,14 @@ interface DeviceConfigInput {
  * 以上、零输出；设备端每轮都要重新付这笔开销，表现就是「先想很久」。provider /
  * model / instructions / permission 全部保留，模型与人格不变。
  *
- * 用户显式指定过 OPENCODE_CONFIG（或 CLAWMESSENGER_OPENCODE_CONFIG）时不动 ——
+ * 用户显式指定过 OPENCODE_CONFIG（或 AGENTSBB_OPENCODE_CONFIG）时不动 ——
  * 那说明他自己管这份配置。
  */
 function opencodeServeEnv(input: DeviceConfigInput = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  const fullConfig = envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG);
-  const userManaged = Boolean(env.OPENCODE_CONFIG || env.CLAWMESSENGER_OPENCODE_CONFIG);
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_OPENCODE_* 于 v1.6+
+  const fullConfig = envFlag(env.AGENTSBB_OPENCODE_FULL_CONFIG ?? env.CLAWMESSENGER_OPENCODE_FULL_CONFIG);
+  const userManaged = Boolean(env.OPENCODE_CONFIG || env.AGENTSBB_OPENCODE_CONFIG || env.CLAWMESSENGER_OPENCODE_CONFIG);
   // 精简回合即使 operator 自己指定了 OPENCODE_CONFIG 也要派生：那一份只是"源"，
   // 我们派生出 `-lean` 的副本（不动原件），否则推荐回合又回到 2.9 万 token 的
   // build 系统提示上。FULL_CONFIG 是显式豁免，照旧不派生。
@@ -1928,8 +1935,10 @@ export function syncAgentPermissionConfig(
   // 它的派生配置要保持「无限制键」。
   if (fsGateExempt(agentName)) return null;
   const env = opts.env ?? process.env;
-  if (envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG)
+  // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_OPENCODE_* 于 v1.6+
+  if (envFlag(env.AGENTSBB_OPENCODE_FULL_CONFIG ?? env.CLAWMESSENGER_OPENCODE_FULL_CONFIG)
     || env.OPENCODE_CONFIG
+    || env.AGENTSBB_OPENCODE_CONFIG
     || env.CLAWMESSENGER_OPENCODE_CONFIG) {
     return null;
   }

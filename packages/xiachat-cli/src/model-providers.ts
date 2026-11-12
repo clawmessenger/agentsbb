@@ -397,7 +397,7 @@ export function parseQwenConfig(text: string): AgentConfig {
   };
 }
 
-// `~/.codebuddy/clawmessenger-provider.json` — codebuddy 自己的 settings.json
+// `~/.codebuddy/agentsbb-provider.json` — codebuddy 自己的 settings.json
 // 只认 `custom-local:<m>`（走 WorkBuddy 托管通道，有周/月限额），且这个 build
 // 丢掉了 ANTHROPIC_BASE_URL 支持，唯一可直连自建网关的入口是环境变量
 // `CODEBUDDY_BASE_URL`（OpenAI 兼容，实测 `/v1/chat/completions`）。
@@ -574,12 +574,16 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
     return candidates;
   }
   if (agentName === "codebuddy") {
-    // CLAWMESSENGER_CODEBUDDY_PROVIDER lets a machine point at a second
-    // gateway without editing the shared profile.
+    // AGENTSBB_CODEBUDDY_PROVIDER lets a machine point at a second gateway
+    // without editing the shared profile.
     const candidates: string[] = [];
-    if (env.CLAWMESSENGER_CODEBUDDY_PROVIDER) {
-      candidates.push(env.CLAWMESSENGER_CODEBUDDY_PROVIDER);
+    // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_CODEBUDDY_PROVIDER 于 v1.6+
+    if (env.AGENTSBB_CODEBUDDY_PROVIDER ?? env.CLAWMESSENGER_CODEBUDDY_PROVIDER) {
+      candidates.push((env.AGENTSBB_CODEBUDDY_PROVIDER ?? env.CLAWMESSENGER_CODEBUDDY_PROVIDER) as string);
     }
+    // 新文件名优先；旧名文件（改名前落盘的）继续兜底。
+    // TODO(rebrand-retire): 旧文件名移除于 v1.6+
+    candidates.push(join(home, ".codebuddy", "agentsbb-provider.json"));
     candidates.push(join(home, ".codebuddy", "clawmessenger-provider.json"));
     return candidates;
   }
@@ -587,7 +591,9 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
     // opencode 自己按 XDG 找配置；Windows 上 XDG_CONFIG_HOME 通常缺失，所以
     // 无条件再补一条 ~/.config（opencode 自身也是这么回落的）。
     const candidates: string[] = [];
-    if (env.CLAWMESSENGER_OPENCODE_CONFIG) candidates.push(env.CLAWMESSENGER_OPENCODE_CONFIG);
+    // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_OPENCODE_CONFIG 于 v1.6+
+    const opencodeConfig = env.AGENTSBB_OPENCODE_CONFIG ?? env.CLAWMESSENGER_OPENCODE_CONFIG;
+    if (opencodeConfig) candidates.push(opencodeConfig);
     const xdg = env.XDG_CONFIG_HOME;
     if (xdg) {
       candidates.push(join(xdg, "opencode", "opencode.json"));

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { stateHome } from "./paths.js";
 
 // 「这台 agent 的默认对话模型」。
 //
@@ -24,7 +24,7 @@ import { dirname, join } from "node:path";
 // 就有多进程互相覆盖的风险（与 user-models / processed-uids 同一处理方式）。
 export function defaultAgentModelPath(nodeId?: string): string {
   const suffix = nodeId ? `-${nodeId.replace(/[^A-Za-z0-9._-]/g, "_")}` : "";
-  return join(homedir(), ".clawmessenger", `agent-default-model${suffix}.json`);
+  return join(stateHome(), `agent-default-model${suffix}.json`);
 }
 
 /** `provider/model` 路由：与 web 的 segment() 判据同源（非空、无空白、恰好一个斜杠）。 */

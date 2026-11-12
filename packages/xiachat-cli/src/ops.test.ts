@@ -89,7 +89,7 @@ describe("ensureOpencodeInstalled", () => {
 
 describe("setupOpsWorkdir", () => {
   it("creates the workdir with an AGENTS.md ops system prompt", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       const returned = await setupOpsWorkdir(dir);
       expect(returned).toBe(dir);
@@ -102,7 +102,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("scopes a per-agent ops prompt to its own account", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir, { opsFor: "opencode_330076275" });
       const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
@@ -110,8 +110,8 @@ describe("setupOpsWorkdir", () => {
       expect(md).toContain("opencode_330076275");
       expect(md).toContain("不准操作其他智能体");
       // 整机级 stop 会连坐别的账号：提示词必须把它换成按账号的命令。
-      expect(md).toContain("clawmessenger agent start|stop|restart");
-      expect(md).toContain("clawmessenger stop");
+      expect(md).toContain("agentsbb agent start|stop|restart");
+      expect(md).toContain("agentsbb stop");
       expect(md).toContain("--all-agents");
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -119,7 +119,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("keeps a machine-level ops prompt without a per-agent scope", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir);
       const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
@@ -136,7 +136,7 @@ describe("setupOpsWorkdir", () => {
   // 0.2.47 的教训：提示词写死 git-bash 是猜的，opencode 在 Windows 上默认用
   // PowerShell —— 提示词必须按探测结果生成，两种形态各自自洽。
   it("tells the ops agent which shell its command tool really is (git-bash)", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir, {
         opsFor: "rc_node_3300776275_openclaw",
@@ -154,7 +154,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("tells the ops agent the truth when the shell is PowerShell", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir, { shell: { kind: "powershell" } });
       const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
@@ -170,7 +170,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("pins git-bash into opencode.json when detected, preserving other keys", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir);
       const { writeFile } = await import("node:fs/promises");
@@ -185,7 +185,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("does not write opencode.json when no git-bash is available", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir, { shell: { kind: "powershell" } });
       const { existsSync } = await import("node:fs");
@@ -196,7 +196,7 @@ describe("setupOpsWorkdir", () => {
   });
 
   it("rewrites AGENTS.md idempotently", async () => {
-    const dir = path.join(os.tmpdir(), `clawmessenger-ops-test-${Date.now()}`);
+    const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
       await setupOpsWorkdir(dir);
       await setupOpsWorkdir(dir);

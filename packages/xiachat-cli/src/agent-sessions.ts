@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { stateHome } from "./paths.js";
 
 // 「会话形态 + 会话 id」→ agent 自己的会话 id。
 //
@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 // 互相覆盖（与 user-models / agent-default-model 同一处理方式）。
 export function defaultAgentSessionsPath(nodeId?: string): string {
   const suffix = nodeId ? `-${nodeId.replace(/[^A-Za-z0-9._-]/g, "_")}` : "";
-  return join(homedir(), ".clawmessenger", `agent-sessions${suffix}.json`);
+  return join(stateHome(), `agent-sessions${suffix}.json`);
 }
 
 /** 只保留可安全塞进 argv 的 id：各家 id 都是 UUID/短横线串，出界一律丢掉。 */
