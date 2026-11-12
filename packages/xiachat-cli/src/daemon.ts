@@ -277,6 +277,35 @@ export function supervisorSpawnArgv(script: string | undefined = process.argv[1]
   return isSea ? [] : [script];
 }
 
+/**
+ * 把子进程的原始输出解码成文本，按「严格 UTF-8 → GBK → 宽松 UTF-8」的顺序兜底。
+ *
+ * 为什么需要它：中文 Windows 的系统命令（schtasks / tasklist / …）的 stdout
+ * / stderr 走 ANSI 代码页（GBK / cp936）。如果按 UTF-8 解码，中文错误提示会被
+ * 打碎成一串 U+FFFD（管理端详情页上就是一串菱形），而且碎过之后**无法还原**。
+ * 所以需要原文的调用点必须自己在 spawnSync 上拿 `encoding: "buffer"` 的原始
+ * Buffer，再交给这里做两级自适应解码（Node ≥ 20 全量 ICU 自带 'gbk' 标签）。
+ *
+ * 最后仍然把 U+FFFD 清掉：两级严格解码都失败时只剩宽松 UTF-8 一条路，它会把
+ * 无效字节替换成 U+FFFD —— 上报给服务端的 detail 里永远不该出现替换符。
+ */
+export function decodeCommandOutput(buf: Buffer): string {
+  if (buf.length === 0) return "";
+  for (const [label, fatal] of [
+    ["utf-8", true],
+    ["gbk", true],
+    ["utf-8", false],
+  ] as const) {
+    try {
+      return new TextDecoder(label, { fatal }).decode(buf).replace(/\uFFFD/g, "");
+    } catch {
+      // fatal 解码抛错 = 这串字节不是该编码（或该编码标签不可用），试下一级。
+    }
+  }
+  // 不可达：非严格 UTF-8 从不抛错，这一行只是给类型收窄的兜底。
+  return "";
+}
+
 function defaultIsAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -536,9 +565,18 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
           detail: "只装了登录自启，缺崩溃看门狗：执行 clawmessenger install-service",
         };
       }
-      const probe = runCommand("schtasks", ["/Query", "/TN", WATCHDOG_TASK_NAME]);
+      // 中文 Windows 上 schtasks.exe 的 stdout/stderr 是 ANSI（GBK/cp936）编码，
+      // 而 runCommand 的默认实现按 utf8 解码 —— 中文报错会被打碎成 U+FFFD（后台
+      // 页面上就是一串菱形），碎过之后无法还原。所以这条探测绕开 runCommand，
+      // 直接用 spawnSync 拿原始 Buffer，再交给 decodeCommandOutput 自适应解码。
+      // 其余 runCommand 调用点的输出要么是纯 ASCII、要么不需要进上报文案，不动。
+      const probe = spawnSyncFn("schtasks", ["/Query", "/TN", WATCHDOG_TASK_NAME], { encoding: "buffer" });
       if (probe.status !== 0) {
-        const reason = firstLine(`${probe.stdout ?? ""}${probe.stderr ?? ""}`);
+        // overrides 注入的假 spawnSync 可能仍返回字符串（老测试桩），按 Buffer 判定，
+        // 拿不到就当空串走默认文案。
+        const stdout = Buffer.isBuffer(probe.stdout) ? probe.stdout : Buffer.alloc(0);
+        const stderr = Buffer.isBuffer(probe.stderr) ? probe.stderr : Buffer.alloc(0);
+        const reason = firstLine(decodeCommandOutput(Buffer.concat([stdout, stderr])));
         return {
           ready: false,
           detail: `看门狗计划任务 ${WATCHDOG_TASK_NAME} 未注册（${reason || "schtasks 不可用，可能被安全软件拦截"}）`,

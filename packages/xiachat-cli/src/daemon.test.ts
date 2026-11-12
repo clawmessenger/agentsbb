@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createDaemon,
+  decodeCommandOutput,
   defaultDaemonPaths,
   findLiveSupervisor,
   formatDaemonStatus,
@@ -1032,5 +1033,101 @@ describe("ensureWatchdog（存量设备自愈补装）", () => {
     const result = await h.daemon.ensureWatchdog();
     expect(result).toEqual({ created: false, reason: "not-windows" });
     expect(h.commands).toHaveLength(0);
+  });
+});
+
+// 中文 Windows 上 schtasks.exe 的报错原文是 GBK（cp936）编码；过去按 UTF-8 解码
+// 后上报给服务端的 detail 全是菱形（U+FFFD）。这一组钉住两级兜底解码 + 替换符清洗。
+describe("decodeCommandOutput（子进程输出的编码兜底）", () => {
+  it("合法 UTF-8 原样返回", () => {
+    const text = "错误: 系统找不到指定的文件。";
+    expect(decodeCommandOutput(Buffer.from(text, "utf8"))).toBe(text);
+  });
+
+  it("GBK 字节（中文 Windows 的 ANSI 输出）正确转回中文", () => {
+    // 「拒绝访问」的 GBK/cp936 编码。这些字节不是合法 UTF-8，严格 UTF-8 解码会
+    // 抛错，于是落到 GBK 一级。（字节序列已用 Node full-ICU 的 TextDecoder 验证。）
+    const gbk = Buffer.from([0xbe, 0xdc, 0xbe, 0xf8, 0xb7, 0xc3, 0xce, 0xca]);
+    expect(decodeCommandOutput(gbk)).toBe("拒绝访问");
+  });
+
+  it("纯 ASCII 输出不受影响（GBK 与 UTF-8 在 ASCII 区间一致）", () => {
+    expect(decodeCommandOutput(Buffer.from("ERROR: The system cannot find the file specified.\r\n"))).toBe(
+      "ERROR: The system cannot find the file specified.\r\n",
+    );
+  });
+
+  it("无效字节被清掉，不留 U+FFFD 残留", () => {
+    // [0x41, 0x81, 0x20, 0x42] 在 UTF-8 里非法（0x81 是孤立续字节）、在 GBK 里
+    // 也不合法（0x81 作首字节时 0x20 不是合法的次字节）：两级严格解码都失败 →
+    // 宽松 UTF-8 把 0x81 替换成 U+FFFD，最后必须被清掉。
+    const decoded = decodeCommandOutput(Buffer.from([0x41, 0x81, 0x20, 0x42]));
+    expect(decoded).toBe("A B");
+    expect(decoded).not.toContain("\uFFFD");
+  });
+
+  it("空输出给空串", () => {
+    expect(decodeCommandOutput(Buffer.alloc(0))).toBe("");
+  });
+});
+
+describe("serviceHealth（Windows 看门狗探测的编码兜底）", () => {
+  const setup = (spawnSyncOverride: Partial<DaemonOverrides> = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-health-gbk-"));
+    dirs.push(dir);
+    const vbs = join(dir, "Startup", "clawmessenger.vbs");
+    const cmd = join(dir, "watchdog.cmd");
+    mkdirSync(join(vbs, ".."), { recursive: true });
+    writeFileSync(vbs, "rem logon autostart\n");
+    writeFileSync(cmd, "rem watchdog shell\n");
+    return harness({
+      platform: "win32",
+      env: { APPDATA: dir },
+      autostartPaths: { startupVbs: vbs, watchdogCmd: cmd },
+      ...spawnSyncOverride,
+    });
+  };
+
+  it("schtasks 报错原文是 GBK 字节时，detail 里是中文而不是菱形", () => {
+    // 「拒绝访问」的 GBK 编码 —— 安全软件拦截 schtasks 时在中文 Windows 上就是这个。
+    const spawnSyncFake = ((file: string, args: string[], options: { encoding?: string }) => {
+      expect(file).toBe("schtasks");
+      expect(args).toEqual(["/Query", "/TN", "clawmessenger-watchdog"]);
+      expect(options.encoding).toBe("buffer");
+      return {
+        status: 1,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.from([0xbe, 0xdc, 0xbe, 0xf8, 0xb7, 0xc3, 0xce, 0xca]),
+        pid: 0,
+      };
+    }) as unknown as typeof import("node:child_process").spawnSync;
+    const h = setup({ spawnSync: spawnSyncFake });
+
+    const health = h.daemon.serviceHealth();
+
+    expect(health.ready).toBe(false);
+    expect(health.detail).toContain("拒绝访问");
+    expect(health.detail).not.toContain("\uFFFD");
+  });
+
+  it("探测拿不到输出（如被安全软件拦死）时仍给默认文案，不出现替换符", () => {
+    const spawnSyncFake = (() => ({ status: null, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), pid: 0 })) as unknown as typeof import("node:child_process").spawnSync;
+    const h = setup({ spawnSync: spawnSyncFake });
+
+    const health = h.daemon.serviceHealth();
+
+    expect(health.ready).toBe(false);
+    expect(health.detail).toContain("schtasks 不可用");
+    expect(health.detail).not.toContain("\uFFFD");
+  });
+
+  it("任务已注册（status 0）时 ready=true，与编码处理无关", () => {
+    const spawnSyncFake = (() => ({ status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), pid: 0 })) as unknown as typeof import("node:child_process").spawnSync;
+    const h = setup({ spawnSync: spawnSyncFake });
+
+    const health = h.daemon.serviceHealth();
+
+    expect(health.ready).toBe(true);
+    expect(health.detail).toContain("崩溃看门狗");
   });
 });
