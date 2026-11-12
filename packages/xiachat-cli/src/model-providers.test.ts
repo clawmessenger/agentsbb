@@ -438,7 +438,7 @@ describe("readAgentConfig", () => {
 
 // --- small_model 对齐主模型（2026-11-05 现场） ------------------------------
 
-import { buildDeviceOpencodeConfig } from "./model-providers.js";
+import { buildDeviceOpencodeConfig, LEAN_AGENT_SYSTEM_PROMPT } from "./model-providers.js";
 
 describe("buildDeviceOpencodeConfig small_model 对齐", () => {
   it("small_model 与主 model 不一致时对齐到主 model（防小模型欠费拖慢 title 生成）", () => {
@@ -468,5 +468,44 @@ describe("buildDeviceOpencodeConfig small_model 对齐", () => {
 
     const absent = buildDeviceOpencodeConfig(JSON.stringify({ model: "a/x" }), {});
     expect(JSON.parse(absent!.text).small_model).toBeUndefined();
+  });
+});
+
+// --- 精简回合：换掉 build 系统提示 + 关全部工具（2026-11-12 实测 2.9万 → 1.7千 token）
+
+describe("buildDeviceOpencodeConfig lean 回合", () => {
+  const raw = JSON.stringify({
+    model: "quukk/glm-5.2",
+    provider: { quukk: { models: {} } },
+    agent: { "my-helper": { prompt: "用户自己的子 agent" } },
+  });
+
+  it("把 build 换成只输出 JSON 的人格，并用通配符关掉全部工具", () => {
+    const built = buildDeviceOpencodeConfig(raw, { lean: true });
+    expect(built).not.toBeNull();
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.agent.build.prompt).toBe(LEAN_AGENT_SYSTEM_PROMPT);
+    // 通配符而不是逐条枚举：opencode 新加的工具不必跟着改这张表。
+    expect(parsed.agent.build.tools).toEqual({ "*": false });
+    // 用户自己的 agent 必须原样保留 —— 精简回合只改 build 这一个人格。
+    expect(parsed.agent["my-helper"]).toEqual({ prompt: "用户自己的子 agent" });
+    // 模型与 provider 不受影响。
+    expect(parsed.model).toBe("quukk/glm-5.2");
+    expect(parsed.provider).toEqual({ quukk: { models: {} } });
+  });
+
+  it("不带 lean 时不碰 agent：聊天轮次的人格与工具保持原样", () => {
+    const built = buildDeviceOpencodeConfig(raw, {});
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.agent).toEqual({ "my-helper": { prompt: "用户自己的子 agent" } });
+    expect(parsed.agent.build).toBeUndefined();
+  });
+
+  it("lean 与 fsRestricted 叠加时两套键都在", () => {
+    const built = buildDeviceOpencodeConfig(raw, { lean: true, fsRestricted: true });
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.agent.build.tools).toEqual({ "*": false });
+    expect(parsed.tools.read).toBe(false);
+    expect(parsed.permission.bash).toBe("deny");
   });
 });

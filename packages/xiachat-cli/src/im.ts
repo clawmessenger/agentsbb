@@ -245,6 +245,17 @@ export interface TurnOptions {
    * 只会留下僵尸回合跟下一轮抢额度（见 roleRecommendTurnTimeoutMs）。
    */
   timeoutMs?: number;
+  /**
+   * 精简回合：把 opencode `build` agent 的系统提示换成"只输出 JSON"、工具全关。
+   *
+   * 只给「问一句、拿一段 JSON」的短回合用（角色推荐）。默认 build agent 的系统
+   * 提示 + 15 个工具定义 + 技能清单共 2.9 万 token，与本任务毫无关系却每轮都要
+   * prefill 一遍 —— 上游越慢，这笔固定开销越致命（2026-11-12 实测：29,397 →
+   * 1,722 输入 token，单轮 27s → 14s）。
+   */
+  lean?: boolean;
+  /** 上游用量回调（只有 serve 模式能拿到），用于把「为什么慢」写进日志。 */
+  onUsage?: (usage: { inputTokens: number; outputTokens: number; reasoningTokens: number }) => void;
 }
 
 export interface TurnRunner {
@@ -1924,6 +1935,9 @@ export class MessageDispatcher {
       `role recommend: request ${request.requestId} max_roles=${request.maxRoles} from ${msg.fromUserId}`,
     );
     let reply: string;
+    // 上游用量（本回合的输入/输出 token）：只有 serve 模式拿得到，拼在 answered
+    // 日志尾部 —— 下一轮排查「为什么这轮 90 秒」先看这里，而不是从慢猜起。
+    let usageText = "";
     try {
       // 管理端「讨论主持 AI」配的模型优先（params.model）：讨论轮次那条链路
       // （your_turn → resolveTurnModel(params.model)）早就尊重它了，唯独推荐
@@ -1937,6 +1951,13 @@ export class MessageDispatcher {
         // 默认 300s —— 差了 5 倍，一个慢回合会在服务端超时后还继续烧 4 分钟，
         // 跟用户重试起的新回合抢同一份上游额度，越点越慢。
         timeoutMs: request.timeoutMs ?? ROLE_RECOMMEND_TURN_TIMEOUT_MS,
+        // 推荐只是"问一句、拿一段 JSON"：用精简回合（换掉 build 系统提示 + 关
+        // 全部工具），把每轮的 2.9 万输入 token 压到 1.7 千 —— 这是这一轮"变快"
+        // 的主要来源，与超时窗口无关。
+        lean: true,
+        onUsage: (usage) => {
+          usageText = ` in=${usage.inputTokens} out=${usage.outputTokens} reason=${usage.reasoningTokens}`;
+        },
       });
       const roles = parseRoleRecommendationOutput(output, request.maxRoles);
       const turnElapsedMs = Date.now() - startedAt;
@@ -1949,7 +1970,7 @@ export class MessageDispatcher {
           );
       if (roles) {
         console.log(
-          `role recommend: answered ${request.requestId} with ${roles.length} role(s) in ${turnElapsedMs}ms`,
+          `role recommend: answered ${request.requestId} with ${roles.length} role(s) in ${turnElapsedMs}ms${usageText}`,
         );
       } else {
         console.error(`role recommend: could not parse an answer for ${request.requestId}`);

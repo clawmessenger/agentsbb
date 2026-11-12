@@ -342,6 +342,34 @@ export interface RunServerSessionResult {
   /** 最后一个工具步骤失败、其后又没正文 —— 这一轮只有半句话（与 run 模式同判据）。 */
   endedOnFailedTool: boolean;
   failedStep: ActivityStep | null;
+  /** 本轮上游用量（POST 返回体里的 info.tokens）；拿不到就没有。 */
+  usage?: TurnUsage;
+}
+
+export interface TurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+}
+
+/**
+ * 从 `POST /session/:id/message` 的返回体里取 token 用量。
+ *
+ * 只做诊断用：推荐回合"为什么慢"在日志里过去完全看不出来（只有总耗时），
+ * 而现场数据表明慢的根源是**输入**（默认 build agent 的系统提示 + 工具定义
+ * 共 2.9 万 token，见 DeviceOpencodeConfigOpts.lean）。把 in/out 打进日志，
+ * 下一轮排查不必再靠猜。
+ */
+function extractUsage(body: unknown): TurnUsage | undefined {
+  const tokens = asRecord(asRecord(body)?.info)?.tokens;
+  const t = asRecord(tokens);
+  if (!t) return undefined;
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return {
+    inputTokens: num(t.input),
+    outputTokens: num(t.output),
+    reasoningTokens: num(t.reasoning),
+  };
 }
 
 export class OpenCodeServerError extends Error {
@@ -548,8 +576,11 @@ export async function runServerSession(opts: RunServerSessionOpts): Promise<RunS
     }
 
     let authoritative: string | undefined;
+    let usage: TurnUsage | undefined;
     try {
-      authoritative = extractReplyText(JSON.parse(replied.body));
+      const parsedBody: unknown = JSON.parse(replied.body);
+      authoritative = extractReplyText(parsedBody);
+      usage = extractUsage(parsedBody);
     } catch {
       authoritative = undefined;
     }
@@ -569,6 +600,7 @@ export async function runServerSession(opts: RunServerSessionOpts): Promise<RunS
       idleSeen: state.idle,
       endedOnFailedTool,
       failedStep: endedOnFailedTool && lastStep ? lastStep : null,
+      ...(usage ? { usage } : {}),
     };
   } catch (err) {
     if (timedOut) throw new Error(`agent turn timeout after ${opts.timeoutMs}ms`);

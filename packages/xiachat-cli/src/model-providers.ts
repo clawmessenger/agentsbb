@@ -640,7 +640,29 @@ export interface DeviceOpencodeConfigOpts {
    * `instructions: string[]`），正好是「指令层」而不是用户消息层。
    */
   instructions?: string[];
+  /**
+   * 「精简回合」：把 `build` agent 的系统提示换掉、工具全关，用于角色推荐这类
+   * 「问一句、拿一段 JSON」的短回合。
+   *
+   * 为什么要动这一层（2026-11-12 实测，quukk/glm-5.2，同一条推荐提示词）：
+   *   · 默认 build agent：输入 **29,397 token**、单轮 21~28s；
+   *   · 关掉工具：22,316 token；
+   *   · 换掉系统提示 + 关掉全部工具：**1,722 token**、单轮 13~18s。
+   * 那 2.8 万 token 与推荐毫无关系（build 的系统提示 + 15 个工具定义 + 技能清单），
+   * 却要在每一轮里重新 prefill 一遍 —— 上游网关越慢，这笔开销越大，最后撞上
+   * 服务端 60s 的等待窗口，用户看到的就是「推荐超时」。
+   *
+   * 只写 `agent.build` 而不新增 agent 名：serve 的 message 接口给 `agent` 传参
+   * 需要 2.x 协议配合，而配置里覆盖 build 是 1.x/2.x 通吃的（本地 1.19.4 实测
+   * `agent.build.prompt` + `tools:{"*":false}` 生效）。精简配置走**独立文件**
+   * （见 deviceOpencodeConfigPath 的 lean 参数），聊天轮次那份配置不受影响。
+   */
+  lean?: boolean;
 }
+
+/** 精简回合的 `build` agent：只输出用户要的 JSON，零工具、零寒暄。 */
+export const LEAN_AGENT_SYSTEM_PROMPT =
+  "你是角色推荐器：不要使用任何工具，不要分析或解释，直接输出用户要求的 JSON 对象。";
 
 // 文件读写限制态要关掉的工具。`read`/`glob`/`grep`/`list` 是读，`edit`/`write`/
 // `patch` 是写；`bash` 既能读也能写，一并关掉 —— 否则「禁了文件工具但留一个
@@ -732,6 +754,24 @@ export function buildDeviceOpencodeConfig(
       ? { ...(out.tools as Record<string, unknown>) }
       : {};
     out.tools = { ...tools, ...FS_DENY_TOOLS };
+  }
+  if (opts.lean) {
+    // 只覆盖 build 这一个人格：用户自定义的其它 agent（explore / 各种 subagent）
+    // 原样保留 —— 它们不参与精简回合，删掉反而会让用户的配置"消失"。
+    const agents = (out.agent && typeof out.agent === "object" && !Array.isArray(out.agent))
+      ? { ...(out.agent as Record<string, unknown>) }
+      : {};
+    const build = (agents.build && typeof agents.build === "object" && !Array.isArray(agents.build))
+      ? { ...(agents.build as Record<string, unknown>) }
+      : {};
+    agents.build = {
+      ...build,
+      prompt: LEAN_AGENT_SYSTEM_PROMPT,
+      // 通配符关掉全部工具：新增工具不必跟着改这张表（1.19.4 实测生效），
+      // 也不会因为漏了某个新工具名而让模型又开始翻文件。
+      tools: { "*": false },
+    };
+    out.agent = agents;
   }
   return { text: JSON.stringify(out, null, 2), dropped };
 }
