@@ -189,8 +189,13 @@ const exePath = join(distDir, isWindows ? `${exeName}.exe` : exeName);
 // 归一成 x.y.z 并**拒绝**任何不是 x.y.z 的输入：一个编错版本的包会让设备每次
 // 「升级成功」都被自己判成 restart_failed，而管理端看不出原因（审查报告 S1）。
 const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8"));
+// 双读用数组 + find，而不是 `a ?? b || c`：`??` 与 `||` 混用是语法错误，而且
+// 空字符串（CI 里 `AGENTSBB_VERSION=""` 这种）该当成「没设」而不是「版本是空」。
 // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_VERSION 于 v1.6+
-const rawVersion = (opt("--version", process.env.AGENTSBB_VERSION ?? process.env.CLAWMESSENGER_VERSION || pkg.version) || pkg.version).trim();
+const envVersion = [process.env.AGENTSBB_VERSION, process.env.CLAWMESSENGER_VERSION]
+  .map((value) => (value ?? "").trim())
+  .find((value) => value !== "");
+const rawVersion = (opt("--version", envVersion ?? pkg.version) || pkg.version).trim();
 const versionMatch = rawVersion.match(/(\d+\.\d+\.\d+)/);
 const injectedVersion = versionMatch ? versionMatch[1] : "";
 if (!injectedVersion) {

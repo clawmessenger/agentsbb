@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
   已弃用的入口（兼容旧文档/旧运维习惯）。
   clawmessenger-daemon.ps1 已更名为 agentsbb-daemon.ps1，本薄壳只打印
