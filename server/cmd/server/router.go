@@ -1845,6 +1845,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 归属变更：按融云好友边重建（本地 owner_user_id 与 IM 账号体系对不上，见
 	// claw_admin_nodes.go 的 ClawAdminTransferNodeOwner）。
 	r.Put("/api/admin/nodes/{id}/owner", h.ClawAdminTransferNodeOwner)
+	// 升级包镜像（claw-mirror）：把「服务器手工跑 claw-cli-mirror-sync.sh」搬进
+	// 后台。查询只读（system:read），拉取/上传是镜像写操作（system:write）。
+	// 拉取是异步任务（400MB 级下载会撞 nginx 超时），POST 开任务、GET job 轮询。
+	r.Get("/api/admin/claw-mirror", h.ClawAdminGetMirrorStatus)
+	r.Get("/api/admin/claw-mirror/job", h.ClawAdminMirrorJob)
+	r.Post("/api/admin/claw-mirror/pull-github", h.ClawAdminPullMirrorFromGitHub)
+	r.Post("/api/admin/claw-mirror/upload", h.ClawAdminUploadMirror)
 	// 群组：本地镜像表 rongcloud_group / rongcloud_group_member（迁移 588）。
 	// 融云没有「列出全部群」的平台接口，只能按群 ID 或按用户查，所以必须本地留一份；
 	// 群由 C 端的 service=group 命令创建（见 rongcloud/group_command.go）。
