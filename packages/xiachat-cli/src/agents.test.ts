@@ -11,15 +11,19 @@ import {
   buildSpawnInvocation,
   buildModelArgs,
   discoverAgents,
+  deviceOpencodeConfigPath,
   emitsJsonEnvelope,
   extractOpenclawEnvelopeDetails,
   extractOpenclawReply,
+  grokCliModelId,
+  grokRouteFromCliModelId,
   KNOWN_AGENT_CLIS,
   normalizeOpenclawOutput,
   openclawTurnHealth,
   parseOpenclawJsonOutput,
   parseStreamJsonLine,
   resolveWindowsShim,
+  runAgentCommand,
   runAgentTurn,
   splitModelRoute,
   stripAnsiCodes,
@@ -30,6 +34,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyTurnError } from "./turn-error.js";
+import { AGENT_MODEL_CAPABILITIES } from "./agent-model-capabilities.js";
 
 // 本文件测的是 run --format json 那条路径的解析（part 去重、缓冲截断、半句判据）。
 // opencode 默认已改走 serve + SSE（真增量），这里统一关掉，让假脚本能按 run 的
@@ -174,9 +179,10 @@ describe("buildAgentArgs", () => {
   // 预期为空——正文流升级，不虚构思考）。
   it("kimi 走 -p + stream-json（不再是 text 整包，也不回退 stdin/TUI）", () => {
     expect(buildAgentArgs("kimi", "hi")).toEqual(["-p", "hi", "--output-format", "stream-json"]);
-    // 不注入 --model：kimi 的 -m 只认它自己的模型别名，不认 provider/model 路由。
+    // -m 收的正是 `kimi provider list --json` 给出的 alias（`quukk/glm-5.2` 形，
+    // 2026-11 实测），所以整段路由直接注入。
     expect(buildAgentArgs("kimi", "hi", "quukk/glm-5.2")).toEqual([
-      "-p", "hi", "--output-format", "stream-json",
+      "-p", "hi", "--output-format", "stream-json", "-m", "quukk/glm-5.2",
     ]);
     // 超长 prompt 退回 stdin 模式：kimi -p 的 argv 与 stdin 二选一，stdin 形态
     // 下它把管道读到 EOF 当 prompt（不会挂起）。
@@ -323,9 +329,17 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("dim", "quukk/glm-5.2")).toEqual([]);
   });
 
-  it("grok 走 -p/--single（plain 正文），模型不注入", () => {
+  it("grok 走 -p/--single（plain 正文），-m 注入连字符模型 id", () => {
     expect(buildAgentArgs("grok", "hi")).toEqual(["-p", "hi"]);
-    expect(buildModelArgs("grok", "quukk/glm-5.2")).toEqual([]);
+    // 目录用斜杠路由（wire 要求），注入用 CLI 的连字符 id（2026-11 实测
+    // `grok models` 输出 `quukk-glm-5.2`）。转换是严格双射：`/` ⇄ `-`，
+    // 所以 `grok/4.7` 注入回 CLI 认的 `grok-4.7`（不做前缀白名单猜测）。
+    expect(buildModelArgs("grok", "quukk/glm-5.2")).toEqual(["-m", "quukk-glm-5.2"]);
+    expect(buildModelArgs("grok", "grok/4.7")).toEqual(["-m", "grok-4.7"]);
+    // 无斜杠的裸 id 原样透传（splitModelRoute 返回 null 时不做改写）
+    expect(buildModelArgs("grok", "grok-4.7")).toEqual(["-m", "grok-4.7"]);
+    expect(buildModelArgs("grok", undefined)).toEqual([]);
+    expect(buildAgentArgs("grok", "hi", "quukk/glm-5.2")).toEqual(["-p", "hi", "-m", "quukk-glm-5.2"]);
   });
 
   it("reasonix 走 -p + text（不再把 usage help 当回复）", () => {
@@ -397,9 +411,8 @@ describe("splitModelRoute / buildModelArgs", () => {
     expect(buildModelArgs("opencode", undefined)).toEqual([]);
     expect(buildModelArgs("opencode", "quukk/glm-5.3")).toEqual(["--model", "quukk/glm-5.3"]);
     expect(buildModelArgs("claude", "sonnet-4")).toEqual(["--model", "sonnet-4"]);
-    // 无 argv 策略的 agent 不注入模型参数：它们不认 `--model`（kimi 走 stdin，
-    // 收到未知参数只会 usage dump + exit 1），模型选择对它们本就无效。
-    expect(buildModelArgs("kimi", "m1")).toEqual([]);
+    // 没人选的模型 → 什么都不加（与 agent 是否支持注入无关）
+    expect(buildModelArgs("kimi", undefined)).toEqual([]);
   });
 
   // 3a 的守卫必须逐 agent 钉住：既不能给不认 `--model` 的 agent 乱塞参数，
@@ -407,14 +420,18 @@ describe("splitModelRoute / buildModelArgs", () => {
   // 它在设备端没有 argv 策略，但 `--model` 是真实支持的参数）。
   it("only renders model flags for agents that actually accept them", () => {
     // 无策略 → 不注入
-    expect(buildModelArgs("kimi", "m1")).toEqual([]);
-    expect(buildModelArgs("grok", "m1")).toEqual([]);
+    expect(buildModelArgs("kiro-cli", "m1")).toEqual([]);
+    expect(buildModelArgs("cursor-agent", "m1")).toEqual([]);
     // 有策略 → 按各家形状注入
     expect(buildModelArgs("codex", "p/m")).toEqual(["-c", "model_provider=p", "-m", "m"]);
     expect(buildModelArgs("opencode", "p/m")).toEqual(["--model", "p/m"]);
     expect(buildModelArgs("hermes", "p/m")).toEqual(["-m", "m", "--provider", "p"]);
     // 无策略但确实支持 --model：provider 段必须剥掉
     expect(buildModelArgs("qwen", "p/m")).toEqual(["--model", "m"]);
+    // kimi：-m 收 provider/model alias，整段注入
+    expect(buildModelArgs("kimi", "p/m")).toEqual(["-m", "p/m"]);
+    // grok：目录用斜杠、注入用连字符
+    expect(buildModelArgs("grok", "p/m")).toEqual(["-m", "p-m"]);
     // codebuddy 只留一个随机端口，模型走 CODEBUDDY_MODEL
     expect(buildModelArgs("codebuddy", "m1")).toEqual(["--port", "0"]);
     // 没选模型 → 什么都不加
@@ -422,7 +439,7 @@ describe("splitModelRoute / buildModelArgs", () => {
   });
 
   // B 类十家的模型注入面（2026-11-04 批量接入）：每一家都按证据钉住——
-  // 不认路由的（cursor/kimi）不注入，认整段的（pi/omp）整段透传，
+  // 不认路由的（cursor）不注入，认整段的（pi/omp/kimi）整段透传，
   // 模型在 stdin 协议帧里的（dsh）argv 返回空。
   it("B 类新 CLI 的模型注入面逐家钉住（不猜参数名）", () => {
     // cursor-agent：模型跟随 cursor 账户配置（抓包 init model="Auto"）
@@ -451,11 +468,119 @@ describe("splitModelRoute / buildModelArgs", () => {
     expect(buildAgentArgs("qwen", "hi", "quukk/glm-5.2")).toContain("glm-5.2");
   });
 
+  // claude 的静态目录（model-static-catalogs.ts）以 anthropic 前缀分组，但
+  // Claude Code 的 --model 只认裸 ResolvedModel（claude_models.go:340-344）——
+  // 整段路由会被它当成未知模型，注入前必须剥掉 provider（2026-11 修复）。
+  it("strips the provider segment for claude, which takes the bare resolved id", () => {
+    expect(buildModelArgs("claude", "anthropic/claude-sonnet-4-6"))
+      .toEqual(["--model", "claude-sonnet-4-6"]);
+    expect(buildModelArgs("claude", "claude-opus-5")).toEqual(["--model", "claude-opus-5"]);
+    expect(buildModelArgs("claude", undefined)).toEqual([]);
+  });
+
+  // agy 的目录（`agy models`，parseAgyModelsList）用自造的 `agy` 前缀分组，
+  // 但目录条目本身没有 provider（models.go:2427-2452），--model 收裸 id ——
+  // 注入前剥掉前缀（2026-11 修复）。
+  it("strips the synthetic provider segment for agy", () => {
+    expect(buildModelArgs("agy", "agy/gemini-3-pro")).toEqual(["--model", "gemini-3-pro"]);
+    // 裸 id 形态（历史行为）保持不变
+    expect(buildModelArgs("agy", "gemini-3-pro")).toEqual(["--model", "gemini-3-pro"]);
+  });
+
+  // grok 的目录 ↔ 注入 id 形状转换必须严格互逆：目录（wire）用斜杠，
+  // CLI 用连字符。转换规则 = 第一个 `-` 前是 provider，其余是 model，
+  // 因此裸 id `grok-4.7` 被切成 `grok` + `4.7` —— 分组不完美但可逆，
+  // 注入出去仍是 CLI 认的 `grok-4.7`。**不用前缀白名单猜 xai**。
+  it("round-trips grok ids between the wire route and the CLI form", () => {
+    expect(grokRouteFromCliModelId("quukk-glm-5.2")).toBe("quukk/glm-5.2");
+    expect(grokRouteFromCliModelId("quukk-kimi-k2-7-code")).toBe("quukk/kimi-k2-7-code");
+    expect(grokRouteFromCliModelId("grok-4.7")).toBe("grok/4.7");
+    expect(grokRouteFromCliModelId("   ")).toBeNull();
+    // 无法构成合法单斜杠路由时返回 null（这些 id 会被目录解析器跳过）
+    expect(grokRouteFromCliModelId("grok4.7")).toBeNull();
+    expect(grokRouteFromCliModelId("-4.7")).toBeNull();
+    expect(grokRouteFromCliModelId("grok-")).toBeNull();
+    // 互逆：CLI id → 路由 → CLI id 必须逐字符还原（分组被切得不完美也不影响注入）
+    for (const cliId of ["quukk-glm-5.2", "quukk-kimi-k2-7-code", "grok-4.7", "deepseek-v4-pro"]) {
+      const route = grokRouteFromCliModelId(cliId);
+      expect(route).not.toBeNull();
+      expect(grokCliModelId(route as string)).toBe(cliId);
+    }
+    // 正向：wire 路由 → CLI id
+    expect(grokCliModelId("quukk/glm-5.2")).toBe("quukk-glm-5.2");
+    expect(grokCliModelId("grok/4.7")).toBe("grok-4.7");
+    // 无斜杠输入原样返回（不进 CLI 的模型名不做改写）
+    expect(grokCliModelId("grok-4.7")).toBe("grok-4.7");
+  });
+
   it("never passes --model to codebuddy (it only exposes a free port)", () => {
     // codebuddy rejects any model id it does not own (`--model glm-5.2` →
     // "Authentication required"), so the model rides CODEBUDDY_MODEL instead.
     expect(buildModelArgs("codebuddy", "quukk/glm-5.2")).toEqual(["--port", "0"]);
     expect(buildModelArgs("codebuddy", undefined)).toEqual(["--port", "0"]);
+  });
+
+  // 能力矩阵与注入实现的**交叉校验**（agent-model-capabilities.ts 是单一事实源）：
+  // 矩阵说 'none' 的 agent，argv 里绝不能出现模型参数 —— 否则「目录里没有」与
+  // 「注入了不该注入的旗标」会同时发生，比空目录更糟（CLI 未知参数直接退出）。
+  // 反过来，矩阵说 'argv' 的 agent 必须真的把模型带进命令行，否则面板上选中的
+  // 模型会静默失效（设计 D 的红线）。
+  it("agrees with AGENT_MODEL_CAPABILITIES on every agent", () => {
+    for (const [agentName, capability] of Object.entries(AGENT_MODEL_CAPABILITIES)) {
+      const argv = buildModelArgs(agentName, "probe/provider-model");
+      if (capability.modelInjection === "none") {
+        expect(argv, `${agentName} must not inject a model`).toEqual([]);
+      } else if (capability.modelInjection === "stdin-frame") {
+        // dsh：模型随 stdin 的 execute 帧走，argv 里没有 --model
+        expect(argv, `${agentName} carries the model on stdin`).toEqual([]);
+      } else if (capability.modelInjection === "env") {
+        // codebuddy：只留 --port 0，模型走 CODEBUDDY_MODEL
+        expect(argv.join(" "), `${agentName} must not pass the route on argv`)
+          .not.toContain("probe/provider-model");
+      } else {
+        expect(argv.length, `${agentName} must inject the model`).toBeGreaterThan(0);
+        expect(argv.join(" "), `${agentName} must carry the model id`).toContain("provider-model");
+      }
+    }
+  });
+});
+
+// dsh 的列举命令打完帧不肯退出（2026-11 实测，只能等 timeout 被杀 → exit 124）：
+// runAgentCommand 必须靠 stopWhen 早退，否则设备端永远是「超时 → 空目录」。
+describe("runAgentCommand stopWhen", () => {
+  it("resolves as soon as the predicate matches, without waiting for the process to exit", async () => {
+    // stdoutText 写完后 process.stdin.resume() 挂着不退 —— 正好复现 dsh 的行为。
+    const fixture = createEchoAgentScript("dsh", {
+      stdoutText: '{"v":1,"type":"models","models":[{"id":"quukk/glm-5.2"}]}\n',
+    });
+    const started = Date.now();
+    try {
+      const stdout = await runAgentCommand({
+        execPath: fixture.agentPath,
+        argv: ["--profile", "multica", "--list-models"],
+        timeoutMs: 30_000,
+        stopWhen: (partial) => partial.includes('"type":"models"'),
+      });
+      expect(stdout).toContain('"type":"models"');
+      // 远小于 timeoutMs：证明是「命中即收工」，不是等超时、也不是等进程退出
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("still waits for a normal exit when no predicate is given", async () => {
+    const fixture = createEchoAgentScript("dsh", { stdoutText: "done\n" });
+    try {
+      const stdout = await runAgentCommand({
+        execPath: fixture.agentPath,
+        argv: [],
+        timeoutMs: 30_000,
+      });
+      expect(stdout).toBe("done\n");
+    } finally {
+      fixture.cleanup();
+    }
   });
 });
 
@@ -1872,3 +1997,18 @@ describe.skipIf(process.platform !== "win32")("Windows .cmd shim 穿透（cmd.ex
     expect(viaCmd.args.every((a) => !a.includes("\n"))).toBe(true);
   });
 })
+
+describe("deviceOpencodeConfigPath", () => {
+  it("精简回合写 -lean 副本，绝不与聊天轮次共用同一份配置", () => {
+    const home = join(tmpdir(), "cm-home");
+    // 聊天轮次：老路径，升级前后完全一致（既有设备不受影响）。
+    expect(deviceOpencodeConfigPath("opencode_673", home))
+      .toBe(join(home, ".clawmessenger", "opencode-device-opencode_673.json"));
+    // 精简回合：独立文件 —— 共用的话，私聊/群聊的 agent 会跟着丢掉工具与人设。
+    expect(deviceOpencodeConfigPath("opencode_673", home, true))
+      .toBe(join(home, ".clawmessenger", "opencode-device-opencode_673-lean.json"));
+    // 没有 agent 名的老调用方：整机一份，同样带后缀。
+    expect(deviceOpencodeConfigPath(undefined, home, true))
+      .toBe(join(home, ".clawmessenger", "opencode-device-lean.json"));
+  });
+});

@@ -123,6 +123,17 @@ export interface RunAgentTurnOpts {
   // 内部用：serve 模式起不来时退回 run --format json，递归进来时置 true，
   // 避免二次分流。外部调用方不该传。
   disableServerMode?: boolean;
+  /**
+   * 精简回合：换掉 opencode `build` agent 的系统提示、关掉全部工具，只给
+   * 「问一句、拿一段 JSON」的短回合用（当前只有角色推荐）。
+   *
+   * 实测（quukk/glm-5.2，2026-11-12）：默认 29,397 输入 token / 21~28s，
+   * 精简后 1,722 token / 13~18s —— build 的系统提示、15 个工具定义、技能清单
+   * 与推荐任务毫无关系，却要每轮重新 prefill。见 DeviceOpencodeConfigOpts.lean。
+   */
+  lean?: boolean;
+  /** 本轮上游用量（输入/输出 token）：目前只有 serve 模式能拿到，用于排查"为什么慢"。 */
+  onUsage?: (usage: { inputTokens: number; outputTokens: number; reasoningTokens: number }) => void;
 }
 
 // Agents known to reject or hang on stdin-mode invocation get an argv
@@ -182,10 +193,14 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // 模型选择必须走 `CODEBUDDY_MODEL` 环境变量（见 agentRuntimeEnv）。这里只留
   // `--port 0`：不给它固定端口，多个 agent 实例并发时会撞 EADDRINUSE。
   if (name === "codebuddy") return ["--port", "0"];
-  // kimi 的 `-m` 只认自己的模型别名（`kimi-code/kimi-for-coding` 这类），
-  // 我们的 `provider/model` 路由会被它当成未知模型拒绝。模型选择交给它自己的
-  // 配置（`default_model`），这里不注入。
-  if (name === "kimi") return [];
+  // kimi 的 `-m/--model` 收的是它自己的**模型 alias**，而 alias 的形状就是
+  // `quukk/glm-5.2` 这种 `provider/model` 路由 —— 2026-11 实测
+  // `kimi provider list --json` 的 models key 逐条就是这个 alias，
+  // `kimi --help` 也写明 `-m, --model <model>` 的默认值来自 config.toml 的
+  // `default_model`（同一个 alias）。所以整段路由直接注入。
+  // （旧代码「kimi 一律不注入」是 ACP 目录时代的保守假设，已被 provider list
+  // 的实测推翻：它自家别名恰好就是我们存的路由形状。）
+  if (name === "kimi") return model ? ["-m", model] : [];
   if (!model) return [];
   const route = splitModelRoute(model);
   // qwen 走 OpenAI 兼容网关，`--model` 只接受上游的裸模型名（`quukk/glm-5.2`
@@ -195,6 +210,19 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // 策略（提示词走 stdin），但 `--model` 是它确实支持的参数，守卫先行会把
   // stdin 模式下选好的模型静默丢掉。
   if (name === "qwen") {
+    return route ? ["--model", route.model] : ["--model", model];
+  }
+  // claude：`--model` 收它自己 catalog 解析出的**裸模型 id**（claude_models.go:
+  // 340-344 —— daemon 落库并传给 --model 的是裸 ResolvedModel，如
+  // `claude-sonnet-4-6`）。设备端静态目录（model-static-catalogs.ts）的 provider
+  // `anthropic` 只是给前端分组的，注入前必须剥掉，否则整段路由会被当成未知模型。
+  if (name === "claude") {
+    return route ? ["--model", route.model] : ["--model", model];
+  }
+  // agy（Antigravity）：1.0.6 起 --model 收 `agy models` 列出的裸 id
+  // （models.go:2407-2452 parseAntigravityModels —— 目录条目没有 provider 字段）。
+  // 设备端目录用自造的 `agy` 前缀分组（parseAgyModelsList），注入前同样剥掉。
+  if (name === "agy") {
     return route ? ["--model", route.model] : ["--model", model];
   }
   // 没有 argv 策略的 agent 会退化成「裸进程名」（buildAgentArgs 返回 []），给它
@@ -223,11 +251,18 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   if (name === "pi" || name === "omp") {
     return ["--model", model];
   }
+  // grok：CLI 的模型 id 是**连字符**形式（`grok models` 实测输出 `quukk-glm-5.2`、
+  // 裸 `grok-4.7`），`-m` 也按这个形状收。目录侧为了让前端存得下必须转成
+  // 斜杠路由（wire 协议只认单斜杠），注入时再用 grokCliModelId 转回去 ——
+  // 转换规则见那里的注释（2026-11 实测，`grok models` exit 0）。
+  if (name === "grok") {
+    return model ? ["-m", grokCliModelId(model)] : [];
+  }
   // dsh：协议的模型字段是 {provider,id} 对（dsh.go:36-40），JSONL 命令在
   // stdin 里拼装（runAgentTurn 的 dsh 专用分支），argv 里没有 --model 这个
   // 旗标——这里返回空，模型信息由 stdin 命令携带。
   if (name === "dsh") return [];
-  // B 类第二批（2026-11-10）：deveco / mcode / qwenpaw / dim / grok /
+  // B 类第二批（2026-11-10）：deveco / mcode / qwenpaw / dim /
   // reasonix / zeroclaw 的模型选择都走各家自己的账户或配置文件（deveco 的
   // auth.json、kimi 同款目录型配置、zeroclaw 的 [providers.models.custom]），
   // 我们的 provider/model 路由它们并不认识——deveco 的 -m 虽然自称收
@@ -236,10 +271,43 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // 模型跟随各家默认配置。
   if (
     name === "deveco" || name === "mcode" || name === "qwenpaw"
-    || name === "dim" || name === "grok" || name === "reasonix"
+    || name === "dim" || name === "reasonix"
     || name === "zeroclaw" || name === "codearts"
   ) return [];
   return ["--model", model];
+}
+
+// grok 的目录 ↔ 注入 id 形状转换（**严格双射**，功能永远正确）。
+//
+//   `grok models` 输出      wire 目录（前端要单斜杠）   注入 `-m`
+//   quukk-glm-5.2     →     quukk/glm-5.2          →  quukk-glm-5.2
+//   grok-4.7          →     grok/4.7               →  grok-4.7
+//
+// 规则：第一个 `-` 之前是 provider，其余是 model；注入用 `route.replace("/","-")`，
+// 与原 CLI id 逐字符相同。**不引入 xai 之类的前缀白名单** —— 白名单不可靠，而双射
+// 不需要它。
+//
+// 已知展示局限（可接受，不影响功能）：裸 id `grok-4.7` 在面板里显示为
+// `grok/4.7` 而不是 `xai/grok-4.7`；注入出去的仍是 CLI 认的 `grok-4.7`。
+//
+// 没有 `-` 的 id 在双射里表示不了（`a` ↔ `?/a` 无法既保住原 id 又满足单斜杠
+// 路由），实测输出里没有这种 id，遇到就跳过。
+
+/** wire 路由 → grok CLI 的连字符模型 id（`a/b` → `a-b`；无斜杠时原样返回）。 */
+export function grokCliModelId(model: string): string {
+  const route = splitModelRoute(model);
+  if (!route) return model;
+  return `${route.provider}-${route.model}`;
+}
+
+/** grok CLI 的连字符模型 id → wire 路由（`a-b` → `a/b`）；无法转换时返回 null。 */
+export function grokRouteFromCliModelId(cliId: string): string | null {
+  const raw = cliId.trim();
+  if (!raw) return null;
+  const dash = raw.indexOf("-");
+  if (dash < 1 || dash === raw.length - 1) return null;
+  const candidate = `${raw.slice(0, dash)}/${raw.slice(dash + 1)}`;
+  return MODEL_ROUTE_RE.test(candidate) ? candidate : null;
 }
 
 // Subprocess environment overrides per agent. Returns the full env to hand to
@@ -500,7 +568,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 全链路复用 stream-json 管线（Kimi Code 是 Claude Code 协议族的实现，
   // 事件形状同构，claude 分支直接消化）。仍不注入 --model（它的 -m 只认自家
   // 别名，见 buildModelArgs 的 kimi 分支）。
-  kimi: (prompt) => ["-p", prompt, "--output-format", "stream-json"],
+  kimi: (prompt, model) => [
+    "-p", prompt, "--output-format", "stream-json",
+    // 模型选择：`-m` 收 provider/model alias（见 buildModelArgs 的 kimi 分支，
+    // 2026-11 用 `kimi provider list --json` 实测确认）。
+    ...buildModelArgs("kimi", model),
+  ],
   // traecli：官方一次性 headless 入口是 `exec [PROMPT] --json`（docs.trae.cn
   // cli_command-line-parameters），事件流与它的 ACP 模式同源。不为它引入
   // `traecli acp serve` 的 ACP 会话管理（报告 §4：优先一次性 headless）。
@@ -612,8 +685,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // grok（xAI Grok Build）：`-p/--single <PROMPT>` 官方 headless 单轮
   // （grok --help：Single-turn prompt. Prints the response to stdout and
   // exits），默认 --output-format plain 即纯正文。裸 `grok [PROMPT]` 是 TUI。
-  grok: (prompt) => [
+  grok: (prompt, model) => [
     "-p", prompt,
+    // 模型选择：`-m` 收连字符 id（`quukk-glm-5.2`），由 buildModelArgs 的 grok
+    // 分支从 wire 路由转换而来（2026-11 实测 `grok models` 的输出形状）。
+    ...buildModelArgs("grok", model),
   ],
   // reasonix：`-p/--print <task>` 官方非交互入口，--output-format text 输出
   // 纯正文（json/stream-json 的事件形状未抓包，先不上解析）。裸 `reasonix`
@@ -1062,7 +1138,20 @@ export interface RunAgentCommandOpts {
   timeoutMs?: number;
   maxOutputBytes?: number;
   cwd?: string;
+  /**
+   * 「输出够了就收工」判据（可选）。每收到一段 stdout 就用**累计输出**调一次，
+   * 返回 true 即立刻 resolve 并杀掉子进程。
+   *
+   * 为什么必须有：有的列举命令打完帧**不会自己退出** —— 2026-11 实测
+   * `dsh --profile multica --list-models` 输出一行完整的 `{"v":1,"type":"models",…}`
+   * 后进程一直挂着，只能等到我们自己的超时（exit 124），结果是拿着超时当失败、
+   * 目录永远为空。等 EOF 的实现（照 Go 的 scanner 写法）在设备端是错的。
+   */
+  stopWhen?: OutputStopPredicate;
 }
+
+/** `stopWhen` 判据：入参是迄今为止累计的 stdout。 */
+export type OutputStopPredicate = (partialStdout: string) => boolean;
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_COMMAND_MAX_OUTPUT_BYTES = 256 * 1024;
@@ -1102,11 +1191,20 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
     }, timeoutMs);
 
     child.stdout.on("data", (buf: Buffer) => {
-      if (totalBytes >= maxBytes) return;
+      if (settled || totalBytes >= maxBytes) return;
       const room = maxBytes - totalBytes;
       const slice = buf.length > room ? trimIncompleteUtf8Tail(buf.subarray(0, room)) : buf;
       chunks.push(slice);
       totalBytes += slice.length;
+      // 早退：命中判据就拿着已有输出收工，并杀掉这个不肯自己退出的子进程
+      // （dsh 的 --list-models 就是这种）。
+      const snapshot = Buffer.concat(chunks).toString("utf8");
+      if (opts.stopWhen && opts.stopWhen(snapshot)) {
+        settle(() => {
+          killProcessTree(child);
+          resolve(snapshot);
+        });
+      }
     });
     child.stderr.on("data", (buf: Buffer) => {
       stderr = (stderr + buf.toString("utf8")).slice(-2000);
@@ -1701,11 +1799,19 @@ function envFlag(raw: string | undefined): boolean {
 export function deviceOpencodeConfigPath(
   agentName: string | undefined,
   home: string = homedir(),
+  /**
+   * 精简回合专用配置（见 DeviceOpencodeConfigOpts.lean）。
+   *
+   * 必须是**另一份文件**：精简回合把 `agent.build` 的系统提示换成了"只输出 JSON"，
+   * 若与聊天轮次共用同一份，私聊/群聊的 agent 会突然不会用工具、也不会按人格说话。
+   */
+  lean = false,
 ): string {
   const base = join(home, ".clawmessenger");
+  const suffix = lean ? "-lean" : "";
   // 没有 agent 名（老调用方 / 手工探测）时退回整机一份的老路径，行为与升级前一致。
-  if (!agentName) return join(base, "opencode-device.json");
-  return join(base, `opencode-device-${sanitizeAgentId(agentName)}.json`);
+  if (!agentName) return join(base, `opencode-device${suffix}.json`);
+  return join(base, `opencode-device-${sanitizeAgentId(agentName)}${suffix}.json`);
 }
 
 interface DeviceConfigInput {
@@ -1723,6 +1829,8 @@ interface DeviceConfigInput {
   behaviorPrompt?: string;
   /** 整机是否处于「文件读写禁止」限制态。 */
   fsRestricted?: boolean;
+  /** 精简回合（角色推荐）：换掉 build 系统提示并关掉全部工具，见 DeviceOpencodeConfigOpts.lean。 */
+  lean?: boolean;
   home?: string;
 }
 
@@ -1740,9 +1848,12 @@ interface DeviceConfigInput {
  */
 function opencodeServeEnv(input: DeviceConfigInput = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  if (!envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG)
-    && !env.OPENCODE_CONFIG
-    && !env.CLAWMESSENGER_OPENCODE_CONFIG) {
+  const fullConfig = envFlag(env.CLAWMESSENGER_OPENCODE_FULL_CONFIG);
+  const userManaged = Boolean(env.OPENCODE_CONFIG || env.CLAWMESSENGER_OPENCODE_CONFIG);
+  // 精简回合即使 operator 自己指定了 OPENCODE_CONFIG 也要派生：那一份只是"源"，
+  // 我们派生出 `-lean` 的副本（不动原件），否则推荐回合又回到 2.9 万 token 的
+  // build 系统提示上。FULL_CONFIG 是显式豁免，照旧不派生。
+  if (!fullConfig && (input.lean || !userManaged)) {
     const config = ensureDeviceOpencodeConfig(env, input);
     if (config) env.OPENCODE_CONFIG = config;
   }
@@ -1780,9 +1891,10 @@ function ensureDeviceOpencodeConfig(
   const built = buildDeviceOpencodeConfig(raw, {
     fsRestricted: input.fsRestricted === true,
     instructions: behaviorFile ? [behaviorFile] : [],
+    ...(input.lean ? { lean: true } : {}),
   });
   if (!built) return null;
-  const target = deviceOpencodeConfigPath(input.agentName, home);
+  const target = deviceOpencodeConfigPath(input.agentName, home, input.lean === true);
   try {
     const existing = existsSync(target) ? readFileSync(target, "utf8") : null;
     // 内容没变就不重写：既省 IO，也避免每轮都触发 opencode 重新加载配置。
@@ -1862,6 +1974,9 @@ async function runOpenCodeServerTurn(
       // 运维轮次的行为规范在 ops workdir 的 AGENTS.md 里，这里不掺和。
       ...((opts.agentIdentity ?? opts.agentName) === "ops" ? {} : { behaviorPrompt: opts.behaviorPrompt ?? "" }),
       ...(opts.fsRestricted ? { fsRestricted: true } : {}),
+      // 角色推荐这类短回合：换掉 build 的系统提示、关掉全部工具（实测输入
+      // token 29,397 → 1,722，单轮 27s → 14s）。见 DeviceOpencodeConfigOpts.lean。
+      ...(opts.lean ? { lean: true } : {}),
     }),
   });
 
@@ -1928,6 +2043,7 @@ async function runOpenCodeServerTurn(
       // 字符上限按字节上限的一半估：中文 UTF-8 三字节，留余量不误杀长回答。
       maxTextChars: Math.max(1, Math.floor(hardLimit / 2)),
     });
+    if (result.usage) opts.onUsage?.(result.usage);
     if (!result.sawDelta) {
       // serve 起来了但没有增量事件：多半是旧版 opencode。内容不丢，只是不流。
       // 正文事件的两种形态都要点到：1.x 的 serve 发 `message.part.delta`，
@@ -2092,7 +2208,10 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     // 它的身份不是 "opencode"，不会被对话 agent 的受限配置牵连。
     // 其它 agent 维持原语义：只在「受限或有行为规范」时才派生。
     const wantDeviceConfig = permissionIdentity === "ops"
-      || (permissionIdentity === "opencode" && (fsRestricted || opts.behaviorPrompt));
+      || (permissionIdentity === "opencode" && (fsRestricted || opts.behaviorPrompt))
+      // 精简回合必须挂上 `-lean` 那份配置，否则退回 run 时又会拿到 2.9 万 token
+      // 的 build 系统提示（用户配置里带 plugin/MCP 时这轮还会更慢）。
+      || (opts.lean === true && permissionIdentity === "opencode");
     const deviceConfig = wantDeviceConfig
       ? ensureDeviceOpencodeConfig(process.env, {
         ...(permissionIdentity ? { agentName: permissionIdentity } : {}),
@@ -2101,6 +2220,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         // 运维的行为规范在 ops workdir 的 AGENTS.md，这里不碰。
         ...(permissionIdentity === "ops" ? {} : { behaviorPrompt: opts.behaviorPrompt ?? "" }),
         ...(fsRestricted ? { fsRestricted: true } : {}),
+        ...(opts.lean ? { lean: true } : {}),
       })
       : null;
     const spawnEnv = deviceConfig

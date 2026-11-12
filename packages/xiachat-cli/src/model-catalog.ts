@@ -1,4 +1,9 @@
-import { stripAnsiCodes } from "./agents.js";
+import {
+  grokRouteFromCliModelId,
+  stripAnsiCodes,
+  type OutputStopPredicate,
+} from "./agents.js";
+import { agentModelCapability } from "./agent-model-capabilities.js";
 import { isModelRoute } from "./agent-default-model.js";
 import {
   probeProviderModels,
@@ -6,6 +11,7 @@ import {
   type AgentConfig,
   type ProviderEndpoint,
 } from "./model-providers.js";
+import { staticModelCatalogFor } from "./model-static-catalogs.js";
 
 // Protocol v2 model-catalog responder for the web's 设备管理 → 默认模型 panel.
 //
@@ -49,12 +55,41 @@ export interface ModelListSpec {
   argv: string[];
   timeoutMs: number;
   maxOutputBytes: number;
+  /**
+   * 「输出够了就收工」判据（可选，透传给 runAgentCommand）。dsh 的列举命令
+   * 打完帧**不会自己退出**（2026-11 实测），等 EOF 只能等到超时 → 空目录。
+   */
+  stopWhen?: OutputStopPredicate;
 }
 
 // Agents whose CLI can enumerate models as `provider/model` routes — the only
 // shape the web's provider+model dropdowns can persist and hand back to the
 // agent. openclaw needs the `list` subcommand (`openclaw models` alone prints
 // status, not the catalog).
+//
+// Every entry must be mirrored in agent-model-capabilities.ts with
+// catalogSource 'cli' — that table is the single source of truth for "where a
+// catalog comes from" and "can a picked model actually be injected".
+//
+//   dsh  — `--profile multica --list-models` (2026-11 真机实测；**不能带
+//          --stdio**，二者互斥)。输出是一行完整的 JSONL 帧
+//          `{"v":1,"type":"models","models":[…]}` —— 注意版本字段名是 `v` 不是
+//          `version`。这条命令打完帧**不会自己退出**，所以必须配 stopWhen
+//          （dshModelsFrameComplete）命中即收工，不能等 EOF。解析见
+//          parseDshModelListJsonl；注入走 stdin 的 execute 帧。
+//   agy  — `agy models` 是本地枚举（models.go:2407-2425，MUL-3125）。输出是
+//          `id\tlabel` 行、无 provider 列，parseAgyModelsList 归到虚拟 provider
+//          `agy`，buildModelArgs 注入时剥掉。
+//   pi   — `pi --list-models`（models.go:1232-1307，兼容 `provider:model` 与多列
+//          表格）。parsePiModelsList 解析。
+//   grok — `grok models`（2026-11 真机实测，exit 0，人类可读文本）：`- <id>` /
+//          `* <id> (default)` 行 + 头部 `Default model: <id>`；id 是**连字符**
+//          形式（`quukk-glm-5.2`）或裸 id（`grok-4.7`）。parseGrokModelsList 负责
+//          转成单斜杠路由（wire 硬要求），注入侧 grokCliModelId 转回去。
+//   kimi — `kimi provider list --json`（2026-11 真机实测，exit 0）：models 的 key
+//          就是 `provider/model` 路由，逐项还带 displayName。⚠️ 同一份输出里的
+//          providers.*.apiKey 是明文真实密钥 —— parseKimiProviderListJson **只读
+//          models 段**，不打印、不透传任何 providers 内容。
 //
 // NOTE: none of these lists is complete on its own. openclaw's covers the
 // provider's configured/OAuth catalogue but not the gateway's pass-through
@@ -64,6 +99,16 @@ export interface ModelListSpec {
 const AGENT_MODEL_LIST: Readonly<Record<string, ModelListSpec>> = {
   opencode: { argv: ["models"], timeoutMs: 30_000, maxOutputBytes: 256 * 1024 },
   openclaw: { argv: ["models", "list", "--json"], timeoutMs: 60_000, maxOutputBytes: 1024 * 1024 },
+  dsh: {
+    argv: ["--profile", "multica", "--list-models"],
+    timeoutMs: 10_000,
+    maxOutputBytes: 256 * 1024,
+    stopWhen: dshModelsFrameComplete,
+  },
+  agy: { argv: ["models"], timeoutMs: 10_000, maxOutputBytes: 256 * 1024 },
+  pi: { argv: ["--list-models"], timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
+  grok: { argv: ["models"], timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
+  kimi: { argv: ["provider", "list", "--json"], timeoutMs: 15_000, maxOutputBytes: 512 * 1024 },
 };
 
 export function modelListSpec(agentName: string | undefined): ModelListSpec | null {
@@ -226,6 +271,249 @@ export function parseOpenclawModelListJson(stdout: string): DiscussionModelCatal
   return catalogFromRoutes(routes, defaultModel, names);
 }
 
+// dsh `--profile multica --list-models`（2026-11 真机实测，不能带 --stdio）。
+//
+// 输出是一行完整的 JSONL 帧：
+//   {"v":1,"type":"models","models":[
+//     {"id":"quukk/glm-5.2","label":"GLM 5.2","provider":"Quukk AI","default":true,
+//      "thinking":{"supported_levels":[…],"default_level":"high"}}, …]}
+//
+// 三个关键点（踩过的坑，逐条钉住）：
+//   1. 版本字段名是 `v`（值 1），不是 `version`；
+//   2. **`id` 本身已经是 `provider/model` 斜杠路由**，而 `provider` 字段是
+//      **展示名**（"Quukk AI"/"DeepSeek"，含空格）—— 直接拿它当 provider id
+//      会让前端 normalizeCatalog 判非法。所以 provider id 取 `id` 的第一个
+//      斜杠前段，展示名单独记下来覆盖 group name；
+//   3. `thinking` 档位在 wire 协议里没有字段（白名单只有 id/name），丢弃。
+export function parseDshModelListJsonl(stdout: string): DiscussionModelCatalog {
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  const providerNames = new Map<string, string>();
+  let defaultModel: string | null = null;
+  for (const rawLine of stdout.split(/\r?\n/).slice(0, MAX_LINES_SCANNED)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let frame: unknown;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      continue; // 半行 / 非 JSON 噪声跳过，不当作损坏
+    }
+    if (typeof frame !== "object" || frame === null) continue;
+    const record = frame as Record<string, unknown>;
+    // 版本不符的帧整行丢弃（与流解析器同一降级策略，agents.ts DSH_PROTOCOL_VERSION）。
+    if (record.v !== 1 || record.type !== "models" || !Array.isArray(record.models)) continue;
+    for (const item of record.models) {
+      if (typeof item !== "object" || item === null) continue;
+      const entry = item as Record<string, unknown>;
+      const route = typeof entry.id === "string" ? entry.id.trim() : "";
+      if (!ROUTE_RE.test(route)) continue;
+      if (!routes.includes(route)) routes.push(route);
+      const label = typeof entry.label === "string" && entry.label.trim() !== ""
+        ? entry.label.trim().slice(0, 500)
+        : route.split("/")[1];
+      if (!names.has(route)) names.set(route, label);
+      const display = typeof entry.provider === "string" ? entry.provider.trim() : "";
+      const providerId = route.split("/")[0];
+      if (display && display.length <= 500 && !providerNames.has(providerId)) {
+        providerNames.set(providerId, display);
+      }
+      if (entry.default === true && !defaultModel) defaultModel = route;
+    }
+  }
+  const catalog = catalogFromRoutes(routes, defaultModel, names);
+  // catalogFromRoutes 只能用 provider id 当展示名；dsh 的帧里有真正的展示名
+  // （"Quukk AI"），在这里补上（finalizeCatalog 已经把 id 收口过了）。
+  return {
+    defaultModel: catalog.defaultModel,
+    providers: catalog.providers.map((provider) => ({
+      ...provider,
+      name: providerNames.get(provider.id) ?? provider.name,
+    })),
+  };
+}
+
+/**
+ * dsh 列举命令的「够用了」判据：累计输出里出现一条完整的 `v:1,type:"models"`
+ * 帧（且帧里有模型）即视为完成。
+ *
+ * 该命令打完帧**不会退出**（2026-11 实测，只能等 timeout 被杀），所以
+ * runAgentCommand 必须靠这条判据早退，否则永远拿不到目录。
+ */
+export function dshModelsFrameComplete(partialStdout: string): boolean {
+  for (const rawLine of partialStdout.split(/\r?\n/).slice(0, MAX_LINES_SCANNED)) {
+    const line = rawLine.trim();
+    if (!line || line[0] !== "{") continue;
+    let frame: unknown;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof frame !== "object" || frame === null) continue;
+    const record = frame as Record<string, unknown>;
+    if (record.v !== 1 || record.type !== "models") continue;
+    if (Array.isArray(record.models) && record.models.length > 0) return true;
+  }
+  return false;
+}
+
+// `grok models`（2026-11 真机实测，exit 0，人类可读文本，不是 JSON）：
+//
+//   Model 'quukk-glm-5.2' is using its own API key.     ← 噪声，跳过
+//
+//   Default model: quukk-glm-5.2                        ← 默认值（最稳的来源）
+//
+//   Available models:
+//     - grok-4.7                                        ← 裸 id
+//     * quukk-glm-5.2 (default)                         ← 当前默认标记
+//     - quukk-kimi-k2-7-code
+//
+// CLI 的 id 是**连字符**形状，wire 协议要求单斜杠 —— 用 grokRouteFromCliModelId
+// 转换。规则是**严格双射**：第一个 `-` 之前为 provider，其余为 model
+// （`quukk-glm-5.2` → `quukk`+`glm-5.2`；裸 `grok-4.7` → `grok`+`4.7`）。
+// 因为「provider-model」能逐字符还原，注入侧 grokCliModelId 是它的逆函数。
+// **不用前缀白名单猜 `xai`** —— 白名单不可靠，双射不需要它。
+// 已知展示局限（可接受）：裸 id `grok-4.7` 在面板里显示为 `grok/4.7`，
+// 注入出去的仍是 CLI 认的 `grok-4.7`，功能不受影响。
+export function parseGrokModelsList(stdout: string): DiscussionModelCatalog {
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  let defaultModel: string | null = null;
+  for (const rawLine of stripAnsiCodes(stdout).split(/\r?\n/).slice(0, MAX_LINES_SCANNED)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const labelled = /^default model\s*:\s*(\S+)/i.exec(line);
+    if (labelled) {
+      const route = grokRouteFromCliModelId(labelled[1]);
+      if (route && !routes.includes(route)) routes.push(route);
+      if (route) {
+        defaultModel = route;
+        names.set(route, labelled[1]);
+      }
+      continue;
+    }
+    const bullet = /^[-*]\s+(\S+)/.exec(line);
+    if (!bullet) continue; // 表头 / 噪声行（"Model '…' is using its own API key." 等）
+    const cliId = bullet[1];
+    const route = grokRouteFromCliModelId(cliId);
+    if (!route) continue;
+    if (!routes.includes(route)) routes.push(route);
+    names.set(route, cliId);
+    // 列表里的 `* … (default)` 标记与头部 Default model 行一致，任一命中即可。
+    if (line.startsWith("*") && /\(default\)/i.test(line) && !defaultModel) defaultModel = route;
+  }
+  return catalogFromRoutes(routes, defaultModel, names);
+}
+
+// `kimi provider list --json`（2026-11 真机实测，exit 0）：
+//
+//   { "providers": { "quukk": { …, "apiKey": "sk-…" } },   ← ⚠️ 明文真实密钥
+//     "models": { "quukk/glm-5.2": { "provider":"quukk","model":"glm-5.2",
+//                                     "displayName":"GLM 5.2", … }, … } }
+//
+// models 的 key 本身就是 `provider/model` 路由，逐项还带 displayName —— 直接映射，
+// 不需要猜。**只读 models 段**：providers 段（含 apiKey）一律不读、不打印、
+// 不进 catalog（安全红线，测试用假值）。
+export function parseKimiProviderListJson(stdout: string): DiscussionModelCatalog | null {
+  const start = stdout.indexOf("{");
+  if (start < 0) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.slice(start));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const models = (parsed as { models?: unknown }).models;
+  if (typeof models !== "object" || models === null || Array.isArray(models)) return null;
+
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  for (const [rawKey, value] of Object.entries(models as Record<string, unknown>)) {
+    const key = rawKey.trim();
+    // Provider 与 model 两侧都从 key 推导；entry.provider/model 只在 key 不合法时
+    // 作为兜底（它们的组合仍是同一条路由）。
+    let route: string | null = ROUTE_RE.test(key) ? key : null;
+    if (!route && typeof value === "object" && value !== null) {
+      const entry = value as Record<string, unknown>;
+      const provider = typeof entry.provider === "string" ? entry.provider.trim() : "";
+      const model = typeof entry.model === "string" ? entry.model.trim() : "";
+      const candidate = provider && model ? `${provider}/${model}` : "";
+      if (candidate && ROUTE_RE.test(candidate)) route = candidate;
+    }
+    if (!route || routes.includes(route)) continue;
+    routes.push(route);
+    const displayName = typeof value === "object" && value !== null
+      ? (value as Record<string, unknown>).displayName
+      : undefined;
+    const fallback = route.split("/")[1];
+    if (typeof displayName === "string" && displayName.trim() !== "") {
+      names.set(route, displayName.trim().slice(0, 500));
+    } else {
+      names.set(route, fallback);
+    }
+  }
+  if (routes.length === 0) return null;
+  // provider list 不报当前默认（kimi 的默认在 config.toml 的 default_model 里，
+  // 设备端没有那份解析器），defaultModel 交给上层兜底。
+  return catalogFromRoutes(routes, null, names);
+}
+
+// `agy models` -> `id\tlabel` lines (agy 1.1.11+) or one bare id per line
+// (older builds). Items carry no provider (models.go:2427-2452
+// parseAntigravityModels), so every id is grouped under the synthetic `agy`
+// provider; buildModelArgs strips that prefix back off when injecting.
+export function parseAgyModelsList(stdout: string): DiscussionModelCatalog {
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  for (const rawLine of stripAnsiCodes(stdout).split(/\r?\n/).slice(0, MAX_LINES_SCANNED)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const [idField, labelField] = line.split("\t");
+    const id = idField.trim();
+    if (!id) continue;
+    const route = `agy/${id}`;
+    if (!ROUTE_RE.test(route) || routes.includes(route)) continue;
+    routes.push(route);
+    const label = labelField?.trim();
+    if (label) names.set(route, label.slice(0, 500));
+  }
+  return catalogFromRoutes(routes, null, names);
+}
+
+// `pi --list-models` -> either legacy `provider:model` rows or a multi-column
+// `provider model context …` table; both normalize to `provider/model`
+// (models.go:1249-1308 parsePiModels). Diagnostic lines (pi interleaves
+// "Warning: No models match pattern …" prose with the catalog) and the
+// `provider` header row are skipped so prose tokens are never coined into
+// bogus models (#3729).
+export function parsePiModelsList(stdout: string): DiscussionModelCatalog {
+  const routes: string[] = [];
+  for (const rawLine of stripAnsiCodes(stdout).split(/\r?\n/).slice(0, MAX_LINES_SCANNED)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // Prose diagnostics: `Warning: …` / the unmatched-pattern message itself.
+    if (/^warning\b/i.test(line) || /no models match/i.test(line)) continue;
+    const fields = line.split(/\s+/);
+    const first = fields[0];
+    if (/^provider$/i.test(first)) continue; // table header
+    let route: string;
+    if (first.includes(":") || first.includes("/")) {
+      // Legacy `provider:model` — normalize the first colon to a slash. Kept
+      // to this branch so a table row's model column never gets rewritten.
+      route = first.replace(":", "/");
+    } else if (fields.length >= 2) {
+      route = `${first}/${fields[1]}`;
+    } else {
+      continue;
+    }
+    if (!ROUTE_RE.test(route) || routes.includes(route)) continue;
+    routes.push(route);
+  }
+  return catalogFromRoutes(routes, null);
+}
+
 export function parseModelCatalogOutput(
   agentName: string | undefined,
   stdout: string,
@@ -234,6 +522,14 @@ export function parseModelCatalogOutput(
     const json = parseOpenclawModelListJson(stdout);
     if (json && json.providers.length > 0) return json;
   }
+  // dsh / agy / pi / grok / kimi 的输出形态与「文本里找 provider/model 路由」的
+  // 通用解析器不兼容（JSONL 帧 / 无 provider 的裸 id / 冒号分隔 / 连字符 id /
+  // JSON 信封），各自走专属解析器。
+  if (agentName === "dsh") return parseDshModelListJsonl(stdout);
+  if (agentName === "agy") return parseAgyModelsList(stdout);
+  if (agentName === "pi") return parsePiModelsList(stdout);
+  if (agentName === "grok") return parseGrokModelsList(stdout);
+  if (agentName === "kimi") return parseKimiProviderListJson(stdout) ?? EMPTY_MODEL_CATALOG;
   return parseModelListText(stdout);
 }
 
@@ -355,7 +651,16 @@ export function buildAgentDefaultModelResponse(
 
 export interface ModelCatalogLoaderOpts {
   agentName?: string;
-  runCommand: (argv: string[], timeoutMs: number, maxOutputBytes: number) => Promise<string>;
+  /**
+   * Runs one agent subcommand. `stopWhen`（可选，第 4 参）来自 ModelListSpec：
+   * 命令打完帧不肯退出时（dsh）靠它早退，实现可以忽略它。
+   */
+  runCommand: (
+    argv: string[],
+    timeoutMs: number,
+    maxOutputBytes: number,
+    stopWhen?: OutputStopPredicate,
+  ) => Promise<string>;
   // Reads the agent's own config (provider endpoints + configured default).
   // Defaults to the real readers; inject a stub to keep tests hermetic.
   readConfig?: (agentName: string | undefined) => AgentConfig | null;
@@ -377,6 +682,16 @@ export interface ModelCatalogLoader {
   warm(): void;
   /** Drop the cached catalog (call right after the default model is rewritten). */
   invalidate(): void;
+}
+
+/**
+ * 日志打码：runCommand 的失败信息里会夹带 agent 的原始 stderr/stdout，而
+ * `kimi provider list --json` 的输出里 providers.*.apiKey 是**明文真实密钥**
+ * （2026-11 实测）。日志只该说明「哪条命令失败」，不该顺手把密钥写进日志——
+ * 这里把 `sk-…` 形态的 token 统一打码。
+ */
+export function redactSecrets(text: string): string {
+  return text.replace(/\bsk-[A-Za-z0-9_-]{8,}/g, "sk-***");
 }
 
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
@@ -402,6 +717,21 @@ function groupsFromCatalog(catalog: DiscussionModelCatalog): GroupedProviders {
   return grouped;
 }
 
+/** UNION-merges a catalog into the grouped accumulator without shrinking it. */
+function mergeCatalogGroups(grouped: GroupedProviders, catalog: DiscussionModelCatalog): void {
+  for (const [id, group] of groupsFromCatalog(catalog)) {
+    const existing = grouped.get(id);
+    if (!existing) {
+      grouped.set(id, group);
+      continue;
+    }
+    for (const [modelId, name] of group.models) {
+      if (existing.models.size >= MAX_MODELS_PER_PROVIDER) break;
+      if (!existing.models.has(modelId)) existing.models.set(modelId, name);
+    }
+  }
+}
+
 // The web aborts after 8s, while `openclaw models list` alone takes ~10s on a
 // cold start, so a cache-warm path is required for anything beyond opencode.
 export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCatalogLoader {
@@ -414,12 +744,20 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
   let cachedAt = 0;
   let inflight: Promise<DiscussionModelCatalog> | null = null;
 
-  const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+  const describe = (err: unknown): string => redactSecrets(err instanceof Error ? err.message : String(err));
 
   // Never rejects: a failing CLI command or an unreachable endpoint degrades to
   // whatever we already know rather than taking the panel down with it.
   const resolveCatalog = async (): Promise<DiscussionModelCatalog> => {
     const config = readConfig(opts.agentName);
+    // 配置缺失不再静默：readAgentConfig 在文件不存在时返回 null、加载器不报错，
+    // 面板上就只剩「设备未返回可用模型目录」——这正是「看起来像故障」的成因。
+    // 把这个事实写进日志，运维排查时能直接看到是哪一环为空。
+    if (!config) {
+      opts.logger?.(
+        `model catalog: ${opts.agentName} has no readable provider config; relying on CLI/static sources`,
+      );
+    }
     const grouped: GroupedProviders = new Map();
     // 主人设置的默认模型压过 agent CLI 自身的 default_model：前者是显式意图，
     // 后者只是兜底。finalizeCatalog 还会把它收口一次 —— 不在目录里的值当没设过，
@@ -466,28 +804,41 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
     // 吸收抖动；真的超时/报错就退回声明清单，与旧行为等价，不会让面板变空。
     const hasDeclared = declaredAdded > 0;
 
+    // 静态兜底（agent-model-capabilities.ts 是准入闸门：modelInjection 'none'
+    // 的 agent 一律不进这里 —— 给一个选了不生效的目录比空态更糟）。它先落袋，
+    // 后面的 CLI / 端点 probe 只做并集追加，永远不会把它挤掉：面板因此在
+    // 「配置缺失 + CLI 失败 + probe 不通」三路全断时仍有最小可用目录。
+    const capability = agentModelCapability(opts.agentName);
+    const staticCatalog = capability.modelInjection === "none"
+      ? null
+      : staticModelCatalogFor(opts.agentName, {
+        hasProviderConfig: (config?.endpoints.length ?? 0) > 0,
+      });
+    if (staticCatalog && staticCatalog.providers.length > 0) {
+      mergeCatalogGroups(grouped, staticCatalog);
+      if (!defaultModel) defaultModel = staticCatalog.defaultModel;
+      opts.logger?.(
+        `model catalog: ${opts.agentName} + static fallback (${staticCatalog.providers.length} provider(s))`,
+      );
+    }
+
     if (spec) {
       const label = `${opts.agentName} ${spec.argv.join(" ")}`;
       const cliTimeoutMs = hasDeclared
         ? Math.min(spec.timeoutMs, DECLARED_CLI_TIMEOUT_MS)
         : spec.timeoutMs;
       try {
-        const stdout = await opts.runCommand(spec.argv, cliTimeoutMs, spec.maxOutputBytes);
+        const stdout = await opts.runCommand(
+          spec.argv,
+          cliTimeoutMs,
+          spec.maxOutputBytes,
+          spec.stopWhen,
+        );
         const fromCli = parseModelCatalogOutput(opts.agentName, stdout);
         // 并集而不是覆盖：同一个 provider 既在配置里声明了清单、CLI 又回报了
         // 一份时（opencode 两条路都会命中），覆盖会把配置里那份**更完整**的
-        // 清单缩成 CLI 那份子集。
-        for (const [id, group] of groupsFromCatalog(fromCli)) {
-          const existing = grouped.get(id);
-          if (!existing) {
-            grouped.set(id, group);
-            continue;
-          }
-          for (const [modelId, name] of group.models) {
-            if (existing.models.size >= MAX_MODELS_PER_PROVIDER) break;
-            if (!existing.models.has(modelId)) existing.models.set(modelId, name);
-          }
-        }
+        // 清单缩成 CLI 那份子集。静态兜底（上面已并入）同理不被挤掉。
+        mergeCatalogGroups(grouped, fromCli);
         if (!defaultModel) defaultModel = fromCli.defaultModel;
         opts.logger?.(`model catalog: ${label} -> ${fromCli.providers.length} provider(s)`);
       } catch (err) {

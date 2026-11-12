@@ -409,13 +409,16 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // Warm-up runs in the background so it never delays message dispatch.
   const catalogLoader = createModelCatalogLoader({
     agentName: opts.agentName,
-    runCommand: (argv, timeoutMs, maxOutputBytes) =>
+    runCommand: (argv, timeoutMs, maxOutputBytes, stopWhen) =>
       runAgentCommand({
         execPath: opts.agentExecPath,
         argv,
         timeoutMs,
         maxOutputBytes,
         cwd: opts.cwd,
+        // dsh 的 --list-models 打完帧不退出（2026-11 实测）：命中判据就收工，
+        // 不能等 EOF，否则只能等到超时、拿到一个空目录。
+        ...(stopWhen ? { stopWhen } : {}),
       }),
     // 面板上的"当前默认"必须显示主人设的那个值（而不是 agent CLI 自己配置里的），
     // 否则用户改完再打开面板又看到旧值，等于告诉他"没生效"。
@@ -593,6 +596,10 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
         // 角色推荐的「最新覆盖」靠它 kill 掉被顶替的那一轮（im.ts handleRoleRecommend）。
         ...(turnOpts?.signal ? { signal: turnOpts.signal } : {}),
+        // 精简回合（换掉 build 系统提示 + 关全部工具）：推荐这类"问一句拿一段
+        // JSON"的短回合用它，输入 token 从 2.9 万降到 1.7 千。
+        ...(turnOpts?.lean ? { lean: true } : {}),
+        ...(turnOpts?.onUsage ? { onUsage: turnOpts.onUsage } : {}),
       })),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
     // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
