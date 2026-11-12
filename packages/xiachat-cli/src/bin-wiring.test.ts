@@ -156,7 +156,11 @@ describe("状态目录迁移在启动链上无条件执行（QA 回归 P1）", (
       expect(readFileSync(join(legacyDir, "credentials.json"), "utf8")).toBe(creds);
       // 6) **行为证据**：命令真的读到了凭据，而不是「目录有了、数据没读」。
       expect(run.stdout).toContain("node: qa-node-1");
-      // 7) 告知用户数据搬走了（stderr，不污染 stdout 的版本闸门）。
+      // 7) 告知用户数据搬走了（stderr，不污染 stdout 的版本闸门），且**双语**：
+      //    设计 §2.1 要求中文，存量用户升级后第一句话就是它。两条断言分开写，
+      //    任何一半被改回单语都会立刻变红。
+      expect(run.stderr).toContain("已把配置迁移到");
+      expect(run.stderr).toContain("可作为回滚路径");
       expect(run.stderr).toContain("moved your data");
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -185,8 +189,9 @@ describe("状态目录迁移在启动链上无条件执行（QA 回归 P1）", (
       expect(second.stdout).toContain("node: qa-node-new");
       // marker 没被重写（说明没走第二次迁移）。
       expect(readFileSync(join(newDir, ".migrated-from-clawmessenger.json"), "utf8")).toBe(markerBefore);
-      // 第二次不该再提示「搬完了」。
+      // 第二次不该再提示「搬完了」——中英两半都要不在。
       expect(second.stderr).not.toContain("moved your data");
+      expect(second.stderr).not.toContain("已把配置迁移到");
       // 旧目录始终不动。
       expect(existsSync(join(legacyDir, "credentials.json"))).toBe(true);
     } finally {
@@ -209,6 +214,9 @@ describe("状态目录迁移在启动链上无条件执行（QA 回归 P1）", (
       expect(existsSync(join(explicit, "credentials.json"))).toBe(false);
       expect(existsSync(join(home, ".agentsbb"))).toBe(false);
       expect(run.stdout).toContain("not registered");
+      // 没有搬家动作就不该有搬家提示（中英两半都不许出现）。
+      expect(run.stderr).not.toContain("已把配置迁移到");
+      expect(run.stderr).not.toContain("moved your data");
       expect(existsSync(join(legacyDir, "credentials.json"))).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });

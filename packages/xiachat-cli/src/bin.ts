@@ -59,9 +59,14 @@ let stateMigrationNote: string | null = null;
 try {
   const migration = ensureStateHome();
   if (migration.migrated) {
+    // 双语：存量用户刚升级时看到的第一句话就是它，设计 §2.1 要求中文；
+    // 与垫片弃用提示（shim.ts）保持同一种「中文一行 + 英文一行」的版式。
+    // 两行都说清「旧目录原样保留 = 回滚路径」，用户才敢删新目录重来。
     // stderr：stdout 只留给命令输出（发布流水线的版本闸门读它）。
     stateMigrationNote =
-      `agentsbb: moved your data to ${migration.home} ` +
+      `agentsbb: 已把配置迁移到 ${migration.home}` +
+      `（旧的 ~/${LEGACY_HOME_DIR} 原样保留，可作为回滚路径）\n` +
+      `          moved your data to ${migration.home} ` +
       `(the old ~/${LEGACY_HOME_DIR} is left untouched — it is your rollback path).\n`;
   }
 } catch {
