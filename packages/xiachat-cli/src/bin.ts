@@ -8,6 +8,7 @@ import { XiachatApi } from "./api.js";
 import { defaultKeystorePath } from "./config.js";
 import { ensureInstalled, isLegacyExeName, isSeaExecutable, takeOverLegacy, upgradeTargetPath, type InstallResult } from "./install.js";
 import { applyStagedUpdate, cleanupStaleBackups, healInstall } from "./self-update.js";
+import { ensureStateHome, LEGACY_HOME_DIR } from "./paths.js";
 
 // ---------------------------------------------------------------- 旧名兼容转发
 //
@@ -32,6 +33,43 @@ if (process.platform === "win32" && isLegacyExeName(process.execPath, process.pl
     process.exit(forwarded.status ?? 1);
   }
 }
+
+// ---------------------------------------------------------------- 状态目录迁移
+//
+// 存量设备（v≤1.3.33）的数据在 `~/.clawmessenger`；改名后一切读写都走
+// `~/.agentsbb`（paths.ts 的 stateHome）。这一步**无条件**执行，且必须早于任何
+// 状态读写（keystore、user-models、answered-turns、logs…）。
+//
+// 为什么不能挂在「进程名是旧名」上（QA 回归 P1，真跑复现）：
+// 真实升级路径里进程名几乎都是**新名**，四种路径全都拿不到旧名 ——
+//   - POSIX `~/.local/bin/clawmessenger` 是 `exec agentsbb` 的壳脚本；
+//   - Windows 兼容副本 `clawmessenger.exe` 转发给同级 `agentsbb.exe`；
+//   - npm 全局升级、手动覆盖安装更不用说。
+// 挂条件的结果就是「日志已经写进 ~/.agentsbb/logs、界面却说 not registered」，
+// 因为旧 keystore 从未被读。
+//
+// 与 takeOverLegacy() 的分工：那边只管 exe / 服务名 / 旧自启的交接，用
+// `.took-over-legacy-install.json` 做幂等；这里只管数据搬家，幂等靠
+// `.migrated-from-clawmessenger.json`（见 paths.ts）。两者互不依赖，
+// 所以「不是旧 exe 名」不再是迁移的前置条件。
+//
+// 幂等且廉价：目录已存在 → 立刻返回，零 IO。失败则回退旧目录并把决定钉进 env
+// （paths.ts 里做），本进程后续读取与子进程都落在旧目录，下一轮启动重试。
+let stateMigrationNote: string | null = null;
+try {
+  const migration = ensureStateHome();
+  if (migration.migrated) {
+    // stderr：stdout 只留给命令输出（发布流水线的版本闸门读它）。
+    stateMigrationNote =
+      `agentsbb: moved your data to ${migration.home} ` +
+      `(the old ~/${LEGACY_HOME_DIR} is left untouched — it is your rollback path).\n`;
+  }
+} catch {
+  // 迁移本身永不因为「读不到 home」而挡住启动：paths.ts 内部已兜底，
+  // 这里再兜一层，保证入口在任何磁盘状态下都能进命令解析。
+  stateMigrationNote = null;
+}
+if (stateMigrationNote) process.stderr.write(stateMigrationNote);
 
 // A staged update — downloaded and checksum-verified by `agentsbb update`
 // on an earlier run — is swapped in here, before anything else starts. The

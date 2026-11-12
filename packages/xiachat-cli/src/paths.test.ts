@@ -100,7 +100,8 @@ describe("paths: state dir migration", () => {
   it("falls back to the legacy dir when the copy fails, so the device keeps working", () => {
     mkdirSync(legacyHome, { recursive: true });
     writeFileSync(join(legacyHome, "credentials.json"), "{}", "utf8");
-    const result = ensureStateHome({}, () => join(home, "user"), () => {
+    const env: NodeJS.ProcessEnv = {};
+    const result = ensureStateHome(env, () => join(home, "user"), () => {
       throw new Error("EPERM: locked by the legacy supervisor");
     });
     expect(result.fellBackToLegacy).toBe(true);
@@ -108,6 +109,10 @@ describe("paths: state dir migration", () => {
     expect(result.home).toBe(legacyStateHome(() => join(home, "user")));
     // 旧目录里的凭据原样可用（本机继续服务）。
     expect(existsSync(join(legacyHome, "credentials.json"))).toBe(true);
+    // 「回退」必须对后续所有读取生效：stateHome() 也要落在旧目录，否则后续
+    // keystore / user-models 全读那个空的新目录，用户看到「未登录」。
+    expect(stateHome(env)).toBe(result.home);
+    expect(env.AGENTSBB_HOME).toBe(result.home);
   });
 });
 

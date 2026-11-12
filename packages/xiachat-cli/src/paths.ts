@@ -25,6 +25,7 @@
 import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { cliVersion } from "./version.js";
 
 /** Legacy per-user state directory (v≤1.3.33). Kept for migration only. */
 // TODO(rebrand-retire): 移除于 v1.6+ —— 旧目录只读沉寂后此常量与迁移逻辑一并删除。
@@ -107,7 +108,9 @@ export function ensureStateHome(
       JSON.stringify({
         from: legacy,
         at: new Date().toISOString(),
-        cliVersion: process.env.AGENTSBB_VERSION ?? process.env.CLAWMESSENGER_VERSION ?? "",
+        // 记「哪个版本搬的」用于事后审计：走 cliVersion() 而不是读 env，这样
+        // 手工 `node dist/bin.js` 或测试环境里也有值（注入的版本常量兜底 package.json）。
+        cliVersion: cliVersion(),
       }, null, 2) + "\n",
       { mode: 0o600 },
     );
@@ -121,6 +124,13 @@ export function ensureStateHome(
       `agentsbb: migrating state dir from ${legacy} to ${home} failed, falling back to the legacy directory:`,
       err instanceof Error ? err.message : err,
     );
+    // 「回退」必须对**后续所有读取**生效，否则等于骗人：stateHome() 仍然会返回
+    // 那个刚建了一半的空新目录，keystore / user-models 全读不到，用户看到的是
+    // 「未登录」。所以把决定钉进 env —— stateHome() 的实现就是「有 override 就
+    // 用 override」，钉进去之后本进程后续的每次读取（以及它 spawn 的子进程，env
+    // 会继承）都落在旧目录，行为与改名前一模一样。下一轮启动时旧目录仍能作为
+    // 迁移源继续重试。
+    env.AGENTSBB_HOME = legacy;
     return { home: legacy, migrated: false, fellBackToLegacy: true };
   }
 }
