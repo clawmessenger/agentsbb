@@ -409,7 +409,17 @@ func (s *roundtableCreationService) validateCurrent(ctx context.Context, userID 
 		return roundtableValidated{}, roundtableErr(hostErr)
 	}
 	if rec.HostNodeID != host.nodeID || rec.HostAiUserID != host.aiUserID || rec.ConfigVersion != host.configVersion {
-		return roundtableValidated{}, roundtableErr("SYSTEM_HOST_OFFLINE")
+		// 推荐记录绑定的是**生成它那一刻**的主持配置基线（节点 / AI 账号 / config_version）。
+		// 管理端每保存一次主持配置（换模型、换节点、改提示词、改超时）都会顶 config_version，
+		// 之前那批角色随之作废 —— 但这里过去对外复用 SYSTEM_HOST_OFFLINE 且一行日志都不打，
+		// 于是「改完模型点开始讨论」看起来像「主持设备掉线」，实际设备一直在线、只需要重新推荐。
+		// 单独给码 + 落 Warn，把两侧版本号打出来（见 memory 2026-11-12 的排查）。
+		slog.Warn("rongcloud: 推荐记录与当前主持配置不一致，需重新推荐",
+			"recommendation_id", canonical.RecommendationID,
+			"rec_host_node_id", rec.HostNodeID, "host_node_id", host.nodeID,
+			"rec_host_ai_user_id", rec.HostAiUserID, "host_ai_user_id", host.aiUserID,
+			"rec_config_version", rec.ConfigVersion, "host_config_version", host.configVersion)
+		return roundtableValidated{}, roundtableErr("SYSTEM_HOST_CONFIG_CHANGED")
 	}
 	// 2. 提交的 role_id 集合必须与推荐一一对应。
 	recommendedIDs := map[string]bool{}

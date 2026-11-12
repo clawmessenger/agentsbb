@@ -293,7 +293,9 @@ func roundtableErrorResult(e *RoundtableError) commandResult {
 		"ROLE_DEVICE_DUPLICATED", "ROLE_DEVICE_NOT_OWNED", "ROLE_DEVICE_UNAVAILABLE",
 		"ROLE_NAME_DUPLICATED", "MODEL_NOT_AVAILABLE":
 		return commandResult{code: 400, message: e.Code, data: e.Data}
-	case "RECOMMENDATION_EXPIRED":
+	case "RECOMMENDATION_EXPIRED", "SYSTEM_HOST_CONFIG_CHANGED":
+		// 两者都是「这份推荐批次作废」，动作同一套：重新推荐。SYSTEM_HOST_CONFIG_CHANGED
+		// 过去混在 SYSTEM_HOST_OFFLINE（503）里，会把「改了主持配置」误报成「设备掉线」。
 		return commandResult{code: 410, message: e.Code, data: e.Data}
 	case "SYSTEM_HOST_NOT_CONFIGURED", "SYSTEM_HOST_DISABLED", "SYSTEM_HOST_OFFLINE",
 		"DISCUSSION_WORKFLOW_UNAVAILABLE":

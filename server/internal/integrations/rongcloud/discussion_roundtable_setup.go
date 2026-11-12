@@ -3,6 +3,7 @@ package rongcloud
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -920,7 +921,15 @@ func (rt *discussionRuntime) actionConfirmRoundtableSetup(ctx context.Context, c
 		return errResult(503, hostErr)
 	}
 	if rec.HostNodeID != host.nodeID || rec.HostAiUserID != host.aiUserID || rec.ConfigVersion != host.configVersion {
-		return errResult(503, "SYSTEM_HOST_OFFLINE")
+		// 同 discussion_roundtable.go 的 validateCurrent：这是「推荐批次的主持配置基线过期」，
+		// 不是设备掉线。管理端改一次主持配置就会顶版本，旧角色立刻作废；过去复用
+		// SYSTEM_HOST_OFFLINE 且静默返回，把用户和排查都引到「设备在线状态」上。
+		slog.Warn("discussion: setup 确认时推荐记录与当前主持配置不一致，需重新推荐",
+			"discussionId", row.DiscussionID, "recommendationId", recommendationID,
+			"rec_host_node_id", rec.HostNodeID, "host_node_id", host.nodeID,
+			"rec_host_ai_user_id", rec.HostAiUserID, "host_ai_user_id", host.aiUserID,
+			"rec_config_version", rec.ConfigVersion, "host_config_version", host.configVersion)
+		return errResult(410, "SYSTEM_HOST_CONFIG_CHANGED")
 	}
 	recommendedIDs := map[string]bool{}
 	var recommended []map[string]interface{}

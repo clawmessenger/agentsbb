@@ -697,6 +697,60 @@ func TestSetupConfirmFullFlow(t *testing.T) {
 
 // TestSetupLegacyPlanningRegression 旧五阶段回归：ensureDiscussion 传 planning
 // 时行为与改造前一致（initialStatus 非 configuring 一律回落 planning）。
+// TestSetupConfirmHostConfigChangedRejectsWithDedicatedCode 管理端改过主持配置
+// （config_version 被顶）后，旧推荐批次必须报独立错误码，而不是伪装成「主持离线」。
+//
+// 回归背景（2026-11-12 线上）：换模型把 config_version 从 18 顶到 26，之前那批角色
+// 全部作废，但 confirm 复用 SYSTEM_HOST_OFFLINE 且不打日志 —— 用户看到「主持离线」，
+// 排查方向被带偏到设备在线状态上，实际只需要重新推荐一批。
+func TestSetupConfirmHostConfigChangedRejectsWithDedicatedCode(t *testing.T) {
+	f := setupSetupFixture(t)
+	ctx := context.Background()
+	chatroomID, _ := f.createShell(t, "req-"+uniqueID("t"))
+
+	rolesJSON, _ := json.Marshal([]map[string]interface{}{{
+		"role_id": "role_x", "role_name": "分析师", "role_prompt": "分析数据",
+		"node_id": f.memberNode.NodeID,
+	}})
+	recID := "rec_" + uniqueID("t")
+	// 故意落后一个版本：host 配置是 "1"，推荐记录停在 "0"。
+	if _, err := f.queries.InsertRongCloudRoleRecommendation(ctx, db.InsertRongCloudRoleRecommendationParams{
+		RecommendationID: recID,
+		RequestID:        "c2c_" + recID,
+		UserID:           f.ownerRCID,
+		HostNodeID:       f.hostNode.NodeID,
+		HostAiUserID:     f.hostNode.RongcloudUserID,
+		ConfigVersion:    "0",
+		Topic:            "发布计划评审",
+		Goal:             "得出结论",
+		Roles:            rolesJSON,
+		ExpiresAt:        pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("insert recommendation: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "DELETE FROM rongcloud_role_recommendation WHERE recommendation_id=$1", recID)
+	})
+
+	confirm := f.rt.actionConfirmRoundtableSetup(ctx, CommandContent{
+		Service: "discussion", Action: "confirmRoundtableSetup",
+		Params: map[string]interface{}{
+			"chatroom_id":       chatroomID,
+			"recommendation_id": recID,
+			"roles": []interface{}{map[string]interface{}{
+				"role_id": "role_x", "role_name": "分析师", "role_prompt": "分析数据",
+				"node_id": f.memberNode.NodeID,
+			}},
+		},
+	}, f.actor)
+	if confirm.code != 410 {
+		t.Fatalf("confirm = %d %s, want 410", confirm.code, confirm.message)
+	}
+	if confirm.message != "SYSTEM_HOST_CONFIG_CHANGED" {
+		t.Fatalf("confirm code = %q, want SYSTEM_HOST_CONFIG_CHANGED（不得复用 SYSTEM_HOST_OFFLINE）", confirm.message)
+	}
+}
+
 func TestSetupLegacyPlanningRegression(t *testing.T) {
 	f := setupSetupFixture(t)
 	ctx := context.Background()
