@@ -71,6 +71,19 @@ func TestClawNodeAgentCLIByNodeWithoutDB(t *testing.T) {
 	}
 }
 
+// 列表页的批量版同样要保证降级语义：没有数据库（以及表不存在时的 err 路径）
+// 返回空 map，列表接口照常出其他列，只是 CLI 版本都是「-」。
+func TestClawAdminNodeAgentCLIsWithoutDB(t *testing.T) {
+	h := &Handler{}
+	got := h.clawAdminNodeAgentCLIs(context.Background())
+	if got == nil {
+		t.Fatal("must return an empty map, not nil")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty map, got %v", got)
+	}
+}
+
 // 超长路径/版本按 rune 截断，不能把多字节字符切半（pgx 会拒收非法 UTF-8）。
 func TestClawTruncateRunesForCLIFields(t *testing.T) {
 	long := "目录/智能体/路径"

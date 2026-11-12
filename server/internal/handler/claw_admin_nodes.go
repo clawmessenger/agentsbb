@@ -481,6 +481,38 @@ func clawAdminAttachAgentCLI(row clawAdminNodeRow, cli clawNodeAgentCLI, found b
 	return row
 }
 
+// clawAdminNodeAgentCLIs 取全部节点的 agent CLI 行（rongcloud_node_agent_cli，
+// 迁移 612），键是 node_id 的文本形式（uuidToText）。表量级 = 节点数（一个 agent
+// 一行），列表页一次批查比在行循环里逐行查便宜 —— 与 clawAdminNodeUpgrades 同款。
+//
+// 表不存在（迁移没跑）时返回空 map 而不是报错：这属于「还没上这个功能」，不该
+// 让整个列表 500 —— 与 clawNodeAgentCLIByNode 的降级语义一致。
+func (h *Handler) clawAdminNodeAgentCLIs(ctx context.Context) map[string]clawNodeAgentCLI {
+	out := make(map[string]clawNodeAgentCLI, 4)
+	if h.DB == nil {
+		return out
+	}
+	rows, err := h.DB.Query(ctx, `
+		SELECT node_id, cli_version, cli_path, probed_at
+		  FROM rongcloud_node_agent_cli`)
+	if err != nil {
+		// 吞掉错误会让「迁移 612 没跑」表现成「全站 CLI 版本列都是 -」而服务端
+		// 零信号，排起来费劲 —— 至少留一条日志（与 clawAdminNodeUpgrades 同款）。
+		slog.Warn("claw admin: reading node agent CLI rows failed (migration 612 applied?)", "error", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeID pgtype.UUID
+		var cli clawNodeAgentCLI
+		if err := rows.Scan(&nodeID, &cli.CLIVersion, &cli.CLIPath, &cli.ProbedAt); err != nil {
+			continue
+		}
+		out[uuidToText(nodeID)] = cli
+	}
+	return out
+}
+
 // clawAdminNodeControl 是 rongcloud_node_control 的一行（运维期望状态 + 设备回执）。
 type clawAdminNodeControl struct {	DesiredState   string
 	DesiredVersion int64
@@ -702,6 +734,7 @@ func (h *Handler) ClawAdminListNodes(w http.ResponseWriter, r *http.Request) {
 	accountNames, _ := h.clawAdminIMAccounts(ctx)
 	controls := h.clawAdminNodeControls(ctx)
 	upgrades := h.clawAdminNodeUpgrades(ctx)
+	agentCLIs := h.clawAdminNodeAgentCLIs(ctx)
 	// 机器名要用全量记录算（机器主节点是隐藏行，不在分页结果里）。
 	machineNames := h.clawAdminMachineNames(records, names)
 
@@ -717,7 +750,14 @@ func (h *Handler) ClawAdminListNodes(w http.ResponseWriter, r *http.Request) {
 			reserved[rec.RongcloudUserID] || hostNodes[rec.NodeID],
 			controls[uuidToText(rec.ID)],
 		)
-		items = append(items, h.clawAdminAttachUpgrade(row, rec, upgrades, machineNames))
+		row = h.clawAdminAttachUpgrade(row, rec, upgrades, machineNames)
+		// agent CLI 版本是该节点智能体自己的（rongcloud_node_agent_cli，迁移 612），
+		// 与 supervisor 的 exe_version 是两组字段；详情接口已是单查带出，列表页
+		// 这里用同一份 attach 函数贴上，保证两端同源。
+		if cli, ok := agentCLIs[uuidToText(rec.ID)]; ok {
+			row = clawAdminAttachAgentCLI(row, cli, true)
+		}
+		items = append(items, row)
 	}
 	clawAdminOK(w, map[string]interface{}{
 		"items": items, "total": total, "page": page, "page_size": pageSize,
