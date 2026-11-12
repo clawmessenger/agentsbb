@@ -489,7 +489,9 @@ func setupRecommendFailureMessage(code string) string {
 		// 原文留在服务端日志（role recommendation: node reported an error）。
 		return "主持设备上的模型当前不可用（额度用尽、限流或鉴权失败），请更换主持模型后重试"
 	case "SYSTEM_HOST_OFFLINE", "SYSTEM_HOST_NOT_CONFIGURED", "SYSTEM_HOST_DISABLED":
-		return "系统主持 AI 当前不可用，请确认主持设备上的 agentsbb 正在运行"
+		// 面向用户的句子用显示名 AgentsBB（大小写规范：exe/bin/目录 = agentsbb，
+		// 常量 = AGENTSBB，显示 = AgentsBB），与 web / uniapp 的本地文案逐字一致。
+		return "系统主持 AI 当前不可用，请确认主持设备上的 AgentsBB 正在运行"
 	case "NO_ELIGIBLE_USER_DEVICES":
 		return "没有可用于讨论的在线设备"
 	case "NO_PERMITTED_USER_DEVICES":

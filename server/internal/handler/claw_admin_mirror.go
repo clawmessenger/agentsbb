@@ -809,8 +809,10 @@ func clawMirrorWriteManifest(dir, tag string) error {
 	}
 	encoded, err := json.MarshalIndent(map[string]interface{}{
 		"tag_name": tag,
-		"name":     "agentsbb " + version,
-		"assets":   assets,
+		// name 是给人看的显示名，用 AgentsBB（大小写规范：显示 = AgentsBB），
+		// 与 Release 标题 "AgentsBB <版本>" 一致。
+		"name":   "AgentsBB " + version,
+		"assets": assets,
 	}, "", "  ")
 	if err != nil {
 		return err
