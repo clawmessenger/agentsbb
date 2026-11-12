@@ -1292,6 +1292,45 @@ describe("MessageDispatcher discussion recommend_roles", () => {
     expect(JSON.parse(deps.sent[0].content).request_id).toBe("roles_fast");
   });
 
+  it("bounds the turn to the server's wait window instead of the 300s default", async () => {
+    // 服务端 60s 就把这一批作废，设备端默认却是 300s：慢回合会在服务端放弃后
+    // 继续烧 4 分钟，跟用户重试起的新回合抢上游额度（第一批 17s、第二批超时、
+    // 第三批更差）。设备端必须按 timeout_seconds 提前收手。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seenTimeout: number | undefined;
+    await dispatcher.handle(roleRequest("roles_1", { timeout_seconds: 60 }), {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        seenTimeout = opts?.timeoutMs;
+        return JSON.stringify({ roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }] });
+      },
+    });
+    expect(seenTimeout).toBe(57_000);
+
+    // 旧服务端不发这个键：兜底仍要短于 60s 窗口。
+    let fallback: number | undefined;
+    await dispatcher.handle(roleRequest("roles_2"), {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        fallback = opts?.timeoutMs;
+        return JSON.stringify({ roles: [{ role_name: "B", role_prompt: "p", speaking_order: 0 }] });
+      },
+    });
+    expect(fallback).toBe(55_000);
+  });
+
+  it("reports how long the device spent so the server can split the wait", async () => {
+    // 成功路径过去一行日志都没有，「服务端等了 70s」到底慢在设备回合还是慢在
+    // 融云往返，事后无从判断。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(roleRequest("roles_1"), {
+      runTurn: async () => JSON.stringify({ roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }] }),
+    });
+    const payload = JSON.parse(deps.sent[0].content).payload;
+    expect(typeof payload.elapsed_ms).toBe("number");
+    expect(payload.elapsed_ms).toBeGreaterThanOrEqual(0);
+  });
+
   it("forwards the admin host model (params.model) to the agent turn", async () => {
     // 讨论轮次那条链路早就尊重 params.model 了，唯独推荐把它丢掉、永远落在
     // 节点默认模型 —— 管理端换主持模型对推荐毫无效果。

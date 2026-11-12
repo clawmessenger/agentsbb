@@ -41,6 +41,7 @@ import {
   parseRoleRecommendRequest,
   parseRoleRecommendationOutput,
   ROLE_RECOMMEND_ACTION,
+  ROLE_RECOMMEND_TURN_TIMEOUT_MS,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
 import { formatUseModelAck, parseUseModelCommand, routeInCatalog, type UseModelCommand } from "./use-model.js";
@@ -238,6 +239,12 @@ export interface TurnOptions {
    * 白占一份上游额度还会拖慢新的那一轮（见 handleRoleRecommend）。
    */
   signal?: AbortSignal;
+  /**
+   * 本轮 agent 回合的超时（毫秒）。不传时沿用设备级默认（`DEFAULT_TURN_TIMEOUT_MS`
+   * = 300s）。角色推荐必须传：服务端只等 60s 就作废这一批，设备端跑满 5 分钟
+   * 只会留下僵尸回合跟下一轮抢额度（见 roleRecommendTurnTimeoutMs）。
+   */
+  timeoutMs?: number;
 }
 
 export interface TurnRunner {
@@ -1926,14 +1933,23 @@ export class MessageDispatcher {
       // 过去完全一致（回落节点默认）。
       const output = await turns.runTurn(buildRoleRecommendPrompt(request), request.model, undefined, {
         signal: controller.signal,
+        // 设备端必须在服务端放弃之前收手：服务端 60s 就作废这一批，而 runTurn
+        // 默认 300s —— 差了 5 倍，一个慢回合会在服务端超时后还继续烧 4 分钟，
+        // 跟用户重试起的新回合抢同一份上游额度，越点越慢。
+        timeoutMs: request.timeoutMs ?? ROLE_RECOMMEND_TURN_TIMEOUT_MS,
       });
       const roles = parseRoleRecommendationOutput(output, request.maxRoles);
+      const turnElapsedMs = Date.now() - startedAt;
       reply = roles
-        ? buildRoleRecommendationResponse(request.requestId, roles)
-        : buildRoleRecommendationError(request.requestId, "role recommendation invalid");
+        ? buildRoleRecommendationResponse(request.requestId, roles, turnElapsedMs)
+        : buildRoleRecommendationError(
+            request.requestId,
+            "role recommendation invalid",
+            turnElapsedMs,
+          );
       if (roles) {
         console.log(
-          `role recommend: answered ${request.requestId} with ${roles.length} role(s) in ${Date.now() - startedAt}ms`,
+          `role recommend: answered ${request.requestId} with ${roles.length} role(s) in ${turnElapsedMs}ms`,
         );
       } else {
         console.error(`role recommend: could not parse an answer for ${request.requestId}`);
@@ -1950,7 +1966,7 @@ export class MessageDispatcher {
       }
       const message = err instanceof Error ? err.message : "agent turn failed";
       console.error(`role recommend: agent turn failed for ${request.requestId}: ${message}`);
-      reply = buildRoleRecommendationError(request.requestId, message);
+      reply = buildRoleRecommendationError(request.requestId, message, Date.now() - startedAt);
     } finally {
       // 只清理自己那一个：被顶替时 activeRoleRecommend 已经指向新请求了。
       if (this.activeRoleRecommend?.requestId === request.requestId) {

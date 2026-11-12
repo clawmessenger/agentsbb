@@ -128,8 +128,12 @@ type pendingNodeRequest struct {
 	maxRoles  int
 
 	targetAIUserID string
-	expiresAt      time.Time
-	done           chan struct{}
+	// sentAt / deviceElapsedMs 只用于观测：把「服务端等了多久」拆成「设备跑了
+	// 多久」与「链路占用了其余时间」。过去成功路径一行日志都没有，只能靠猜。
+	sentAt          time.Time
+	deviceElapsedMs int64
+	expiresAt       time.Time
+	done            chan struct{}
 
 	// Terminal state. Written once, under the broker mutex, before done closes;
 	// read only after done is closed.
@@ -186,6 +190,11 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 		"recommendation_prompt": host.RecommendationPrompt,
 		"config_version":        host.ConfigVersion,
 		"protocol_version":      "v1",
+		// 调用方愿意等多久。设备端据此把这一轮 agent 回合的超时压到窗口之内 ——
+		// 过去两端差 5 倍（服务端 60s 就作废，设备端 runTurn 默认 300s），一个慢
+		// 回合会在服务端放弃后继续跑满 5 分钟，跟用户重试起的新回合抢上游额度，
+		// 表现就是「第一批 17s、第二批超时、第三批更慢」。旧 CLI 忽略未知键。
+		"timeout_seconds": int(timeout.Seconds()),
 		// 融云在客户端每次重连时会把离线历史整段重放；设备端用它丢弃
 		// 早已无人等待的旧请求，避免为一次重放白跑一遍 agent。
 		"timestamp": b.now().UnixMilli(),
@@ -227,6 +236,7 @@ func (b *NodeRequestBroker) StartRecommendation(ctx context.Context, host NodeRe
 		host:           host,
 		maxRoles:       maxRoles,
 		targetAIUserID: host.AIUserID,
+		sentAt:         b.now(),
 		expiresAt:      b.now().Add(timeout),
 		done:           make(chan struct{}),
 		status:         "pending",
@@ -737,6 +747,15 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 			b.settle(result.RequestID, "", NodeRequestCodeRecommendInvalid, nil)
 			return true
 		}
+		// 成功路径也要留痕：没有这一行，「服务端等了 70s」到底慢在设备上的 agent
+		// 回合，还是慢在融云往返，事后完全看不出来。deviceMs 由新版设备回传，
+		// 旧设备缺失就是 0。
+		b.logger.Info("role recommendation: answered",
+			"request_id", result.RequestID,
+			"node", senderID,
+			"roles", len(roles),
+			"serverMs", b.now().Sub(record.sentAt).Milliseconds(),
+			"deviceMs", payloadInt64(result.Payload["elapsed_ms"]))
 		b.settle(result.RequestID, "completed", "", roles)
 		return true
 	}
@@ -752,7 +771,9 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 		"request_id", result.RequestID,
 		"node", senderID,
 		"error", result.Payload["error"],
-		"detail", nodeErrorDetail(result.Payload["detail"]))
+		"detail", nodeErrorDetail(result.Payload["detail"]),
+		"serverMs", b.now().Sub(record.sentAt).Milliseconds(),
+		"deviceMs", payloadInt64(result.Payload["elapsed_ms"]))
 
 	b.settle(result.RequestID, "", mapNodeError(result.Payload["error"], result.Payload["detail"]), nil)
 	return true
@@ -1048,6 +1069,22 @@ func nodeErrorReason(value interface{}) string {
 // 不做结构断言：新版是 {reason, sample}，旧版根本没有这个键，将来也可能加字段。
 // 能 JSON 序列化就原样记，序列化不了退回 fmt.Sprint；按 rune 截断到
 // nodeErrorDetailMaxChars，免得一段模型原文把日志行撑爆。它**只**用于日志。
+// payloadInt64 从设备回执里读一个整型观测字段（JSON 数字解出来是 float64）。
+// 只用于日志，读不到就当 0。
+func payloadInt64(value interface{}) int64 {
+	switch n := value.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case json.Number:
+		if parsed, err := n.Int64(); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
 func nodeErrorDetail(value interface{}) string {
 	if value == nil {
 		return ""

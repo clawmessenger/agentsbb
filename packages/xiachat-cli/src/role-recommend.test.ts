@@ -10,6 +10,7 @@ import {
   ROLE_RECOMMEND_ROLE_PROMPT_CHARS,
   ROLE_RECOMMEND_TARGET_ROLES,
   roleRecommendTargetRoleCount,
+  roleRecommendTurnTimeoutMs,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
   type RoleRecommendRequest,
 } from "./role-recommend.js";
@@ -30,6 +31,8 @@ describe("parseRoleRecommendRequest", () => {
       goal: "",
       maxRoles: 3,
       recommendationPrompt: "",
+      // 服务端没下发 timeout_seconds：兜底 55s（必须短于服务端的 60s 窗口）。
+      timeoutMs: 55_000,
       timestamp: 1_700_000_000_000,
     });
   });
@@ -94,6 +97,41 @@ describe("parseRoleRecommendRequest", () => {
     // 空白或过长的取值不当作风格。
     expect(parseRoleRecommendRequest({ ...base, params: { ...base.params, style: "   " } })?.style).toBeUndefined();
     expect(parseRoleRecommendRequest({ ...base, params: { ...base.params, style: "x".repeat(65) } })?.style).toBeUndefined();
+  });
+});
+
+describe("roleRecommendTurnTimeoutMs", () => {
+  // 这条纪律就是「第一快第二慢第三更慢」的根因：服务端 60s 作废，设备端默认
+  // 300s，慢回合会在服务端放弃后继续烧几分钟，跟用户重试起的新回合抢额度。
+  it("keeps the device turn strictly inside the server's wait window", () => {
+    // 服务端下发 60s（setup 链路的上限）→ 设备 57s 收手，留 3s 回包。
+    expect(roleRecommendTurnTimeoutMs(60)).toBe(57_000);
+    expect(roleRecommendTurnTimeoutMs(60)).toBeLessThan(60_000);
+  });
+
+  it("falls back to 55s when the server does not send a budget", () => {
+    expect(roleRecommendTurnTimeoutMs(undefined)).toBe(55_000);
+    expect(roleRecommendTurnTimeoutMs(0)).toBe(55_000);
+    expect(roleRecommendTurnTimeoutMs(-5)).toBe(55_000);
+    expect(roleRecommendTurnTimeoutMs("60")).toBe(55_000);
+    expect(roleRecommendTurnTimeoutMs(Number.NaN)).toBe(55_000);
+  });
+
+  it("clamps absurd budgets instead of trusting them", () => {
+    // 管理端「测试推荐」用 host.timeout_seconds（线上配成 600s）：设备端不该陪跑 10 分钟。
+    expect(roleRecommendTurnTimeoutMs(600)).toBe(300_000);
+    // 小到没意义的预算给一个下限，免得 1s 就自杀。
+    expect(roleRecommendTurnTimeoutMs(2)).toBe(5_000);
+  });
+
+  it("is carried into the parsed request", () => {
+    const parsed = parseRoleRecommendRequest({
+      request_id: "roles_1",
+      service: "discussion",
+      action: "recommend_roles",
+      params: { topic: "t", max_roles: 3, timeout_seconds: 60 },
+    });
+    expect(parsed?.timeoutMs).toBe(57_000);
   });
 });
 

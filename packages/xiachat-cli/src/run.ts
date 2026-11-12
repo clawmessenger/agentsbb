@@ -583,7 +583,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ...(opts.agentIdentity ? { agentIdentity: opts.agentIdentity } : {}),
         prompt,
         model: modelForTurn(model),
-        timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+        // 推荐这类短回合自带 timeoutMs（必须短于调用方的等待窗口）；其余回合
+        // 沿用设备级默认（300s）。
+        timeoutMs: turnOpts?.timeoutMs ?? opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
         cwd: opts.cwd,
         sessionKey,
         ...(resumeSessionId ? { resumeSessionId } : {}),

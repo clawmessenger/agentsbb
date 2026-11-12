@@ -330,6 +330,12 @@ func TestNodeRequestBrokerRoundTrip(t *testing.T) {
 	if _, ok := envelope.Params["timestamp"]; !ok {
 		t.Fatalf("timestamp missing; the device needs it to drop replayed requests")
 	}
+	// 设备端单轮 agent 超时必须由这里下发：服务端只等 60s，而设备端 runTurn 默认
+	// 300s —— 不告诉它窗口，慢回合会在服务端放弃后继续烧几分钟，跟用户重试起的
+	// 新回合抢上游额度（「第一批 17s、第二批超时、第三批更慢」）。
+	if got, _ := envelope.Params["timeout_seconds"].(float64); int(got) != 30 {
+		t.Fatalf("timeout_seconds not carried: %#v", envelope.Params["timeout_seconds"])
+	}
 
 	answer := `{"request_id":"` + requestID + `","msg_type":"command_result","payload":{"kind":"text","roles":[` +
 		`{"role_name":"主持人","role_prompt":"引导","speaking_order":0},` +

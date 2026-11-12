@@ -147,6 +147,35 @@ export function detectDiscussionStyle(
  * than this can no longer be delivered to anyone. */
 export const STALE_ROLE_RECOMMEND_REQUEST_MS = 10 * 60 * 1000;
 
+/**
+ * 推荐回合在**设备端**的兜底超时（服务端没下发 timeout_seconds 时才用）。
+ *
+ * 为什么必须有：服务端等 60s（`recommendRoleWaitCapSeconds`）就把这一批作废，
+ * 而设备端 `runTurn` 的默认超时是 **300s**。两边差 5 倍，于是一个「模型慢了」
+ * 的回合在服务端看来早已超时，在设备端却还要跑满 5 分钟 —— 用户点重试后新
+ * 回合与它抢同一份上游额度，越点越慢、越慢越超时（2026-11-12 现场：第一批
+ * 17s，紧接着第二批 64s 撞线，第三批更差）。
+ */
+export const ROLE_RECOMMEND_TURN_TIMEOUT_MS = 55_000;
+
+/** 设备端比服务端窗口提前这么多收手，给回包留出路程。 */
+const ROLE_RECOMMEND_REPLY_MARGIN_MS = 3_000;
+
+/** 设备端最多等这么久：再长就没有意义（服务端早就放弃了），只是白烧额度。 */
+const ROLE_RECOMMEND_TURN_TIMEOUT_MAX_MS = 300_000;
+
+/**
+ * 把服务端下发的 `timeout_seconds`（调用方愿意等多久）换算成这一轮 agent 回合
+ * 的设备端超时。旧服务端不发这个键 → 用兜底值；非法值一律当没发。
+ */
+export function roleRecommendTurnTimeoutMs(timeoutSeconds: unknown): number {
+  const seconds =
+    typeof timeoutSeconds === "number" && Number.isFinite(timeoutSeconds) ? timeoutSeconds : 0;
+  if (seconds <= 0) return ROLE_RECOMMEND_TURN_TIMEOUT_MS;
+  const budget = seconds * 1000 - ROLE_RECOMMEND_REPLY_MARGIN_MS;
+  return Math.min(Math.max(budget, 5_000), ROLE_RECOMMEND_TURN_TIMEOUT_MAX_MS);
+}
+
 export interface RoleRecommendRequest {
   requestId: string;
   topic: string;
@@ -165,6 +194,12 @@ export interface RoleRecommendRequest {
    * 节点默认；为空/非法时保持旧行为（节点默认模型）。
    */
   model?: string;
+  /**
+   * 这一轮 agent 回合的设备端超时（毫秒）。由服务端下发的 `timeout_seconds`
+   * 换算而来 —— 设备必须比调用方先收手，否则会留下跑满 5 分钟的僵尸回合
+   * （见 roleRecommendTurnTimeoutMs）。
+   */
+  timeoutMs?: number;
   timestamp?: number;
 }
 
@@ -204,6 +239,9 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
     typeof rawModel === "string" && rawModel.trim().length > 0 && rawModel.length <= 200
       ? rawModel.trim()
       : undefined;
+  // 服务端愿意等多久（秒）；换算成设备端回合超时，保证设备先收手。
+  // 旧服务端不发这个键 → 兜底 55s（仍短于服务端的 60s 窗口）。
+  const timeoutMs = roleRecommendTurnTimeoutMs(params.timeout_seconds);
   return {
     requestId: cmd.request_id,
     topic: params.topic,
@@ -213,6 +251,7 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
       typeof params.recommendation_prompt === "string" ? params.recommendation_prompt : "",
     style,
     model,
+    timeoutMs,
     timestamp,
   };
 }
@@ -335,16 +374,34 @@ export function parseRoleRecommendationOutput(
 }
 
 /** The success reply: roles ride in payload.roles, kind "text". */
+/**
+ * The success reply. `elapsedMs` 是这一轮 agent 回合在设备上的真实耗时 —— 服务端
+ * 把它记进日志，用来把「服务端等待 70s」拆成「设备跑了 Xs」与「链路占用了其余
+ * 时间」。它只是观测字段，老服务端不认也无害。
+ */
 export function buildRoleRecommendationResponse(
   requestId: string,
   roles: RecommendedRole[],
+  elapsedMs?: number,
 ): string {
-  return encodeCommandResult(requestId, "text", { roles });
+  return encodeCommandResult(
+    requestId,
+    "text",
+    elapsedMs === undefined ? { roles } : { roles, elapsed_ms: elapsedMs },
+  );
 }
 
 /** The failure reply. The server maps the message to a public error code. */
-export function buildRoleRecommendationError(requestId: string, message: string): string {
-  return encodeCommandResult(requestId, "error", { error: message });
+export function buildRoleRecommendationError(
+  requestId: string,
+  message: string,
+  elapsedMs?: number,
+): string {
+  return encodeCommandResult(
+    requestId,
+    "error",
+    elapsedMs === undefined ? { error: message } : { error: message, elapsed_ms: elapsedMs },
+  );
 }
 
 /**
