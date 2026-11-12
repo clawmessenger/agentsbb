@@ -158,6 +158,13 @@ export interface RoleRecommendRequest {
    * 会显式下发；不认识的取值会被忽略，退回 goal 兜底识别。
    */
   style?: string;
+  /**
+   * 管理端「讨论主持 AI」配置的模型路由（`provider/model`）。服务端从
+   * 2026-10-30 起就随请求下发，但 CLI 过去从未读取 —— 推荐回合一直落在
+   * 节点默认模型上，运营在管理端换主持模型对推荐毫无效果。现在它优先于
+   * 节点默认；为空/非法时保持旧行为（节点默认模型）。
+   */
+  model?: string;
   timestamp?: number;
 }
 
@@ -189,6 +196,14 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
     typeof rawStyle === "string" && rawStyle.trim().length > 0 && rawStyle.length <= 64
       ? rawStyle.trim()
       : undefined;
+  // 管理端主持模型路由：与 web 的 `provider/model` 同形（opencode/minimax-…）。
+  // 只做形状校验，不在这里判「目录里有没有」——模型路由无效时 agent 会报
+  // model not found，那句话会经 runTurn 原样回给服务端并落到「模型不可用」。
+  const rawModel = params.model;
+  const model =
+    typeof rawModel === "string" && rawModel.trim().length > 0 && rawModel.length <= 200
+      ? rawModel.trim()
+      : undefined;
   return {
     requestId: cmd.request_id,
     topic: params.topic,
@@ -197,6 +212,7 @@ export function parseRoleRecommendRequest(cmd: CommandContent): RoleRecommendReq
     recommendationPrompt:
       typeof params.recommendation_prompt === "string" ? params.recommendation_prompt : "",
     style,
+    model,
     timestamp,
   };
 }

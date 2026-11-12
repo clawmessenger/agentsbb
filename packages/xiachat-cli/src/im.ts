@@ -1888,7 +1888,13 @@ export class MessageDispatcher {
     );
     let reply: string;
     try {
-      const output = await turns.runTurn(buildRoleRecommendPrompt(request));
+      // 管理端「讨论主持 AI」配的模型优先（params.model）：讨论轮次那条链路
+      // （your_turn → resolveTurnModel(params.model)）早就尊重它了，唯独推荐
+      // 把它丢掉、永远落在节点默认模型上 —— 2026-11-12 现场：主持节点默认是
+      // 一个额度用尽的 OpenCode 免费模型，终端里 MiniMax 明明能用，推荐却
+      // 每次都回「Free usage limit reached」。request.model 为空时行为与
+      // 过去完全一致（回落节点默认）。
+      const output = await turns.runTurn(buildRoleRecommendPrompt(request), request.model);
       const roles = parseRoleRecommendationOutput(output, request.maxRoles);
       reply = roles
         ? buildRoleRecommendationResponse(request.requestId, roles)

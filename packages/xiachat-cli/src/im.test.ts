@@ -1261,6 +1261,42 @@ describe("MessageDispatcher discussion recommend_roles", () => {
     expect(parsed.payload.roles).toEqual(roles);
   });
 
+  it("forwards the admin host model (params.model) to the agent turn", async () => {
+    // 讨论轮次那条链路早就尊重 params.model 了，唯独推荐把它丢掉、永远落在
+    // 节点默认模型 —— 管理端换主持模型对推荐毫无效果。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seenModel: string | undefined = "sentinel";
+    await dispatcher.handle(
+      roleRequest("roles_model", { model: "opencode/minimax-m2.1-flash-free" }),
+      {
+        runTurn: async (_prompt, model) => {
+          seenModel = model;
+          return JSON.stringify({
+            roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }],
+          });
+        },
+      },
+    );
+    expect(seenModel).toBe("opencode/minimax-m2.1-flash-free");
+    expect(deps.sent).toHaveLength(1);
+  });
+
+  it("falls back to the node default model when params.model is absent", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seenModel: string | undefined = "sentinel";
+    await dispatcher.handle(roleRequest("roles_nomodel"), {
+      runTurn: async (_prompt, model) => {
+        seenModel = model;
+        return JSON.stringify({
+          roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }],
+        });
+      },
+    });
+    expect(seenModel).toBeUndefined();
+  });
+
   it("replies with an error command_result when the answer has no valid roles", async () => {
     const deps = makeDeps();
     const dispatcher = new MessageDispatcher({ send: deps.send });

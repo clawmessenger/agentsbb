@@ -45,6 +45,29 @@ describe("parseRoleRecommendRequest", () => {
     expect(parsed?.timestamp).toBeUndefined();
   });
 
+  it("carries the admin host model through (params.model)", () => {
+    // 2026-11-12 现场：管理端配了 opencode/minimax-m2.1-flash-free，但 CLI 从没
+    // 读过 params.model，推荐回合永远落在节点默认模型上 —— 那个默认是额度用尽的
+    // 免费模型，于是「终端里 MiniMax 能用、推荐必挂」。
+    const parsed = parseRoleRecommendRequest({
+      ...base,
+      params: { ...base.params, model: "opencode/minimax-m2.1-flash-free" },
+    });
+    expect(parsed?.model).toBe("opencode/minimax-m2.1-flash-free");
+  });
+
+  it("ignores a blank/oversized/non-string model instead of rejecting the request", () => {
+    expect(parseRoleRecommendRequest({ ...base, params: { topic: "t", model: "   " } })?.model).toBeUndefined();
+    expect(parseRoleRecommendRequest({ ...base, params: { topic: "t", model: 42 } })?.model).toBeUndefined();
+    expect(
+      parseRoleRecommendRequest({ ...base, params: { topic: "t", model: "x".repeat(201) } })?.model,
+    ).toBeUndefined();
+    // 合法长度上界内照常带上
+    expect(
+      parseRoleRecommendRequest({ ...base, params: { topic: "t", model: "x".repeat(200) } })?.model,
+    ).toBe("x".repeat(200));
+  });
+
   it("rejects a missing/blank topic", () => {
     expect(parseRoleRecommendRequest({ ...base, params: { max_roles: 3 } })).toBeNull();
     expect(parseRoleRecommendRequest({ ...base, params: { topic: "   " } })).toBeNull();
