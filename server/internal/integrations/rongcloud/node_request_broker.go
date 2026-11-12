@@ -76,6 +76,11 @@ const (
 	// 模型返回空（detail.reason=empty-output），实测 1s 内就回。与 INVALID
 	// 分开是因为处置动作不同 —— 用户要换主持模型，而不是点重试。
 	NodeRequestCodeRecommendEmpty = "ROLE_RECOMMENDATION_EMPTY"
+	// NodeRequestCodeRecommendModelUnavailable 是「设备端 agent 已经明确报出
+	// 上游/模型错误」：额度用尽（`Free usage limit reached`）、限流、鉴权失败、
+	// 模型不存在。与 INVALID 分开的理由同 EMPTY —— 点重试只会重复同一个结果，
+	// 用户要做的动作是换主持模型（或等额度恢复），而不是「再试一次」。
+	NodeRequestCodeRecommendModelUnavailable = "ROLE_RECOMMENDATION_MODEL_UNAVAILABLE"
 	// 模型目录往返的失败码（管理端「供应商 → 模型」选择器用）。
 	NodeRequestCodeCatalogTimeout = "MODEL_CATALOG_TIMEOUT"
 	NodeRequestCodeCatalogInvalid = "MODEL_CATALOG_INVALID"
@@ -977,7 +982,53 @@ func mapNodeError(value interface{}, detail interface{}) string {
 	if nodeErrorReason(detail) == "empty-output" {
 		return NodeRequestCodeRecommendEmpty
 	}
+	// 设备端把上游 agent 的错误原文逐字转上来了（`opencode session failed:
+	// Free usage limit reached…`）。这类错误必须自己一档：它是**模型当前不可用**，
+	// 重试一千次也还是这句话，用户要做的是换主持模型。
+	//
+	// 2026-11-12 现场：控制台只显示「主持设备返回的内容无法解析，请重试」+ 错误码
+	// INVALID，运营在向导里反复点重试、查网络、查设备在线状态，而真实原因是
+	// OpenCode 免费额度用尽 —— 与服务端日志里那句话差着一整个排查方向。
+	if looksLikeModelUnavailable(lower) {
+		return NodeRequestCodeRecommendModelUnavailable
+	}
 	return NodeRequestCodeRecommendInvalid
+}
+
+// modelUnavailablePatterns 是「模型/上游不可用」的错误原文特征。
+//
+// 只认稳定的措辞片段：上游把它当文案发，版本间措辞会变（同一个意思可能是
+// `Free usage limit reached` / `429 Too Many Requests` / `insufficient_quota`），
+// 但 `limit` / `quota` / `credit` / `unauthorized` 这几个词在各家 SDK 里是共有的。
+// 宁可漏判（落回 INVALID，用户看到「无法解析」）也不能误判成「模型不可用」
+// 把一次真能重试成功的失败说死。
+var modelUnavailablePatterns = []string{
+	"usage limit",
+	"rate limit",
+	"quota",
+	"insufficient",
+	"credit",
+	"too many requests",
+	"unauthorized",
+	"invalid api key",
+	"incorrect api key",
+	"authentication",
+	"model not found",
+	"no such model",
+	"model_unavailable",
+}
+
+// looksLikeModelUnavailable 判一段**已转小写**的错误原文是否属于模型/上游不可用。
+func looksLikeModelUnavailable(lower string) bool {
+	if lower == "" {
+		return false
+	}
+	for _, pattern := range modelUnavailablePatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeErrorReason 取设备端自证里的 reason 短标识（payload.detail.reason）。

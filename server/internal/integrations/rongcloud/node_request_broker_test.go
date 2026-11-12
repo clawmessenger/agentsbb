@@ -219,6 +219,22 @@ func TestMapNodeError(t *testing.T) {
 			t.Errorf("mapNodeError(%v) = %q, want invalid", detail, got)
 		}
 	}
+	// 上游/模型不可用的原文（设备端 agent 逐字转上来）：额度用尽、限流、鉴权
+	// 失败、模型不存在。它们过去全落 INVALID，界面说「内容无法解析」，用户只能
+	// 反复点重试 —— 真实原因是模型侧不可用，动作是换主持模型。
+	for _, value := range []interface{}{
+		"opencode session failed: Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go",
+		"429 Too Many Requests",
+		"insufficient_quota",
+		"you exceeded your current quota, please check your plan and billing details",
+		"Unauthorized",
+		"Incorrect API key provided",
+		"model not found: gpt-9",
+	} {
+		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendModelUnavailable {
+			t.Errorf("mapNodeError(%q) = %q, want model unavailable", value, got)
+		}
+	}
 	for _, value := range []interface{}{nil, "boom", 42, "agent turn failed"} {
 		if got := mapNodeError(value, nil); got != NodeRequestCodeRecommendInvalid {
 			t.Errorf("mapNodeError(%v) = %q, want invalid", value, got)
@@ -231,12 +247,13 @@ func TestMapNodeError(t *testing.T) {
 // 主持设备，还是该换个议题重试。
 func TestSetupRecommendFailureMessage(t *testing.T) {
 	cases := map[string]string{
-		"ROLE_RECOMMENDATION_TIMEOUT": "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试",
-		"ROLE_RECOMMENDATION_INVALID": "主持设备返回的推荐结果无法解析，请重试",
-		"ROLE_RECOMMENDATION_EMPTY":   "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试",
-		"SYSTEM_HOST_OFFLINE":         "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行",
-		"NO_ELIGIBLE_USER_DEVICES":    "没有可用于讨论的在线设备",
-		"WHATEVER_ELSE":               "角色推荐失败，请重试",
+		"ROLE_RECOMMENDATION_TIMEOUT":           "主持设备在限定时间内没有返回推荐结果，请确认主持设备上的智能体与模型可用后重试",
+		"ROLE_RECOMMENDATION_INVALID":           "主持设备返回的推荐结果无法解析，请重试",
+		"ROLE_RECOMMENDATION_EMPTY":             "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试",
+		"ROLE_RECOMMENDATION_MODEL_UNAVAILABLE": "主持设备上的模型当前不可用（额度用尽、限流或鉴权失败），请更换主持模型后重试",
+		"SYSTEM_HOST_OFFLINE":                   "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行",
+		"NO_ELIGIBLE_USER_DEVICES":              "没有可用于讨论的在线设备",
+		"WHATEVER_ELSE":                         "角色推荐失败，请重试",
 	}
 	for code, want := range cases {
 		if got := setupRecommendFailureMessage(code); got != want {

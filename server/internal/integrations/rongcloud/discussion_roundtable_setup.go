@@ -482,6 +482,11 @@ func setupRecommendFailureMessage(code string) string {
 		// 与上一条分开：空产出不是「格式不对」，是这个模型当前根本不出字。
 		// 让用户去点重试只会重复同一个结果，动作应该是换主持模型。
 		return "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试"
+	case "ROLE_RECOMMENDATION_MODEL_UNAVAILABLE":
+		// 设备端 agent 已明确报出上游错误（额度用尽 / 限流 / 鉴权失败 / 模型不存在）。
+		// 这一档同样不是「格式不对」：重试不会变好，动作是换主持模型。
+		// 原文留在服务端日志（role recommendation: node reported an error）。
+		return "主持设备上的模型当前不可用（额度用尽、限流或鉴权失败），请更换主持模型后重试"
 	case "SYSTEM_HOST_OFFLINE", "SYSTEM_HOST_NOT_CONFIGURED", "SYSTEM_HOST_DISABLED":
 		return "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行"
 	case "NO_ELIGIBLE_USER_DEVICES":
