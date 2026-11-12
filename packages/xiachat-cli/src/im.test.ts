@@ -1261,6 +1261,37 @@ describe("MessageDispatcher discussion recommend_roles", () => {
     expect(parsed.payload.roles).toEqual(roles);
   });
 
+  it("aborts the superseded recommendation instead of stacking agent turns", async () => {
+    // 服务端只等 60s 就把这一批作废，而推荐绕过会话队列并发执行。用户点重试时
+    // 上一轮往往还在跑，两轮一起抢上游额度 —— 越点越慢、越慢越超时。
+    // 新请求必须 kill 掉被顶替的那一轮，且被顶替的那轮不再回话。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let firstSignal: AbortSignal | undefined;
+    const first = dispatcher.handle(roleRequest("roles_slow"), {
+      runTurn: (_prompt, _model, _sessionKey, opts) =>
+        new Promise<string>((_resolve, reject) => {
+          firstSignal = opts?.signal;
+          opts?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("agent turn aborted")),
+            { once: true },
+          );
+        }),
+    });
+
+    await dispatcher.handle(roleRequest("roles_fast"), {
+      runTurn: async () => JSON.stringify({
+        roles: [{ role_name: "A", role_prompt: "p", speaking_order: 0 }],
+      }),
+    });
+    await first;
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(deps.sent).toHaveLength(1);
+    expect(JSON.parse(deps.sent[0].content).request_id).toBe("roles_fast");
+  });
+
   it("forwards the admin host model (params.model) to the agent turn", async () => {
     // 讨论轮次那条链路早就尊重 params.model 了，唯独推荐把它丢掉、永远落在
     // 节点默认模型 —— 管理端换主持模型对推荐毫无效果。

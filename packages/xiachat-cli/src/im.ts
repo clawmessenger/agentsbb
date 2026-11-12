@@ -225,13 +225,19 @@ export interface UploadedArtifact {
   type: string;
 }
 
-/** 一轮 turn 的附加指令（目前只有行为规范）。 */
+/** 一轮 turn 的附加指令（目前只有行为规范 + 中止信号）。 */
 export interface TurnOptions {
   /**
    * 本轮要注入到**指令层**的行为规范。只有私聊会带：群聊/讨论组/聊天室的行为
    * 准则由服务端拼进 role_prompt，设备端重复注入会白烧上下文还可能被复述。
    */
   behaviorPrompt?: string;
+  /**
+   * 中止本轮（kill 掉 agent 子进程）。目前只有角色推荐用：
+   * 同一节点上「新的推荐请求覆盖旧的」—— 旧的即使跑完，服务端也早就放弃，
+   * 白占一份上游额度还会拖慢新的那一轮（见 handleRoleRecommend）。
+   */
+  signal?: AbortSignal;
 }
 
 export interface TurnRunner {
@@ -409,6 +415,12 @@ export class MessageDispatcher {
   // Same guard for the admin role-recommendation preview: a replayed request
   // must not spend a whole agent turn again. Bounded: evicts oldest.
   private readonly answeredRoleRecommendRequests = new Set<string>();
+  // 当前在飞的那一轮角色推荐（同一节点同时只允许一个）。
+  //
+  // 推荐绕过会话队列并发执行，服务端却只等 60s 就作废这一批：用户点重试时，
+  // 上一个回合往往还在跑。并存会一起抢上游额度，越点越慢、越慢越超时
+  // （2026-11-12 现场）。新请求到达即 abort 旧的，这里记的就是被 abort 的对象。
+  private activeRoleRecommend: { requestId: string; controller: AbortController } | undefined;
   // streamId -> 在飞轮次。除了 AbortController，还要记住这一轮挂在哪会话、
   // 哪个 request_message_id 上：chat_stop 的 stream_id 一旦对不上（帧丢了、
   // web 从占位气泡取到了别的 id），就得靠后两个字段把它找回来 —— 否则停止
@@ -1882,6 +1894,24 @@ export class MessageDispatcher {
       return;
     }
 
+    // 最新覆盖：同一节点同时只跑一个推荐回合。
+    //
+    // 推荐请求是绕过会话队列直接并发的（见 run.ts），而服务端只等 60s 就放弃
+    // 并把这一批作废。于是「服务端超时 → 用户点重试 → 设备端那个回合还在跑」
+    // 会越叠越多：每个残留回合都占一份上游额度，新回合要跟它们抢，越点越慢、
+    // 越慢越超时（2026-11-12 现场：第一批 17s，紧接着的第二批 64s，第三第四更差）。
+    // 用户在向导里点「换一批 / 重试」的真实意图就是「上一个不要了」，所以这里
+    // 直接 kill 掉被顶替的那一轮，绝不并存。
+    const superseded = this.activeRoleRecommend;
+    if (superseded) {
+      superseded.controller.abort();
+      console.log(
+        `role recommend: aborting superseded request ${superseded.requestId} (new ${request.requestId})`,
+      );
+    }
+    const controller = new AbortController();
+    this.activeRoleRecommend = { requestId: request.requestId, controller };
+
     const startedAt = Date.now();
     console.log(
       `role recommend: request ${request.requestId} max_roles=${request.maxRoles} from ${msg.fromUserId}`,
@@ -1894,7 +1924,9 @@ export class MessageDispatcher {
       // 一个额度用尽的 OpenCode 免费模型，终端里 MiniMax 明明能用，推荐却
       // 每次都回「Free usage limit reached」。request.model 为空时行为与
       // 过去完全一致（回落节点默认）。
-      const output = await turns.runTurn(buildRoleRecommendPrompt(request), request.model);
+      const output = await turns.runTurn(buildRoleRecommendPrompt(request), request.model, undefined, {
+        signal: controller.signal,
+      });
       const roles = parseRoleRecommendationOutput(output, request.maxRoles);
       reply = roles
         ? buildRoleRecommendationResponse(request.requestId, roles)
@@ -1907,9 +1939,23 @@ export class MessageDispatcher {
         console.error(`role recommend: could not parse an answer for ${request.requestId}`);
       }
     } catch (err) {
+      if (controller.signal.aborted) {
+        // 被更新的推荐请求顶替：服务端那一批早已作废，回话没有意义（还会多占
+        // 一条命令发送额度）。记进 answered 集，让融云重放时不再白跑一遍。
+        console.log(
+          `role recommend: superseded request ${request.requestId} aborted after ${Date.now() - startedAt}ms`,
+        );
+        this.answeredRoleRecommendRequests.add(request.requestId);
+        return;
+      }
       const message = err instanceof Error ? err.message : "agent turn failed";
       console.error(`role recommend: agent turn failed for ${request.requestId}: ${message}`);
       reply = buildRoleRecommendationError(request.requestId, message);
+    } finally {
+      // 只清理自己那一个：被顶替时 activeRoleRecommend 已经指向新请求了。
+      if (this.activeRoleRecommend?.requestId === request.requestId) {
+        this.activeRoleRecommend = undefined;
+      }
     }
 
     await this.deps.send(msg.fromUserId, "command", reply);

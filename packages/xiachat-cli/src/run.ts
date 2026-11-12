@@ -589,6 +589,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ...(resumeSessionId ? { resumeSessionId } : {}),
         ...(sessionKey ? { onSessionId: (id: string) => agentSessions.set(sessionKey, id) } : {}),
         ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
+        // 角色推荐的「最新覆盖」靠它 kill 掉被顶替的那一轮（im.ts handleRoleRecommend）。
+        ...(turnOpts?.signal ? { signal: turnOpts.signal } : {}),
       })),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
     // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
