@@ -1,8 +1,8 @@
-// Package handler - 虾说（ClawMessenger Web/uniapp）兼容层。
+// Package handler - 虾说（AgentsBB Web/uniapp）兼容层。
 //
 // 纯增量扩展：把旧 Python 后端的公开 HTTP 契约（/api/login、/api/register、
-// /api/user/*、/api/config/user-guide）移植到 Go 后端，供 clawmessenger-web /
-// clawmessenger-uniapp 前端直连。账号存于独立表 claw_im_users（不动 multica
+// /api/user/*、/api/config/user-guide）移植到 Go 后端，供 agentsbb-web /
+// agentsbb-uniapp 前端直连。账号存于独立表 claw_im_users（不动 multica
 // 的 "user" 表）。
 package handler
 
@@ -845,7 +845,7 @@ func (h *Handler) ClawImRefreshToken(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "换发成功", map[string]interface{}{"token": fresh, "userId": u.UserID})
 }
 
-// ---- clawmessenger 设备绑定（旧站兼容端点） ----
+// ---- agentsbb 设备绑定（旧站兼容端点） ----
 
 // clawPairingView 是旧站可见的票据会话投影（驼峰命名；不含 client_claim_key /
 // idempotency_key 等凭据字段，与 PairingSessionView 同口径）。
@@ -854,7 +854,7 @@ type clawPairingView struct {
 	Status    string `json:"status"`
 	ExpiresAt string `json:"expiresAt"`
 	// AIType 是 claimed 后回填节点的 ai_type（register 时注册的智能体类型），
-	// 供旧站弹窗提示「clawmessenger run --agent <name>」；pending 时为空串。
+	// 供旧站弹窗提示「agentsbb run --agent <name>」；pending 时为空串。
 	AIType string `json:"aiType,omitempty"`
 	// ReportedAgents 是 pair 时设备自动上报的本机 agent 列表（pending 时可能为空）。
 	ReportedAgents []string `json:"reportedAgents,omitempty"`
@@ -972,7 +972,7 @@ func (h *Handler) clawCLIServerURL(ctx context.Context) string {
 	return strings.TrimRight(strings.TrimSpace(os.Getenv("CLAW_CLI_SERVER_URL")), "/")
 }
 
-// ClawCreatePairing POST /api/claw/pairing —— 旧站「绑定设备」生成 clawmessenger 票据。
+// ClawCreatePairing POST /api/claw/pairing —— 旧站「绑定设备」生成 agentsbb 票据。
 // Bearer=claw_im_users.rongcloud_token 认证；workspace 取单安装归属；
 // candidates 留空（设备 register 带 ticket 时回填）；有效期 10 分钟。
 func (h *Handler) ClawCreatePairing(w http.ResponseWriter, r *http.Request) {
@@ -1123,7 +1123,7 @@ func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "绑定成功", map[string]interface{}{"bound": results})
 }
 
-// ClawDeviceNodes POST /api/claw/device/nodes —— clawmessenger supervisor 取回本机全部
+// ClawDeviceNodes POST /api/claw/device/nodes —— agentsbb supervisor 取回本机全部
 // 已绑定 agent 的连接凭据。认证 = 机器节点 device credential（nodeId + credentialId + secret）。
 func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
@@ -1156,7 +1156,7 @@ func (h *Handler) ClawDeviceNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 // ClawDeviceBindAgents POST /api/claw/device/bind-agents —— 已配对设备用机器
-// device credential 主动绑定本机 agent（clawmessenger supervisor 为内置 ops 智能体
+// device credential 主动绑定本机 agent（agentsbb supervisor 为内置 ops 智能体
 // 自动调用）。每个 agent 独立建 rc user + node + 凭据，幂等可重复调用。
 func (h *Handler) ClawDeviceBindAgents(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
@@ -1190,7 +1190,7 @@ func (h *Handler) ClawDeviceBindAgents(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "绑定成功", map[string]interface{}{"bound": results})
 }
 
-// ClawDeviceHeartbeat POST /api/claw/device/heartbeat ���� clawmessenger ���豸�Ĭ��
+// ClawDeviceHeartbeat POST /api/claw/device/heartbeat ���� agentsbb ���豸�Ĭ��
 // �豸ÿ 30s ��һ��֤������ƾ�ݣ�����ڴ�¼�������豸��ʱ״̬�� 90s ����ȡ
 func (h *Handler) ClawDeviceHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if h.RongCloudNode == nil {
@@ -1283,7 +1283,7 @@ func (h *Handler) ClawNodeStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		// 智能体自己的 CLI 版本与路径（迁移 612）：三端详情页的「版本」「安装目录」
 		// 展示的是这一组，不是上面机器维度的 exe_version/install_dir —— 后者是
-		// supervisor（clawmessenger 自己）的，运维要看的是 codex/opencode 的。
+		// supervisor（agentsbb 自己）的，运维要看的是 codex/opencode 的。
 		//
 		// 按**节点**查而不是按机器：一台机器上可能同时跑 codex、opencode、qwen，
 		// 各自的 CLI 版本不同。查不到（老 CLI 未上报 / 迁移没跑）就不下发该字段，

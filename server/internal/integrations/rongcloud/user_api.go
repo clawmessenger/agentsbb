@@ -84,7 +84,7 @@ const (
 	friendCodeAlreadyFriends = 25460
 	// friendCodePendingApproval 是 /friend/add.json 的 processCode「待对方同意」：
 	// 申请确实建立了，但**好友边没有建立**。权威语义见 web 端
-	// clawmessenger-web/src/services/contacts.ts:376-388（FRIEND_CODE_PENDING）。
+	// agentsbb-web/src/services/contacts.ts:376-388（FRIEND_CODE_PENDING）。
 	friendCodePendingApproval = 25461
 )
 
@@ -251,7 +251,7 @@ func (c *rongcloudAPIClient) getFriends(ctx context.Context, userID string) ([]f
 //
 // 前者是线上实际返回（字段包在 data 子字典里）—— 旧 Python 后端的命令通道就是
 // 按 `result["data"]["portraitUri"]` 读的，注释见
-// clawmessenger-server/rongcloud/command_handler.py:1973；后者是官方英文文档
+// agentsbb-server/rongcloud/command_handler.py:1973；后者是官方英文文档
 // （platform-chat-api/user/get）给出的扁平结构，且字段名是 userName / userPortrait。
 //
 // 之前这里只认扁平 `name` / `portraitUri`，两种形状都对不上：postForm 只看

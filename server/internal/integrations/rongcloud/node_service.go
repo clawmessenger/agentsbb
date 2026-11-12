@@ -200,7 +200,7 @@ const rongcloudRCIdentityLimit = 64
 //
 // Rongcloud caps user ids at 64 chars, and CLI machine ids are numeric (10
 // digits), so the new shape never overflows. Older rows carry
-// "clawmessenger-<uuid>" (51 chars) and legacy MAC addresses, and anything too
+// "agentsbb-<uuid>" (51 chars) and legacy MAC addresses, and anything too
 // long is shortened to a stable sha256 prefix.
 func machineIdentityKey(machineID string) string {
 	// Frozen at the value the original "rc_node_<machine>_<agent>" scheme used:
@@ -221,7 +221,7 @@ func machineIdentityKey(machineID string) string {
 }
 
 // OpsAgentType is the ai_type of the built-in maintenance agent that every
-// clawmessenger device binds (see packages/xiachat-cli src/ops.ts). Its node
+// agentsbb device binds (see packages/xiachat-cli src/ops.ts). Its node
 // exists only to power the ops (运维) feature, so it is hidden from the
 // user-facing device list and friend list.
 const OpsAgentType = "ops"
@@ -291,7 +291,7 @@ func (s *NodeService) Register(ctx context.Context, params NodeRegisterParams) (
 		}
 		encToken = base64.StdEncoding.EncodeToString(sealed)
 	}
-	// Register must be idempotent per machine: a repeat `clawmessenger pair` on a
+	// Register must be idempotent per machine: a repeat `agentsbb pair` on a
 	// device that already registered would otherwise collide with the unique
 	// rongcloud_user_id / node rows and fail with a 500. Reuse the existing
 	// identity and just refresh its stored IM token.
@@ -1722,8 +1722,8 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 //
 // Format: "<agent>_<machine key>", e.g. hermes_1234567890. It follows the node
 // id convention the Python server has always used ("<node_type>_<numeric id>",
-// see clawmessenger-server/id_generator.py), which is also what the web parses
-// (clawmessenger-web/src/lib/ai-node-id.ts) and what users read in the device
+// see agentsbb-server/id_generator.py), which is also what the web parses
+// (agentsbb-web/src/lib/ai-node-id.ts) and what users read in the device
 // list. The machine node keeps the older "rc_node_<machine key>" form.
 func agentNodeRCUserID(agent, machineID string) string {
 	return agent + "_" + machineIdentityKey(machineID)

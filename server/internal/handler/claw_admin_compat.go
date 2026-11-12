@@ -1,7 +1,7 @@
 // Package handler - 虾说 admin-web 兼容层。
 //
 // 移植旧 Python 后端 /api/admin/* 的公开 HTTP 契约到 Go，供
-// clawmessenger-admin-web 直连。账号存 claw_admin_users（独立表）。
+// agentsbb-admin-web 直连。账号存 claw_admin_users（独立表）。
 // auth/users/stats/system-config/audit-logs 在这里；admins/roles 提供基础 CRUD；
 // nodes/groups 见 claw_admin_nodes.go / claw_admin_groups.go；
 // chatrooms/discussions/messages 见 claw_admin_conversations.go。

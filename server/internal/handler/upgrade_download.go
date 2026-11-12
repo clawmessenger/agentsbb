@@ -43,7 +43,7 @@ func clawUpgradeCacheDir() string {
 	if dir := strings.TrimSpace(os.Getenv("CLAW_UPGRADE_CACHE_DIR")); dir != "" {
 		return dir
 	}
-	return filepath.Join(os.TempDir(), "clawmessenger-upgrades")
+	return filepath.Join(os.TempDir(), "agentsbb-upgrades")
 }
 
 // clawUpgradeDownloadLocks 按 <version>/<asset> 串行化回源：同一版本并发到达时
@@ -65,10 +65,10 @@ func clawUpgradeDownloadLock(key string) *sync.Mutex {
 }
 
 // clawUpgradeTagForVersion 把版本号还原成发布 tag。发布链路固定是
-// `clawmessenger-v*.*.*`（.github/workflows/clawmessenger-release.yml），与 CLI
-// 的 versionFromTag 互逆。
+// `agentsbb-v*.*.*`（.github/workflows/agentsbb-release.yml），与 CLI 的
+// versionFromTag 互逆。
 func clawUpgradeTagForVersion(version string) string {
-	return "clawmessenger-v" + version
+	return clawUpgradeTagFromVersion(version)
 }
 
 // ClawUpgradeDownload GET /api/agent/upgrade/download?version=&asset=&token=
@@ -168,21 +168,39 @@ func clawUpgradeCachedAsset(ctx context.Context, version, asset string) (string,
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	url := clawUpgradeAssetURL(clawUpgradeTagForVersion(version), asset)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
+	// 回源地址按 tag 候选依次尝试：新前缀优先，旧前缀（`clawmessenger-v*`）
+	// 只在 404 时降级 —— 镜像里可能还挂着改名前的 1.3.x，或管理员给还没升级的
+	// 设备下发旧版本。404 是唯一的「换下一个」信号：5xx / 网络错误直接报错，
+	// 那些重试同一个 tag 才有意义。
+	//
+	// GET 是幂等的，重复请求没有副作用；每个候选各建一次请求（Header 不共享），
+	// 401/403/5xx 立刻收手，避免把 GitHub 的边缘限流放大 N 倍。
+	var res *http.Response
+	for _, tag := range clawUpgradeTagCandidates(version) {
+		url := clawUpgradeAssetURL(tag, asset)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return "", err
+		}
+		request.Header.Set("User-Agent", "agentsbb-server")
+		client := &http.Client{Timeout: 10 * time.Minute}
+		attempt, err := client.Do(request)
+		if err != nil {
+			return "", err
+		}
+		if attempt.StatusCode == http.StatusOK {
+			res = attempt
+			break
+		}
+		attempt.Body.Close()
+		if attempt.StatusCode != http.StatusNotFound {
+			return "", &clawUpgradeUpstreamError{Status: attempt.StatusCode}
+		}
 	}
-	request.Header.Set("User-Agent", "clawmessenger-server")
-	client := &http.Client{Timeout: 10 * time.Minute}
-	res, err := client.Do(request)
-	if err != nil {
-		return "", err
+	if res == nil {
+		return "", &clawUpgradeUpstreamError{Status: http.StatusNotFound}
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return "", &clawUpgradeUpstreamError{Status: res.StatusCode}
-	}
 	partial := dest + ".part"
 	out, err := os.Create(partial)
 	if err != nil {

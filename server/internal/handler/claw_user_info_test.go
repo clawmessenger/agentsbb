@@ -15,7 +15,7 @@ import (
 
 // claw_user_info_test.go 覆盖 /api/user/info 的节点回落链：
 //
-// 前端（clawmessenger-web 的 loadAuthoritativeChatroom / loadGroupMembers /
+// 前端（agentsbb-web 的 loadAuthoritativeChatroom / loadGroupMembers /
 // handleAddMember）会对群聊/聊天室的**每个成员**调这个接口取昵称头像。AI 成员
 // 的 userId 是 rc_node_*（rongcloud_user 表），不在 claw_im_users —— 修复前
 // 全部 404，气泡退化成裸 id。回落顺序：claw_im_users(user_id) →

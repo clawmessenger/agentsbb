@@ -55,7 +55,7 @@ func validClawFileKey(key string) bool {
 
 // ClawUploadFile — POST /api/upload
 //
-// 前端（clawmessenger-web）的图片/文件/语音/视频/头像上传入口。契约与旧 Python
+// 前端（agentsbb-web）的图片/文件/语音/视频/头像上传入口。契约与旧 Python
 // 后端的 /api/upload 一致：multipart 字段 file + type + filename，返回
 // {code,data:{url,filename,type,size}}。线上此前没有这个路由（404），前端上传
 // 一直是坏的 —— 头像走 dataURL 绕过了它，聊天里的图片/文件则直接失败。

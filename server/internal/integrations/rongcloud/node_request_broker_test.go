@@ -251,7 +251,7 @@ func TestSetupRecommendFailureMessage(t *testing.T) {
 		"ROLE_RECOMMENDATION_INVALID":           "主持设备返回的推荐结果无法解析，请重试",
 		"ROLE_RECOMMENDATION_EMPTY":             "主持设备上的模型这一轮没有返回任何内容，请换一个主持模型后重试",
 		"ROLE_RECOMMENDATION_MODEL_UNAVAILABLE": "主持设备上的模型当前不可用（额度用尽、限流或鉴权失败），请更换主持模型后重试",
-		"SYSTEM_HOST_OFFLINE":                   "系统主持 AI 当前不可用，请确认主持设备上的 clawmessenger 正在运行",
+		"SYSTEM_HOST_OFFLINE":                   "系统主持 AI 当前不可用，请确认主持设备上的 agentsbb 正在运行",
 		"NO_ELIGIBLE_USER_DEVICES":              "没有可用于讨论的在线设备",
 		"WHATEVER_ELSE":                         "角色推荐失败，请重试",
 	}

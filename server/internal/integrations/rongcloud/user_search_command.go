@@ -3,15 +3,15 @@ package rongcloud
 // user_search_command.go implements service=user, action=search —— web「添加好友」
 // 的账号搜索。
 //
-// 客户端调用点：clawmessenger-web/src/services/contacts.ts:237-249
+// 客户端调用点：agentsbb-web/src/services/contacts.ts:237-249
 // （`sendSystemRequest('user','search',{keyword})`，读 `result?.list`，
-// 解包在 clawmessenger-web/src/services/im.ts:469-471：成功时 resolve
-// `response.data`）。uniapp 同一契约：clawmessenger-uniapp/src/utils/
+// 解包在 agentsbb-web/src/services/im.ts:469-471：成功时 resolve
+// `response.data`）。uniapp 同一契约：agentsbb-uniapp/src/utils/
 // system-service-client.js:392-393 + subPackages/social/pages/search-user/index.vue:361-375
 // （逐字段 `||` 兜底，所以只要给 userId/username/nickname/portraitUri 就够）。
 //
 // 移植来源是旧 Python 后端的 `_handle_user_search`
-// （clawmessenger-server/rongcloud/command_handler.py:1936-1993）。移植时**有意**
+// （agentsbb-server/rongcloud/command_handler.py:1936-1993）。移植时**有意**
 // 偏离旧实现五处，理由都写在对应代码旁（决策记录见
 // .agent-runs/2026-10-27/task-001/implementer-report.md 的 D1/D2/D3/D4 与 §8）：
 //

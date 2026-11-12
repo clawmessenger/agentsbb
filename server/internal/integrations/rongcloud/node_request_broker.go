@@ -308,7 +308,7 @@ func (b *NodeRequestBroker) RecommendRoles(ctx context.Context, host NodeRequest
 // ---- 模型目录请求族（protocolVersion 2）---------------------------------
 //
 // 管理端「讨论主持 AI」的「供应商 → 模型」两级选择器需要主持节点自报的模型
-// 目录。C 端是浏览器直连设备（clawmessenger-web/src/services/node-model-catalog.ts），
+// 目录。C 端是浏览器直连设备（agentsbb-web/src/services/node-model-catalog.ts），
 // 但管理端没有 IM SDK，所以由服务端代理这一次往返：内容和线上的 C 端请求
 // **逐字节同构**（`msg_type` / `protocolVersion:2` / `requestId` / `timestamp`），
 // 设备端 CLI 的 `parseModelCatalogRequest`（packages/xiachat-cli/src/model-catalog.ts）
@@ -331,7 +331,7 @@ const (
 )
 
 // DiscussionModelCatalog 与 C 端的 NodeModelCatalog 同形
-// （clawmessenger-web/src/types/discussion.ts），只是字段名改成 Go 的大写形式。
+// （agentsbb-web/src/types/discussion.ts），只是字段名改成 Go 的大写形式。
 // 管理端页面据此渲染与「设备详情」页一致的级联选择器。
 type DiscussionModelCatalog struct {
 	// DefaultModel 是设备自己的默认模型 route（`provider/slug`），可能为空：

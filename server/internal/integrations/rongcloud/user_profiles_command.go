@@ -4,13 +4,13 @@ package rongcloud
 // id 取用户资料。它是「群聊添加成员弹窗里所有头像都一样」的服务端修复。
 //
 // 客户端调用点（2026-11-05 全库 grep 核对，回包形状必须同时满足）：
-//   - web clawmessenger-web/src/services/contacts.ts:204
+//   - web agentsbb-web/src/services/contacts.ts:204
 //     `sendSystemRequest<UserInfo[]>('user','getProfiles',{userIds})` —— resolve 的
 //     是信封里的 `data` 本身，所以 data **必须是数组**（不是 {list:[...]}）；
-//   - web clawmessenger-web/src/services/contacts.ts:304（resolveTargetProfile，
+//   - web agentsbb-web/src/services/contacts.ts:304（resolveTargetProfile，
 //     扫码/搜索后补单条资料，同样的数组期望）；
-//   - web clawmessenger-web/src/services/user.ts:84（getUserProfiles，数组期望）；
-//   - uniapp clawmessenger-uniapp/src/utils/system-service-client.js:377-378
+//   - web agentsbb-web/src/services/user.ts:84（getUserProfiles，数组期望）；
+//   - uniapp agentsbb-uniapp/src/utils/system-service-client.js:377-378
 //     （userService.getProfiles，同一契约；当前无页面调用，仅通道保留）。
 //
 // 数据源是本地镜像表 rongcloud_user（rongcloud_user_id / name / portrait_uri）。

@@ -24,7 +24,7 @@ func TestAgentNodeRCUserID(t *testing.T) {
 }
 
 // The device list parses node ids by their "<agent>_" prefix
-// (clawmessenger-web/src/lib/ai-node-id.ts) and users read the id directly, so
+// (agentsbb-web/src/lib/ai-node-id.ts) and users read the id directly, so
 // the agent name has to stay in front — it used to be a trailing suffix on an
 // opaque "rc_node_<machine>_<agent>" id.
 func TestAgentNodeRCUserIDKeepsAgentAsPrefix(t *testing.T) {

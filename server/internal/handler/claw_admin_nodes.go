@@ -305,7 +305,7 @@ type clawAdminNodeRow struct {
 	InstallDir string `json:"install_dir,omitempty"`
 	// ---- 智能体 CLI 自己的版本与路径（迁移 612）-------------------------------
 	//
-	// 上面三个字段（ExeVersion/ExePlatform/InstallDir）描述的是 **clawmessenger
+	// 上面三个字段（ExeVersion/ExePlatform/InstallDir）描述的是 **agentsbb
 	// 自己**（supervisor）。详情页讲的却是「某个智能体」：运维要知道 codex 装的是
 	// 哪个版本、二进制在哪个目录，出问题时要直接去那儿翻日志、换二进制。所以
 	// 「版本」「安装目录」两栏展示这一组，supervisor 的版本另列（升级要用）。

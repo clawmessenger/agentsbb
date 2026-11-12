@@ -14,14 +14,14 @@ import (
 // C 端 web 的「建群」走的就是这条通道：sendSystemRequest('group', 'create',
 // {groupName, ownerId, memberIds, portraitUri, openclawMaxRounds})，紧接着再发一条
 // ('group','update',{groupId, openclawMaxRounds}) 兜底（见
-// clawmessenger-web/src/services/im.ts 的 createGroupConversation）。
+// agentsbb-web/src/services/im.ts 的 createGroupConversation）。
 // Go 的 systemHandler 此前只认 ping/chatroom/device/discussion/ai，group 落进
 // unknown service 分支，所以建群一直是坏的。
 //
 // 当前两个客户端真正会调用的动作（逐个 grep 出来的，不是猜的）：
-//   - clawmessenger-web：create / update / addMember / removeMember / getMembers /
+//   - agentsbb-web：create / update / addMember / removeMember / getMembers /
 //     getMyGroups / getProfiles
-//   - clawmessenger-uniapp：上面七个 + getInfo / transfer / quit / dismiss
+//   - agentsbb-uniapp：上面七个 + getInfo / transfer / quit / dismiss
 // 也就是说 11 个动作全部有调用方。早期这里只实现了 create / update，理由是「其余
 // 动作 C 端并不调用」—— 那个判断是错的：群资料页一进来就调 getInfo，成员列表调
 // getMembers，结果是「群聊添加成员报错 unsupported group action: addMember」这一类

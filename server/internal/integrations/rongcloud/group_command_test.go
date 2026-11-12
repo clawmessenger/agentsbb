@@ -549,7 +549,7 @@ func TestGroupCreateAcceptsTheWebCamelCaseEnvelope(t *testing.T) {
 	defer srv.Close()
 	handler := newGroupCommandHandler(t, rec, srv, newGroupMirrorStub().mirror())
 
-	// clawmessenger-web 发的是 camelCase：{requestId, service, action, payload}。
+	// agentsbb-web 发的是 camelCase：{requestId, service, action, payload}。
 	msg := NormalizedMessage{
 		ObjectName: objectNameCommand,
 		FromUserID: "user-7",

@@ -5,10 +5,10 @@ package rongcloud
 // uniapp 的「个人资料 → 发消息」（subPackages/social/pages/user-profile/index.vue）
 // 会先把会话号落一份副本：`conversationService.save({targetId, conversationType,
 // conversationId, ...})`，客户端定义见
-// clawmessenger-uniapp/src/utils/system-service-client.js:792-795。
+// agentsbb-uniapp/src/utils/system-service-client.js:792-795。
 //
 // 这是从旧 Python 后端移植时漏掉的一个 service（旧实现见
-// clawmessenger-server/rongcloud/command_handler.py:5754-5810 的
+// agentsbb-server/rongcloud/command_handler.py:5754-5810 的
 // _handle_conversation_save / _handle_conversation_get）。漏掉的后果不是功能坏，
 // 而是每次点「发消息」都收到 404「未知的服务或操作: conversation/save」，
 // 小程序控制台整片报红（2026-10-26 现场）—— 客户端虽然 catch 住了继续跳转，

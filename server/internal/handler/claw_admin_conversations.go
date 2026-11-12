@@ -12,7 +12,7 @@
 //   - 消息：rongcloud_discussion_event（唯一持久化的 IM 消息流 —— 融云只负责
 //     投递，Go 不落普通单聊/群聊消息，落库的只有讨论事件）
 //
-// 术语对齐 C 端（clawmessenger-web/src/lib/conversation-kind.ts）：
+// 术语对齐 C 端（agentsbb-web/src/lib/conversation-kind.ts）：
 // conversation_kind='discussion' 的房间在 C 端叫「讨论组」，其余叫「聊天室」。
 // 管理端因此把「聊天室」定义为房间实体、把「讨论组」定义为讨论场次，两者是
 // 一对多，各自有独立页面，不重复列同一批数据。

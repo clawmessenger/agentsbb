@@ -9,9 +9,9 @@ import (
 //
 // 这些动作此前全部落进 handleGroupCommand 的 default 分支，回一句
 // "unsupported group action: addMember" —— 也就是用户报的那个错。而两个客户端
-// （clawmessenger-web / clawmessenger-uniapp）把它们都当正常接口在用：群资料页
+// （agentsbb-web / agentsbb-uniapp）把它们都当正常接口在用：群资料页
 // 调 getInfo，成员列表调 getMembers，加人调 addMember。所以这里按旧后端
-// clawmessenger-server/rongcloud/command_handler.py 的语义逐个补齐，包括各自的
+// agentsbb-server/rongcloud/command_handler.py 的语义逐个补齐，包括各自的
 // 权限判定 —— 权限放宽是最容易在补接口时顺手引入的安全问题：
 //
 //	addMember    只有**群成员**可以邀请新成员（不是只有群主）

@@ -39,7 +39,7 @@ import (
 
 // 超时三个值的分工（改任何一个都要连带看另外两个）：
 //   - clawAdminDiscussionHostMinTimeout / MaxTimeout（10 / 600）是**夹逼范围**：
-//     管理端表单（clawmessenger-admin-web 的 System/DiscussionHost.tsx）与
+//     管理端表单（agentsbb-admin-web 的 System/DiscussionHost.tsx）与
 //     api/discussion-host.ts 的请求超时都按它夹逼，收窄会报「假超时」；
 //   - clawAdminDiscussionHostTimeoutInit（120）是「没配过超时」时的**默认值**。
 //     为什么从 60 提到 120：一次角色推荐要在主持设备上跑一整回合 LLM（十几秒到
@@ -224,7 +224,7 @@ var clawAdminRequiredHostCapabilities = []string{
 }
 
 // clawAdminDiscussionHostConfig is the wire shape GET and PUT both return; it
-// matches DiscussionHostConfig in clawmessenger-admin-web/src/types.
+// matches DiscussionHostConfig in agentsbb-admin-web/src/types.
 type clawAdminDiscussionHostConfig struct {
 	Enabled                  bool   `json:"enabled"`
 	NodeID                   string `json:"node_id"`
@@ -889,7 +889,7 @@ func (h *Handler) ClawAdminDiscussionHostPut(w http.ResponseWriter, r *http.Requ
 // （protocolVersion 2），设备端 CLI 已经有应答器，**无需任何改动**。
 //
 // 返回形状与 C 端的 NodeModelCatalog 一致，前端因此可以 1:1 抄「设备详情」页的
-// 级联选择器（clawmessenger-web/src/sections/DeviceDetail.tsx:390-430）。
+// 级联选择器（agentsbb-web/src/sections/DeviceDetail.tsx:390-430）。
 //
 // 取不到目录时的语义：**一律** 503 + 同一个 code（MODEL_CATALOG_UNAVAILABLE），
 // 页面据此降级成两个可手填的输入框。具体原因（节点不存在 / 不是主持节点 /

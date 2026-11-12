@@ -34,7 +34,7 @@ type clawAdminOpsChatContext struct {
 
 	ExeVersion string `json:"exe_version"`
 	// agent CLI 版本是该节点智能体自己的（rongcloud_node_agent_cli，迁移 612），
-	// 不是 clawmessenger supervisor 的 exe_version；空 = 设备没探到或老 CLI 未上报。
+	// 不是 agentsbb supervisor 的 exe_version；空 = 设备没探到或老 CLI 未上报。
 	AgentCLIVersion string `json:"agent_cli_version,omitempty"`
 	AgentCLIPath    string `json:"agent_cli_path,omitempty"`
 

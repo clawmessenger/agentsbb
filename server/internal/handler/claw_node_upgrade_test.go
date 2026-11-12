@@ -137,18 +137,18 @@ func TestCompareClawVersions(t *testing.T) {
 
 func TestParseClawSHA256Sums(t *testing.T) {
 	sums := parseClawSHA256Sums(strings.Join([]string{
-		strings.Repeat("a", 64) + "  clawmessenger-windows-x64.exe",
-		strings.Repeat("b", 64) + " *clawmessenger-linux-x64",
+		strings.Repeat("a", 64) + "  agentsbb-windows-x64.exe",
+		strings.Repeat("b", 64) + " *agentsbb-linux-x64",
 		"# comment line",
 		"",
 		"not-a-hash  something",
 	}, "\r\n"))
 
-	if sums["clawmessenger-windows-x64.exe"] != strings.Repeat("a", 64) {
-		t.Fatalf("windows asset sum = %q", sums["clawmessenger-windows-x64.exe"])
+	if sums["agentsbb-windows-x64.exe"] != strings.Repeat("a", 64) {
+		t.Fatalf("windows asset sum = %q", sums["agentsbb-windows-x64.exe"])
 	}
-	if sums["clawmessenger-linux-x64"] != strings.Repeat("b", 64) {
-		t.Fatalf("star-prefixed entry must be parsed, got %q", sums["clawmessenger-linux-x64"])
+	if sums["agentsbb-linux-x64"] != strings.Repeat("b", 64) {
+		t.Fatalf("star-prefixed entry must be parsed, got %q", sums["agentsbb-linux-x64"])
 	}
 	if len(sums) != 2 {
 		t.Fatalf("garbage lines must be ignored, got %v", sums)
@@ -181,7 +181,7 @@ func TestClawUpgradeTokenIsBoundToVersionAndAsset(t *testing.T) {
 func TestClawUpgradeMirrorsPreferGitHubThenServerProxy(t *testing.T) {
 	release := &clawUpgradeRelease{
 		Version: "1.3.0",
-		Tag:     "clawmessenger-v1.3.0",
+		Tag:     "agentsbb-v1.3.0",
 		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
 	}
 	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok")
@@ -206,7 +206,7 @@ func TestClawUpgradeMirrorsPreferGitHubThenServerProxy(t *testing.T) {
 func TestClawUpgradeMirrorsDropTheProxyWithoutASecret(t *testing.T) {
 	release := &clawUpgradeRelease{
 		Version: "1.3.0",
-		Tag:     "clawmessenger-v1.3.0",
+		Tag:     "agentsbb-v1.3.0",
 		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
 	}
 	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "")
@@ -303,7 +303,7 @@ func TestClawUpgradePlatformSupported(t *testing.T) {
 		}
 	}
 	// 下载代理是公开端点，资产名进 URL：白名单之外的名字一个都不能过。
-	for _, asset := range []string{"clawmessenger-linux-riscv64", "clawmessenger.exe", "../SHA256SUMS", ""} {
+	for _, asset := range []string{"agentsbb-linux-riscv64", "agentsbb.exe", "../SHA256SUMS", ""} {
 		if clawUpgradeAssetSupported(asset) {
 			t.Fatalf("asset %q must be rejected by the download allow-list", asset)
 		}
@@ -435,7 +435,7 @@ func fakeGitHub(t *testing.T, version string, fail *atomic.Bool) (*httptest.Serv
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"tag_name": "clawmessenger-v" + version,
+				"tag_name": "agentsbb-v" + version,
 				"assets": []map[string]string{
 					{"name": clawUpgradeWindowsAsset, "browser_download_url": "https://github.example/bin"},
 					{"name": "SHA256SUMS", "browser_download_url": "http://" + r.Host + "/sums"},
@@ -974,14 +974,14 @@ func TestClawUpgradeInstallDirEmptyReportKeepsTheStoredValue(t *testing.T) {
 
 	// 新版 CLI 先报一次目录（走与生产一致的 upsert 路径）。
 	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node,
-		"1.3.19", clawUpgradePlatformWindows, "host-a", `C:/Users/ops/.clawmessenger/bin`, 0); err != nil {
+		"1.3.19", clawUpgradePlatformWindows, "host-a", `C:/Users/ops/.agentsbb/bin`, 0); err != nil {
 		t.Fatalf("seed install_dir: %v", err)
 	}
 	up, found, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
 	if err != nil || !found {
 		t.Fatalf("read upgrade row: found=%v err=%v", found, err)
 	}
-	if up.InstallDir != `C:/Users/ops/.clawmessenger/bin` {
+	if up.InstallDir != `C:/Users/ops/.agentsbb/bin` {
 		t.Fatalf("install_dir must be stored verbatim, got %q", up.InstallDir)
 	}
 
@@ -1001,14 +1001,14 @@ func TestClawUpgradeInstallDirEmptyReportKeepsTheStoredValue(t *testing.T) {
 
 	// 新目录（设备搬家/重装后）仍然能推进：COALESCE 不是「只写一次」。
 	if err := testHandler.clawDeviceRecordUpgradeState(ctx, node,
-		"1.3.19", clawUpgradePlatformWindows, "host-b", `D:/tools/clawmessenger`, 0); err != nil {
+		"1.3.19", clawUpgradePlatformWindows, "host-b", `D:/tools/agentsbb`, 0); err != nil {
 		t.Fatalf("moved install_dir upsert: %v", err)
 	}
 	moved, _, err := testHandler.clawNodeUpgradeByMachine(ctx, machine)
 	if err != nil {
 		t.Fatalf("read upgrade row after move: %v", err)
 	}
-	if moved.InstallDir != `D:/tools/clawmessenger` {
+	if moved.InstallDir != `D:/tools/agentsbb` {
 		t.Fatalf("a non-empty installDir must advance the stored value, got %q", moved.InstallDir)
 	}
 }

@@ -3,7 +3,7 @@ package rongcloud
 // web_login_command.go 实现 service=user 的 action=confirmWebLogin
 // —— Web 扫码登录里「移动端确认」那一半。
 //
-// 调用点：clawmessenger-uniapp 两个扫码入口都会识别
+// 调用点：agentsbb-uniapp 两个扫码入口都会识别
 // `{type:'web_login', ticket}` 并调 `userService.confirmWebLogin(ticket)`
 // （pages/conversation/index.vue:299、subPackages/social/pages/search-user/index.vue:564）。
 //
