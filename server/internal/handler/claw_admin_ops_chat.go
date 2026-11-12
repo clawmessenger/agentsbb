@@ -27,11 +27,17 @@ const clawAdminOpsChatMaxTextRunes = 4000
 // clawAdminOpsChatContext 是抽屉头部那一排「这台节点现在什么状态」的事实来源。
 // 名称/版本/机器名全部复用节点列表与详情页的助手，避免运维面板自己另算一套。
 type clawAdminOpsChatContext struct {
-	NodeID         string `json:"node_id"`
-	Name           string `json:"name"`
-	NodeType       string `json:"node_type"`
-	Online         bool   `json:"online"`
-	ExeVersion     string `json:"exe_version"`
+	NodeID   string `json:"node_id"`
+	Name     string `json:"name"`
+	NodeType string `json:"node_type"`
+	Online   bool   `json:"online"`
+
+	ExeVersion string `json:"exe_version"`
+	// agent CLI 版本是该节点智能体自己的（rongcloud_node_agent_cli，迁移 612），
+	// 不是 clawmessenger supervisor 的 exe_version；空 = 设备没探到或老 CLI 未上报。
+	AgentCLIVersion string `json:"agent_cli_version,omitempty"`
+	AgentCLIPath    string `json:"agent_cli_path,omitempty"`
+
 	MachineName    string `json:"machine_name"`
 	OpsPeerID      string `json:"ops_peer_id"`
 	OpsPeerOnline  bool   `json:"ops_peer_online"`
@@ -180,6 +186,13 @@ func (h *Handler) clawAdminOpsChatContextOf(r *http.Request, rec clawAdminNodeRe
 	)
 	out.ExeVersion = row.ExeVersion
 	out.MachineName = row.MachineName
+
+	// agent CLI 版本同样与详情页同源（rongcloud_node_agent_cli，迁移 612）：
+	// helper 自身对 h.DB 为 nil / 表不存在都是安全降级（found=false），不报错。
+	if cli, found := h.clawNodeAgentCLIByNode(ctx, rec.ID); found {
+		out.AgentCLIVersion = cli.CLIVersion
+		out.AgentCLIPath = cli.CLIPath
+	}
 
 	if h.RongCloudNode == nil || h.Queries == nil {
 		return out
