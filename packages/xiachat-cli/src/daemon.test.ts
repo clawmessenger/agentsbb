@@ -1130,4 +1130,24 @@ describe("serviceHealth（Windows 看门狗探测的编码兜底）", () => {
     expect(health.ready).toBe(true);
     expect(health.detail).toContain("崩溃看门狗");
   });
+
+  // 老测试桩（以及任何还没跟上 encoding:"buffer" 的注入点）会返回**字符串**输出。
+  // 这条钉住 Buffer.isBuffer 兜底：拿不到原始字节就当空串走默认文案，绝不能因为
+  // Buffer.concat 收到字符串而抛错——serviceHealth 在 supervisor 启动路径上，抛了
+  // 就等于设备起不来。
+  it("注入的假 spawnSync 仍返回字符串时降级到默认文案，不抛错", () => {
+    const spawnSyncFake = (() => ({
+      status: 1,
+      stdout: "ERROR: Access is denied.",
+      stderr: "",
+      pid: 0,
+    })) as unknown as typeof import("node:child_process").spawnSync;
+    const h = setup({ spawnSync: spawnSyncFake });
+
+    const health = h.daemon.serviceHealth();
+
+    expect(health.ready).toBe(false);
+    expect(health.detail).toContain("schtasks 不可用");
+    expect(health.detail).not.toContain("\uFFFD");
+  });
 });
