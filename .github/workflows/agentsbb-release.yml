@@ -256,24 +256,32 @@ jobs:
 
       # Windows users get the background-daemon wrapper next to the exe, so the
       # agents can stay online without a foreground console window.
+      #
+      # 压缩包里同时放旧名垫片：老运维手册/脚本还在跑 `clawmessenger-daemon.cmd`
+      # （或 `.ps1`），包里没有它就会「升级后照着手册跑，文件不存在」。
+      # TODO(rebrand-retire): v1.6.0 去掉两个 clawmessenger-daemon.*。
       - name: Bundle Windows daemon scripts
         shell: bash
         run: |
           set -euo pipefail
           zip -9 -j artifacts/agentsbb-windows-x64-daemon-scripts.zip \
             packages/xiachat-cli/scripts/win/agentsbb-daemon.ps1 \
-            packages/xiachat-cli/scripts/win/agentsbb-daemon.cmd
+            packages/xiachat-cli/scripts/win/agentsbb-daemon.cmd \
+            packages/xiachat-cli/scripts/win/clawmessenger-daemon.ps1 \
+            packages/xiachat-cli/scripts/win/clawmessenger-daemon.cmd
           unzip -l artifacts/agentsbb-windows-x64-daemon-scripts.zip
 
       # Linux/macOS users get the same capability: a daemon wrapper that detaches
       # from the shell (nohup/setsid) and can register a systemd service.
+      # TODO(rebrand-retire): v1.6.0 去掉 clawmessenger-daemon.sh 垫片。
       - name: Bundle Linux/macOS daemon scripts
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x packages/xiachat-cli/scripts/linux/agentsbb-daemon.sh
+          chmod +x packages/xiachat-cli/scripts/linux/agentsbb-daemon.sh \
+            packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh
           tar -czf artifacts/agentsbb-linux-daemon-scripts.tar.gz \
-            -C packages/xiachat-cli/scripts/linux agentsbb-daemon.sh
+            -C packages/xiachat-cli/scripts/linux agentsbb-daemon.sh clawmessenger-daemon.sh
           tar -tzvf artifacts/agentsbb-linux-daemon-scripts.tar.gz
 
       # 旧名单别名：字节完全相同的第二份文件名，只为了让 1.3.x 客户端
