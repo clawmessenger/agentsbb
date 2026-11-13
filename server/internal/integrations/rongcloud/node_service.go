@@ -221,7 +221,7 @@ func machineIdentityKey(machineID string) string {
 }
 
 // OpsAgentType is the ai_type of the built-in maintenance agent that every
-// agentsbb device binds (see packages/xiachat-cli src/ops.ts). Its node
+// agentsbb device binds (see packages/agentsbb-cli src/ops.ts). Its node
 // exists only to power the ops (运维) feature, so it is hidden from the
 // user-facing device list and friend list.
 const OpsAgentType = "ops"
@@ -1881,7 +1881,7 @@ func isReplaceableNodePortrait(current string) bool {
 // part alone.
 //
 // The CLI registers a machine as "<os.hostname()> <aiType>" (see
-// packages/xiachat-cli/src/main.ts), so the infrastructure node's stored
+// packages/agentsbb-cli/src/main.ts), so the infrastructure node's stored
 // nickname carries whichever agent happened to run `pair`. In the device list
 // that suffix is noise: the row already says which agent it is, and the point
 // of exposing the machine name at all is that three agents on one box render

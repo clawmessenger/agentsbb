@@ -1,4 +1,4 @@
-# Publishes the AgentsBB CLI (packages/xiachat-cli) as standalone Node SEA
+# Publishes the AgentsBB CLI (packages/agentsbb-cli) as standalone Node SEA
 # executables via GitHub Releases.
 #
 # Trigger: pushing a tag named agentsbb-v*.*.* (for example agentsbb-v0.1.0).
@@ -110,7 +110,7 @@ jobs:
           # build-exe.mjs 双读 AGENTSBB_VERSION ?? CLAWMESSENGER_VERSION（TODO(rebrand-retire)），
           # 这里只注入新名。
           AGENTSBB_VERSION: ${{ steps.version.outputs.value }}
-        run: pnpm --filter @quukk/xiachat-cli build:exe
+        run: pnpm --filter @quukk/agentsbb-cli build:exe
 
       # Gate 1, on the entry bundle: deterministic and side-effect free (plain
       # node, runs the same injected constant the SEA blob carries). Fails fast
@@ -118,7 +118,7 @@ jobs:
       #
       # 取版本号用「按 semver 形状挑行」而不是 `tail -n1`：产物首次运行时会在版本号
       # 之后追加自安装通知，`tail -n1` 拿到的是通知文本，会把正确的包判成版本不对。
-      # 通知现在改走 stderr（packages/xiachat-cli/src/bin.ts），这里仍然两道保险。
+      # 通知现在改走 stderr（packages/agentsbb-cli/src/bin.ts），这里仍然两道保险。
       #
       # 采集方式必须是「重定向到文件」，不能是 `raw="$( ... )"`。命令替换在 POSIX 上
       # 把 stdout 接到**管道**，而 Node 的 process.stdout 接管道时是异步写、接文件时
@@ -132,7 +132,7 @@ jobs:
           EXPECTED: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          bundle="packages/xiachat-cli/dist/agentsbb.sea.cjs"
+          bundle="packages/agentsbb-cli/dist/agentsbb.sea.cjs"
           if [[ ! -f "$bundle" ]]; then
             echo "::error::build:exe did not produce $bundle"
             exit 1
@@ -183,7 +183,7 @@ jobs:
           EXPECTED: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          artifact="packages/xiachat-cli/${{ matrix.source }}"
+          artifact="packages/agentsbb-cli/${{ matrix.source }}"
           if [[ ! -f "$artifact" ]]; then
             echo "::error::$artifact was not produced by build:exe"
             exit 1
@@ -224,8 +224,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ls -l packages/xiachat-cli/dist
-          mv "packages/xiachat-cli/${{ matrix.source }}" "${{ matrix.artifact }}"
+          ls -l packages/agentsbb-cli/dist
+          mv "packages/agentsbb-cli/${{ matrix.source }}" "${{ matrix.artifact }}"
           if [[ "${{ runner.os }}" != "Windows" ]]; then
             chmod +x "${{ matrix.artifact }}"
           fi
@@ -265,10 +265,10 @@ jobs:
         run: |
           set -euo pipefail
           zip -9 -j artifacts/agentsbb-windows-x64-daemon-scripts.zip \
-            packages/xiachat-cli/scripts/win/agentsbb-daemon.ps1 \
-            packages/xiachat-cli/scripts/win/agentsbb-daemon.cmd \
-            packages/xiachat-cli/scripts/win/clawmessenger-daemon.ps1 \
-            packages/xiachat-cli/scripts/win/clawmessenger-daemon.cmd
+            packages/agentsbb-cli/scripts/win/agentsbb-daemon.ps1 \
+            packages/agentsbb-cli/scripts/win/agentsbb-daemon.cmd \
+            packages/agentsbb-cli/scripts/win/clawmessenger-daemon.ps1 \
+            packages/agentsbb-cli/scripts/win/clawmessenger-daemon.cmd
           unzip -l artifacts/agentsbb-windows-x64-daemon-scripts.zip
 
       # Linux/macOS users get the same capability: a daemon wrapper that detaches
@@ -278,10 +278,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x packages/xiachat-cli/scripts/linux/agentsbb-daemon.sh \
-            packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh
+          chmod +x packages/agentsbb-cli/scripts/linux/agentsbb-daemon.sh \
+            packages/agentsbb-cli/scripts/linux/clawmessenger-daemon.sh
           tar -czf artifacts/agentsbb-linux-daemon-scripts.tar.gz \
-            -C packages/xiachat-cli/scripts/linux agentsbb-daemon.sh clawmessenger-daemon.sh
+            -C packages/agentsbb-cli/scripts/linux agentsbb-daemon.sh clawmessenger-daemon.sh
           tar -tzvf artifacts/agentsbb-linux-daemon-scripts.tar.gz
 
       # 旧名单别名：字节完全相同的第二份文件名，只为了让 1.3.x 客户端

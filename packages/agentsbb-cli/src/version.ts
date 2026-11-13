@@ -17,7 +17,7 @@
 
 declare const __AGENTSBB_VERSION__: string | undefined;
 
-/** 与 packages/xiachat-cli/package.json 的 version 手工同步（有测试盯着）。 */
+/** 与 packages/agentsbb-cli/package.json 的 version 手工同步（有测试盯着）。 */
 export const AGENTSBB_VERSION_FALLBACK = "1.3.35";
 
 /** 本进程的 CLI 版本：构建期注入优先，否则用兜底字面量。 */

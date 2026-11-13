@@ -180,7 +180,7 @@ func (h *systemHandler) dispatchToCoordinator(ctx context.Context, targetID stri
 //
 // 它走 command 通道，但**不是** command_result —— 设备端按 web 的协议直接回
 // `{msg_type:"discussion_model_catalog_response", protocolVersion:2, …}`
-// （packages/xiachat-cli/src/model-catalog.ts 的 buildModelCatalogResponse）。
+// （packages/agentsbb-cli/src/model-catalog.ts 的 buildModelCatalogResponse）。
 // 不在这里单独识别的话，它会掉进 dispatchCommandAsync 被当成一条未知命令，
 // 于是等目录的那一侧只能等到超时。
 func isModelCatalogResponse(msg NormalizedMessage) bool {

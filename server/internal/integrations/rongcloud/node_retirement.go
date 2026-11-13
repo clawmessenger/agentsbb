@@ -8,7 +8,7 @@ import (
 )
 
 // ShortMachineIDMax is the longest machine id the CLI mints since short ids
-// were introduced (see packages/xiachat-cli/src/config.ts, MACHINE_ID_LENGTH =
+// were introduced (see packages/agentsbb-cli/src/config.ts, MACHINE_ID_LENGTH =
 // 10). Pass it as maxMachineIDLength to sweep anything outside the format.
 const ShortMachineIDMax = 11
 

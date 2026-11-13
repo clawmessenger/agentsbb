@@ -73,7 +73,7 @@ func (h *Handler) ClawUploadFile(w http.ResponseWriter, r *http.Request) {
 
 // ClawNodeUploadFile — POST /api/claw/node-files
 //
-// 设备端（xiachat-cli）把本轮 agent 产出的文件送上来。鉴权沿用同组设备接口的
+// 设备端（agentsbb-cli）把本轮 agent 产出的文件送上来。鉴权沿用同组设备接口的
 // 约定：机器节点的 device credential（nodeId + credentialId + secret）以表单
 // 字段随 multipart 一起提交。
 func (h *Handler) ClawNodeUploadFile(w http.ResponseWriter, r *http.Request) {

@@ -76,7 +76,7 @@ func (b *DiscussionBridge) IsServerManagedByType(aiType string) bool {
 //	         full route fails with model_not_found.
 //	hermes — `-m <slug> --provider <id>`.
 //
-// Keep in sync with buildModelArgs in packages/xiachat-cli/src/agents.ts.
+// Keep in sync with buildModelArgs in packages/agentsbb-cli/src/agents.ts.
 var modelRouteRE = regexp.MustCompile(
 	`^([A-Za-z0-9][A-Za-z0-9._-]{0,127})/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$`,
 )
@@ -122,7 +122,7 @@ func modelArgs(name, model string) []string {
 //	openclaw: `agent --local -m` one-shot message (stdin-mode unsupported)
 //	hermes:   `-z` one-shot prompt (stdin-mode unsupported)
 //
-// Keep in sync with buildAgentArgs in packages/xiachat-cli/src/agents.ts.
+// Keep in sync with buildAgentArgs in packages/agentsbb-cli/src/agents.ts.
 func agentArgvArgs(name, prompt, model string) []string {
 	switch name {
 	case "claude":
@@ -152,7 +152,7 @@ type invocationSpec struct {
 	stdinPrompt bool
 }
 
-// buildInvocation mirrors buildAgentArgs in packages/xiachat-cli: agents
+// buildInvocation mirrors buildAgentArgs in packages/agentsbb-cli: agents
 // with a known strategy take the prompt as argv; unknown agents (or a
 // prompt past the argv length cap) keep the stdin invocation with the
 // model flag as the only argument.

@@ -4,7 +4,7 @@
 
 **Goal:** 让用户在自己设备上运行一个 CLI（xiachat），内置融云 IM 连接并调用本地 Agent（claude/codex/opencode 等），实现用户经虾说 App 与自有 Agent 单聊 + 参与多节点讨论；消息全走融云，服务器仅通过 webhook 旁观。
 
-**Architecture:** 服务端两处最小改动（注册写 workspace 归属、新增 pairing claim 公开端点），其余全是复用。CLI 为 pnpm workspace 新包 `packages/xiachat-cli/`（TypeScript + Node ≥20 + `@rongcloud/imlib-next`），命令含 register / pair / login / agents / run / status。CLI 与服务器之间只有 HTTP（注册/配对/刷 token/取 appKey），运行期零服务器依赖。
+**Architecture:** 服务端两处最小改动（注册写 workspace 归属、新增 pairing claim 公开端点），其余全是复用。CLI 为 pnpm workspace 新包 `packages/agentsbb-cli/`（TypeScript + Node ≥20 + `@rongcloud/imlib-next`），命令含 register / pair / login / agents / run / status。CLI 与服务器之间只有 HTTP（注册/配对/刷 token/取 appKey），运行期零服务器依赖。
 
 **Tech Stack:** Go (Chi, sqlc/pgx/v5), TypeScript (Node ≥ 20, commander, @rongcloud/imlib-next, vitest), PostgreSQL
 
@@ -21,7 +21,7 @@
 - RongCloud objectName: command 消息是字面量 `"command"`（非 RC:CmdMsg）
 - Go binary on Windows: `C:\Program Files\Go\bin\go.exe`；Go 测试从 `server/` 目录跑
 - Handler 测试用 `testutil.Call(h, req).Want(status).JSON(&out)`（server/internal/testutil/http.go:93）
-- CLI 是 pnpm workspace 包：`packages/xiachat-cli/`，自动被 `pnpm-workspace.yaml` 的 `packages/*` glob 覆盖，无需改 workspace 配置
+- CLI 是 pnpm workspace 包：`packages/agentsbb-cli/`，自动被 `pnpm-workspace.yaml` 的 `packages/*` glob 覆盖，无需改 workspace 配置
 - CLI Node ≥ 20；DOM-free 测试文件以 `// @vitest-environment node` 开头
 - 凭证文件权限 0600；凭证绝不写日志
 - 讨论回合超时 120s（与服务端 turnTimeout 对齐）；stdout 截断 64KB
@@ -326,20 +326,20 @@ git commit -m "feat(rongcloud): public pairing claim endpoint for user devices"
 ### Task 3: CLI 包骨架 + protocol.ts（M2 起点）
 
 **Files:**
-- Create: `packages/xiachat-cli/package.json`, `packages/xiachat-cli/tsconfig.json`, `packages/xiachat-cli/vitest.config.ts`
-- Create: `packages/xiachat-cli/src/protocol.ts`
-- Test: `packages/xiachat-cli/src/protocol.test.ts`
+- Create: `packages/agentsbb-cli/package.json`, `packages/agentsbb-cli/tsconfig.json`, `packages/agentsbb-cli/vitest.config.ts`
+- Create: `packages/agentsbb-cli/src/protocol.ts`
+- Test: `packages/agentsbb-cli/src/protocol.test.ts`
 
 **Interfaces:**
 - Produces: `encodeCommand(requestId, service, action, params): string`、`decodeCommandContent(raw): CommandContent | null`、`encodeCommandResult(requestId, msgType, payload): string`、`encodeStreamFrame(turnId, streamType, content): string`、类型 `CommandContent` / `CommandResultContent` / `StreamFrame`。后续 Task 7-8 的 im.ts / agents.ts 依赖这些签名。
 
 - [ ] **Step 1: Create package scaffolding**
 
-`packages/xiachat-cli/package.json`:
+`packages/agentsbb-cli/package.json`:
 
 ```json
 {
-  "name": "@multica/xiachat-cli",
+  "name": "@multica/agentsbb-cli",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -363,7 +363,7 @@ git commit -m "feat(rongcloud): public pairing claim endpoint for user devices"
 }
 ```
 
-`packages/xiachat-cli/tsconfig.json`:
+`packages/agentsbb-cli/tsconfig.json`:
 
 ```json
 {
@@ -381,7 +381,7 @@ git commit -m "feat(rongcloud): public pairing claim endpoint for user devices"
 }
 ```
 
-`packages/xiachat-cli/vitest.config.ts`:
+`packages/agentsbb-cli/vitest.config.ts`:
 
 ```ts
 import { defineConfig } from "vitest/config";
@@ -398,7 +398,7 @@ Run: `pnpm install`（repo root）
 
 - [ ] **Step 2: Write the failing test**
 
-Create `packages/xiachat-cli/src/protocol.test.ts`:
+Create `packages/agentsbb-cli/src/protocol.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -471,12 +471,12 @@ describe("encodeStreamFrame", () => {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: FAIL — `Cannot find module './protocol'`
 
 - [ ] **Step 4: Implement protocol.ts**
 
-Create `packages/xiachat-cli/src/protocol.ts`:
+Create `packages/agentsbb-cli/src/protocol.ts`:
 
 ```ts
 // Message protocol shared with the Go server (server/internal/integrations/
@@ -557,13 +557,13 @@ export function encodeStreamFrame(
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: PASS（4 suites）
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/xiachat-cli/package.json packages/xiachat-cli/tsconfig.json packages/xiachat-cli/vitest.config.ts packages/xiachat-cli/src/protocol.ts packages/xiachat-cli/src/protocol.test.ts pnpm-lock.yaml
+git add packages/agentsbb-cli/package.json packages/agentsbb-cli/tsconfig.json packages/agentsbb-cli/vitest.config.ts packages/agentsbb-cli/src/protocol.ts packages/agentsbb-cli/src/protocol.test.ts pnpm-lock.yaml
 git commit -m "feat(xiachat): CLI package scaffold and message protocol codecs"
 ```
 
@@ -572,10 +572,10 @@ git commit -m "feat(xiachat): CLI package scaffold and message protocol codecs"
 ### Task 4: keystore.ts + api.ts（凭证与 HTTP 客户端）
 
 **Files:**
-- Create: `packages/xiachat-cli/src/keystore.ts`
-- Create: `packages/xiachat-cli/src/api.ts`
-- Test: `packages/xiachat-cli/src/keystore.test.ts`
-- Test: `packages/xiachat-cli/src/api.test.ts`
+- Create: `packages/agentsbb-cli/src/keystore.ts`
+- Create: `packages/agentsbb-cli/src/api.ts`
+- Test: `packages/agentsbb-cli/src/keystore.test.ts`
+- Test: `packages/agentsbb-cli/src/api.test.ts`
 
 **Interfaces:**
 - Produces:
@@ -585,7 +585,7 @@ git commit -m "feat(xiachat): CLI package scaffold and message protocol codecs"
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `packages/xiachat-cli/src/keystore.test.ts`:
+Create `packages/agentsbb-cli/src/keystore.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -632,7 +632,7 @@ function statSyncPermissions(p: string): number {
 }
 ```
 
-Create `packages/xiachat-cli/src/api.test.ts`:
+Create `packages/agentsbb-cli/src/api.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -726,12 +726,12 @@ function startJsonServer(routes: Record<string, { status: number; body: unknown 
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: FAIL — `Cannot find module './keystore'` / `'./api'`
 
 - [ ] **Step 3: Implement keystore.ts**
 
-Create `packages/xiachat-cli/src/keystore.ts`:
+Create `packages/agentsbb-cli/src/keystore.ts`:
 
 ```ts
 import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
@@ -775,7 +775,7 @@ export class Keystore {
 
 - [ ] **Step 4: Implement api.ts**
 
-Create `packages/xiachat-cli/src/api.ts`:
+Create `packages/agentsbb-cli/src/api.ts`:
 
 ```ts
 export interface RegisterParams {
@@ -857,13 +857,13 @@ export class XiachatApi {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/xiachat-cli/src/keystore.ts packages/xiachat-cli/src/keystore.test.ts packages/xiachat-cli/src/api.ts packages/xiachat-cli/src/api.test.ts
+git add packages/agentsbb-cli/src/keystore.ts packages/agentsbb-cli/src/keystore.test.ts packages/agentsbb-cli/src/api.ts packages/agentsbb-cli/src/api.test.ts
 git commit -m "feat(xiachat): credential keystore and server HTTP client"
 ```
 
@@ -872,8 +872,8 @@ git commit -m "feat(xiachat): credential keystore and server HTTP client"
 ### Task 5: agents.ts（agent 发现与 spawn）
 
 **Files:**
-- Create: `packages/xiachat-cli/src/agents.ts`
-- Test: `packages/xiachat-cli/src/agents.test.ts`
+- Create: `packages/agentsbb-cli/src/agents.ts`
+- Test: `packages/agentsbb-cli/src/agents.test.ts`
 
 **Interfaces:**
 - Produces:
@@ -883,7 +883,7 @@ git commit -m "feat(xiachat): credential keystore and server HTTP client"
 
 - [ ] **Step 1: Write the failing test**
 
-Create `packages/xiachat-cli/src/agents.test.ts`:
+Create `packages/agentsbb-cli/src/agents.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -941,7 +941,7 @@ describe("runAgentTurn", () => {
 });
 ```
 
-Create `packages/xiachat-cli/src/test-fixtures.ts`（无测试，纯工具）:
+Create `packages/agentsbb-cli/src/test-fixtures.ts`（无测试，纯工具）:
 
 ```ts
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
@@ -1000,12 +1000,12 @@ function mkdtempXiachat(): string {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: FAIL — `Cannot find module './agents'`
 
 - [ ] **Step 3: Implement agents.ts**
 
-Create `packages/xiachat-cli/src/agents.ts`:
+Create `packages/agentsbb-cli/src/agents.ts`:
 
 ```ts
 import { spawn } from "node:child_process";
@@ -1151,13 +1151,13 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: PASS（agents suites 全绿；Windows 上如遇 fixture flaky 按 Step 1 注记裁剪 skip）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/xiachat-cli/src/agents.ts packages/xiachat-cli/src/agents.test.ts packages/xiachat-cli/src/test-fixtures.ts
+git add packages/agentsbb-cli/src/agents.ts packages/agentsbb-cli/src/agents.test.ts packages/agentsbb-cli/src/test-fixtures.ts
 git commit -m "feat(xiachat): agent CLI discovery and turn execution with timeout/truncation"
 ```
 
@@ -1166,9 +1166,9 @@ git commit -m "feat(xiachat): agent CLI discovery and turn execution with timeou
 ### Task 6: main.ts 命令骨架（register / pair / login / agents / status）
 
 **Files:**
-- Create: `packages/xiachat-cli/src/main.ts`
-- Create: `packages/xiachat-cli/src/config.ts`（默认 serverUrl / keystore 路径）
-- Test: `packages/xiachat-cli/src/main.test.ts`
+- Create: `packages/agentsbb-cli/src/main.ts`
+- Create: `packages/agentsbb-cli/src/config.ts`（默认 serverUrl / keystore 路径）
+- Test: `packages/agentsbb-cli/src/main.test.ts`
 
 **Interfaces:**
 - Consumes: `Keystore`（Task 4）、`XiachatApi`（Task 4）、`discoverAgents`（Task 5）
@@ -1176,7 +1176,7 @@ git commit -m "feat(xiachat): agent CLI discovery and turn execution with timeou
 
 - [ ] **Step 1: Write the failing test**
 
-Create `packages/xiachat-cli/src/main.test.ts`:
+Create `packages/agentsbb-cli/src/main.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -1250,12 +1250,12 @@ describe("xiachat status", () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: FAIL — `Cannot find module './main'`
 
 - [ ] **Step 3: Implement config.ts + main.ts**
 
-Create `packages/xiachat-cli/src/config.ts`:
+Create `packages/agentsbb-cli/src/config.ts`:
 
 ```ts
 import { homedir } from "node:os";
@@ -1268,7 +1268,7 @@ export function defaultKeystorePath(): string {
 export const DEFAULT_SERVER_URL = "http://localhost:8080";
 ```
 
-Create `packages/xiachat-cli/src/main.ts`:
+Create `packages/agentsbb-cli/src/main.ts`:
 
 ```ts
 import { Command } from "commander";
@@ -1387,13 +1387,13 @@ if (process.argv[1] && process.argv[1].endsWith("main.ts")) {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/xiachat-cli/src/main.ts packages/xiachat-cli/src/config.ts packages/xiachat-cli/src/main.test.ts
+git add packages/agentsbb-cli/src/main.ts packages/agentsbb-cli/src/config.ts packages/agentsbb-cli/src/main.test.ts
 git commit -m "feat(xiachat): command skeleton for register/pair/login/agents/status"
 ```
 
@@ -1402,8 +1402,8 @@ git commit -m "feat(xiachat): command skeleton for register/pair/login/agents/st
 ### Task 7: im.ts（融云连接与消息分派，可注入 transport）
 
 **Files:**
-- Create: `packages/xiachat-cli/src/im.ts`
-- Test: `packages/xiachat-cli/src/im.test.ts`
+- Create: `packages/agentsbb-cli/src/im.ts`
+- Test: `packages/agentsbb-cli/src/im.test.ts`
 
 **Interfaces:**
 - Consumes: protocol.ts 编解码（Task 3）
@@ -1414,7 +1414,7 @@ git commit -m "feat(xiachat): command skeleton for register/pair/login/agents/st
 
 - [ ] **Step 1: Write the failing test**
 
-Create `packages/xiachat-cli/src/im.test.ts`:
+Create `packages/agentsbb-cli/src/im.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -1547,12 +1547,12 @@ describe("MessageDispatcher discussion your_turn", () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: FAIL — `Cannot find module './im'`
 
 - [ ] **Step 3: Implement im.ts**
 
-Create `packages/xiachat-cli/src/im.ts`:
+Create `packages/agentsbb-cli/src/im.ts`:
 
 ```ts
 import { decodeCommandContent, encodeCommandResult } from "./protocol";
@@ -1648,13 +1648,13 @@ export class MessageDispatcher {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/xiachat-cli/src/im.ts packages/xiachat-cli/src/im.test.ts
+git add packages/agentsbb-cli/src/im.ts packages/agentsbb-cli/src/im.test.ts
 git commit -m "feat(xiachat): inbound message dispatcher for chat and your_turn commands"
 ```
 
@@ -1663,9 +1663,9 @@ git commit -m "feat(xiachat): inbound message dispatcher for chat and your_turn 
 ### Task 8: run 命令（IM 主循环 + 会话队列 + 真实 transport 适配）
 
 **Files:**
-- Modify: `packages/xiachat-cli/src/main.ts`（挂 run 命令）
-- Create: `packages/xiachat-cli/src/run.ts`（主循环 + 会话 FIFO + imlib-next 适配）
-- Test: `packages/xiachat-cli/src/run.test.ts`
+- Modify: `packages/agentsbb-cli/src/main.ts`（挂 run 命令）
+- Create: `packages/agentsbb-cli/src/run.ts`（主循环 + 会话 FIFO + imlib-next 适配）
+- Test: `packages/agentsbb-cli/src/run.test.ts`
 
 **Interfaces:**
 - Consumes: `MessageDispatcher`（Task 7）、`runAgentTurn`/`discoverAgents`（Task 5）、`Keystore`/`XiachatApi`（Task 4）
@@ -1673,7 +1673,7 @@ git commit -m "feat(xiachat): inbound message dispatcher for chat and your_turn 
 
 - [ ] **Step 1: Write the failing test**
 
-Create `packages/xiachat-cli/src/run.test.ts`:
+Create `packages/agentsbb-cli/src/run.test.ts`:
 
 ```ts
 // @vitest-environment node
@@ -1727,12 +1727,12 @@ describe("SessionQueue", () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pnpm --filter @multica/xiachat-cli test`
+Run: `pnpm --filter @multica/agentsbb-cli test`
 Expected: FAIL — `Cannot find module './run'`
 
 - [ ] **Step 3: Implement run.ts**
 
-Create `packages/xiachat-cli/src/run.ts`:
+Create `packages/agentsbb-cli/src/run.ts`:
 
 ```ts
 import { randomUUID } from "node:crypto";
@@ -1910,7 +1910,7 @@ export function createImlibTransport(): IMTransport {
 
 - [ ] **Step 4: Wire run command into main.ts**
 
-In `packages/xiachat-cli/src/main.ts`，`buildProgram` 内追加（status 命令之后）:
+In `packages/agentsbb-cli/src/main.ts`，`buildProgram` 内追加（status 命令之后）:
 
 ```ts
   program
@@ -1941,13 +1941,13 @@ In `packages/xiachat-cli/src/main.ts`，`buildProgram` 内追加（status 命令
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `pnpm --filter @multica/xiachat-cli test && pnpm --filter @multica/xiachat-cli typecheck`
+Run: `pnpm --filter @multica/agentsbb-cli test && pnpm --filter @multica/agentsbb-cli typecheck`
 Expected: PASS, typecheck clean
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/xiachat-cli/src/run.ts packages/xiachat-cli/src/run.test.ts packages/xiachat-cli/src/main.ts
+git add packages/agentsbb-cli/src/run.ts packages/agentsbb-cli/src/run.test.ts packages/agentsbb-cli/src/main.ts
 git commit -m "feat(xiachat): run command with IM main loop and per-conversation queue"
 ```
 
@@ -1956,8 +1956,8 @@ git commit -m "feat(xiachat): run command with IM main loop and per-conversation
 ### Task 9: 全链路冒烟（spec §7.2）+ 打包脚本
 
 **Files:**
-- Create: `packages/xiachat-cli/scripts/smoke.md`（冒烟操作手册）
-- Modify: `packages/xiachat-cli/package.json`（`build:bin` script）
+- Create: `packages/agentsbb-cli/scripts/smoke.md`（冒烟操作手册）
+- Modify: `packages/agentsbb-cli/package.json`（`build:bin` script）
 - Modify: `CLAWMESSENGER_GUIDE.zh.md`（附录：xiachat 使用）
 
 **Interfaces:**
@@ -1966,13 +1966,13 @@ git commit -m "feat(xiachat): run command with IM main loop and per-conversation
 
 - [ ] **Step 1: Add build:bin script**
 
-`packages/xiachat-cli/package.json` scripts 增加:
+`packages/agentsbb-cli/package.json` scripts 增加:
 
 ```json
 "build:bin": "tsc -p tsconfig.json && node scripts/pack.mjs"
 ```
 
-Create `packages/xiachat-cli/scripts/pack.mjs`:
+Create `packages/agentsbb-cli/scripts/pack.mjs`:
 
 ```js
 import { build } from "esbuild";
@@ -1994,7 +1994,7 @@ chmodSync("dist/xiachat.bundle.js", 0o755);
 console.log("bundled dist/xiachat.bundle.js — run with: node dist/xiachat.bundle.js <cmd>");
 ```
 
-Run: `pnpm --filter @multica/xiachat-cli add -D esbuild && pnpm --filter @multica/xiachat-cli build:bin`
+Run: `pnpm --filter @multica/agentsbb-cli add -D esbuild && pnpm --filter @multica/agentsbb-cli build:bin`
 Expected: bundling 成功，`node dist/xiachat.bundle.js agents` 列出本机 agent
 
 - [ ] **Step 2: Manual smoke per spec §7.2**
@@ -2018,7 +2018,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/xiachat-cli/scripts/ packages/xiachat-cli/package.json CLAWMESSENGER_GUIDE.zh.md
+git add packages/agentsbb-cli/scripts/ packages/agentsbb-cli/package.json CLAWMESSENGER_GUIDE.zh.md
 git commit -m "feat(xiachat): binary packaging, smoke test guide, and user docs"
 ```
 

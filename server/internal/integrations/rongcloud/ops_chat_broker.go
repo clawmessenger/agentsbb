@@ -5,7 +5,7 @@ package rongcloud
 // 为什么需要它：管理端浏览器没有融云 IM SDK（只有 @rongcloud/embed-console-sdk），
 // 做不到 C 端那样直连设备开一条私聊；但设备端 CLI 早就实现了「收到 RC:TxtMsg
 // 私聊 → 跑一次 agent → 回一条 RC:TxtMsg 全文 + 一串 chat_stream 帧」这条链路
-// （packages/xiachat-cli/src/im.ts 的 handle / runStreamedTurn / deliverAgentReply）。
+// （packages/agentsbb-cli/src/im.ts 的 handle / runStreamedTurn / deliverAgentReply）。
 // 所以这里只做代理，不改任何 CLI：
 //
 //	管理端 POST → 服务端以系统账号发 RC:TxtMsg 给运维对端 → 设备回包到系统账号

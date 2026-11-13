@@ -22,7 +22,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CLI_DIR="${REPO_ROOT}/packages/xiachat-cli"
+CLI_DIR="${REPO_ROOT}/packages/agentsbb-cli"
 cd "${REPO_ROOT}"
 
 TAG_ONLY=false
@@ -39,7 +39,7 @@ done
 
 if [[ "${TAG_ONLY}" == false ]]; then
   [[ -n "${VERSION}" ]] || { echo "usage: $0 <version> [--no-push] | --tag-only" >&2; exit 2; }
-  echo "==> bumping xiachat-cli to ${VERSION}"
+  echo "==> bumping agentsbb-cli to ${VERSION}"
   # 版本号只剩**两处**硬编码（main.ts 早已改走 cliVersion()，没有字面量了）：
   #   package.json "version"                      —— 构建脚本的默认来源
   #   version.ts   AGENTSBB_VERSION_FALLBACK      —— 未注入时的运行时兜底，
@@ -75,7 +75,7 @@ if [[ "${TAG_ONLY}" == false ]]; then
   if ! git diff --quiet -- "${CLI_DIR}/package.json" "${CLI_DIR}/src/version.ts"; then
     echo "==> committing version bump"
     git add "${CLI_DIR}/package.json" "${CLI_DIR}/src/version.ts"
-    git commit -m "chore(cli): bump xiachat-cli to ${VERSION}"
+    git commit -m "chore(cli): bump agentsbb-cli to ${VERSION}"
   fi
 
   if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then

@@ -88,3 +88,6 @@ perf-report/
 # Local agent scratch (探针脚本、临时解包目录)。不是项目数据，别进历史。
 .workbuddy/
 .workbuddy-tmp/
+
+# 本地 worktree 目录（git worktree add 的落点，绝不入库）
+_wt/

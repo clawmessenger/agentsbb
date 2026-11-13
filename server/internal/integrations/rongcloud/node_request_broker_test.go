@@ -183,7 +183,7 @@ func TestMapNodeError(t *testing.T) {
 			t.Errorf("mapNodeError(%v) = %q, want timeout", value, got)
 		}
 	}
-	// 设备端 CLI 的真实超时原文（packages/xiachat-cli/src/agents.ts）：轮次跑满
+	// 设备端 CLI 的真实超时原文（packages/agentsbb-cli/src/agents.ts）：轮次跑满
 	// 设备上限就抛这句。只认精确串时它会落到 INVALID，前端于是把「主持设备没
 	// 产出」显示成「角色推荐失败，请重试」。
 	for _, value := range []interface{}{

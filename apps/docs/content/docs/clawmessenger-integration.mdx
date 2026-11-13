@@ -46,9 +46,9 @@ clawmessenger pair --ticket pt_<64hex> --server https://your-server
 3. On the device, install and run it:
 
 ```bash
-pnpm --filter @quukk/xiachat-cli build:bin
-node packages/xiachat-cli/dist/clawmessenger.bundle.js agents   # list local agent CLIs
-node packages/xiachat-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
+pnpm --filter @quukk/agentsbb-cli build:bin
+node packages/agentsbb-cli/dist/clawmessenger.bundle.js agents   # list local agent CLIs
+node packages/agentsbb-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
 ```
 
 4. The dialog flips to **Device bound** automatically once the CLI claims the ticket.

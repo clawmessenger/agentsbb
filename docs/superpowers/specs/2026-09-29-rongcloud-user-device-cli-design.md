@@ -109,7 +109,7 @@ CLI 的 agent 调用语义必须与 `DiscussionBridge.ExecuteTurn` 一致，保�
 - 流式：每 chunk 一条 `RC:StreamMsg`，内容 JSON 含 `turn_id` / `stream_type` / `content`
   （对齐 discussion_coordinator.go:145 的 streamAssembler 协议）。
 
-### 2.5 目录建议（新仓库或 monorepo 内 `packages/xiachat-cli/`）
+### 2.5 目录建议（新仓库或 monorepo 内 `packages/agentsbb-cli/`）
 
 ```
 src/

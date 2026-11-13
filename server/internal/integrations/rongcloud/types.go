@@ -46,7 +46,7 @@ type CommandContent struct {
 // UnmarshalJSON accepts both spellings of the command envelope.
 //
 // Two clients put the same objectName ("command") on the wire with different
-// key styles: the device CLI (packages/xiachat-cli/src/protocol.ts) sends
+// key styles: the device CLI (packages/agentsbb-cli/src/protocol.ts) sends
 // snake_case — request_id / params — while the web client (sendSystemRequest in
 // agentsbb-web/src/services/im.ts) sends camelCase — requestId / payload.
 // Parsing only snake_case made every web request look like it had no request_id,

@@ -46,9 +46,9 @@ clawmessenger pair --ticket pt_<64hex> --server https://your-server
 3. デバイス側でインストールして実行します：
 
 ```bash
-pnpm --filter @quukk/xiachat-cli build:bin
-node packages/xiachat-cli/dist/clawmessenger.bundle.js agents   # ローカルの agent CLI を一覧
-node packages/xiachat-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
+pnpm --filter @quukk/agentsbb-cli build:bin
+node packages/agentsbb-cli/dist/clawmessenger.bundle.js agents   # ローカルの agent CLI を一覧
+node packages/agentsbb-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
 ```
 
 4. CLI がチケットをクレームすると、ダイアログは自動的に **Device bound** に切り替わります。

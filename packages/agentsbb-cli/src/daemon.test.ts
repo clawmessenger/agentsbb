@@ -131,8 +131,8 @@ describe("supervisorSpawnArgv", () => {
   });
 
   it("keeps the bundle path when running under node", () => {
-    expect(supervisorSpawnArgv("/repo/packages/xiachat-cli/dist/bin.js")).toEqual([
-      "/repo/packages/xiachat-cli/dist/bin.js",
+    expect(supervisorSpawnArgv("/repo/packages/agentsbb-cli/dist/bin.js")).toEqual([
+      "/repo/packages/agentsbb-cli/dist/bin.js",
     ]);
   });
 });

@@ -96,7 +96,7 @@ const (
 
 // The discussion runtime's role-recommendation request, as it rides the shared
 // `{request_id, service, action, params}` command envelope. Keep in sync with
-// the `recommend_roles` branch in packages/xiachat-cli/src/im.ts.
+// the `recommend_roles` branch in packages/agentsbb-cli/src/im.ts.
 const (
 	recommendRolesService   = "discussion"
 	recommendRolesAction    = "recommend_roles"
@@ -311,7 +311,7 @@ func (b *NodeRequestBroker) RecommendRoles(ctx context.Context, host NodeRequest
 // 目录。C 端是浏览器直连设备（agentsbb-web/src/services/node-model-catalog.ts），
 // 但管理端没有 IM SDK，所以由服务端代理这一次往返：内容和线上的 C 端请求
 // **逐字节同构**（`msg_type` / `protocolVersion:2` / `requestId` / `timestamp`），
-// 设备端 CLI 的 `parseModelCatalogRequest`（packages/xiachat-cli/src/model-catalog.ts）
+// 设备端 CLI 的 `parseModelCatalogRequest`（packages/agentsbb-cli/src/model-catalog.ts）
 // 因此无需任何改动就能应答。
 //
 // 请求 id 前缀 `catalog_`，与 `roles_` / `turn_` 区分：三条族共用一个 pending
@@ -356,7 +356,7 @@ type DiscussionModelEntry struct {
 // StartModelCatalog records a pending catalog request and sends it to the host.
 //
 // force=true 表示「别拿缓存糊弄我」：管理端点「重新检测」时用。设备端据此跳过
-// 「缓存还新鲜就直接答」的判定（packages/xiachat-cli 的 ModelCatalogLoader.load），
+// 「缓存还新鲜就直接答」的判定（packages/agentsbb-cli 的 ModelCatalogLoader.load），
 // 当轮重新枚举本机模型。老设备不认这个键、行为与从前一致，所以它可以随时下发。
 func (b *NodeRequestBroker) StartModelCatalog(
 	ctx context.Context, host NodeRequestHost, force bool,
@@ -977,7 +977,7 @@ func roleOrder(value interface{}) (int, bool) {
 // admin page understands, exactly like NodeRequestBroker._map_node_error.
 //
 // 除了三个历史精确串，还必须认设备端自己生成的两类超时原文：
-//   - `agent turn timeout after 300000ms`（packages/xiachat-cli/src/agents.ts，
+//   - `agent turn timeout after 300000ms`（packages/agentsbb-cli/src/agents.ts，
 //     轮次跑到设备端上限就抛这句）；
 //   - 各家 agent 转上来的 `timed out` / `ETIMEDOUT`。
 //

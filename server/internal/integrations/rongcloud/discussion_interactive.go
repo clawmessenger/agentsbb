@@ -5,7 +5,7 @@ package rongcloud
 // 移植自旧后端 discussion/interactive_rounds.py 的 InteractiveRoundCoordinator，
 // 但**刻意收窄了传输层**：Python 用一套独立的 v3 设备协议
 // （discussion_assignment / discussion_host_turn + wire 分帧 + delta 增量流 +
-// cancel ack），而当前没有任何设备端实现它（xiachat-cli 只认 your_turn）。
+// cancel ack），而当前没有任何设备端实现它（agentsbb-cli 只认 your_turn）。
 // 所以这里复用**已有的 your_turn 命令通道**：服务端按 speaking_order 依次派发，
 // 设备跑完 agent 回一条 command_result，服务端据此推进下一位。这样：
 //
@@ -93,7 +93,7 @@ const (
 
 	// interactiveHeartbeatIdleWindow 是「最后一次心跳之后还能等多久」。
 	//
-	// 设备端（xiachat-cli）对每个 your_turn 轮次每 15s 发一条 relay_ping_<requestId>
+	// 设备端（agentsbb-cli）对每个 your_turn 轮次每 15s 发一条 relay_ping_<requestId>
 	// 心跳；每收到一条就把 outbox 的 available_at 推到「现在 + 窗口」。心跳在就
 	// 无限续期，断了 120s（漏掉 8 条）才判超时 —— 既容忍融云限流/丢包，也不会
 	// 让一个真挂死的成员把整场讨论按住十分钟。

@@ -566,7 +566,7 @@ clawmessenger 是运行在用户设备上的轻量节点 CLI：绑定到工作�
 - **A.5** 备选：Linux / macOS 守护脚本 — 随 Release 分发的 bash 版
 - **A.6** 验证与排障
 
-完整冒烟手册见 `packages/xiachat-cli/scripts/smoke.md`。
+完整冒烟手册见 `packages/agentsbb-cli/scripts/smoke.md`。
 
 ### A.1 绑定流程（Web 端发起）
 
@@ -593,8 +593,8 @@ clawmessenger pair --ticket pt_<64位hex> --server https://<你的服务地址>
  #   https://github.com/clawmessenger/claw-messenger/releases/latest/download/clawmessenger-windows-x64.exe
  # Linux/macOS 将文件名替换为 clawmessenger-linux-x64 / clawmessenger-linux-arm64 /
  # clawmessenger-darwin-x64 / clawmessenger-darwin-arm64，下载后 chmod +x
- # 开发者也可在仓库内自行构建：pnpm --filter @quukk/xiachat-cli build:exe
- #   → packages/xiachat-cli/dist/clawmessenger.exe（Linux/macOS 为 dist/clawmessenger）
+ # 开发者也可在仓库内自行构建：pnpm --filter @quukk/agentsbb-cli build:exe
+ #   → packages/agentsbb-cli/dist/clawmessenger.exe（Linux/macOS 为 dist/clawmessenger）
 
  # 确认本机有可用的 agent CLI（claude / codex / opencode 等）
  clawmessenger agents
@@ -734,14 +734,14 @@ clawmessenger install-service    # 装过自启的还要重跑一次：unit / pl
 
 > **Note:** 这一节是 v0.2.13 之前的做法（随 Release 分发 PowerShell 脚本）。**新部署请直接用 [A.3](#a3-后台常驻与开机自启cli-原生推荐)**；只有在无法升级到 v0.2.15 及以上二进制、或已有依赖这份脚本的运维流程时才需要它。
 
-`clawmessenger run` 只提供前台模式，CLI 里**没有** `--daemon` 或注册为服务的参数。仓库在 `packages/xiachat-cli/scripts/win/` 下配套了两个脚本，把 supervisor 放到后台常驻：
+`clawmessenger run` 只提供前台模式，CLI 里**没有** `--daemon` 或注册为服务的参数。仓库在 `packages/agentsbb-cli/scripts/win/` 下配套了两个脚本，把 supervisor 放到后台常驻：
 
 | 文件 | 用途 |
 |------|------|
 | `clawmessenger-daemon.ps1` | 主体（启动/停止/状态/日志/自启） |
 | `clawmessenger-daemon.cmd` | 薄包装，方便在 cmd 里直接调用 |
 
-> **Note:** 发布流水线会额外把这两个文件打包成 `clawmessenger-windows-x64-daemon-scripts.zip` 附在 Release 资产里（见 `.github/workflows/clawmessenger-release.yml`），下载后解压到 exe 同目录即可；若你手上的 Release 里还没有这个 zip，直接从本仓库 `packages/xiachat-cli/scripts/win/` 取同样两个文件，并保持它们在同一目录。执行过一次 `install-startup` 或 `install` 后，脚本会自动复制一份到 `%LOCALAPPDATA%\clawmessenger\`（连同 `.cmd`），之后用安装目录里的副本即可，不再依赖仓库位置。
+> **Note:** 发布流水线会额外把这两个文件打包成 `clawmessenger-windows-x64-daemon-scripts.zip` 附在 Release 资产里（见 `.github/workflows/clawmessenger-release.yml`），下载后解压到 exe 同目录即可；若你手上的 Release 里还没有这个 zip，直接从本仓库 `packages/agentsbb-cli/scripts/win/` 取同样两个文件，并保持它们在同一目录。执行过一次 `install-startup` 或 `install` 后，脚本会自动复制一份到 `%LOCALAPPDATA%\clawmessenger\`（连同 `.cmd`），之后用安装目录里的副本即可，不再依赖仓库位置。
 
 #### 命令
 
@@ -825,7 +825,7 @@ Linux / macOS 另有一份**同名同义**的守护脚本，见 [A.5](#a5-备选
 
 > **Note:** 与 A.4 同理，这是 v0.2.14 之前的做法（随 Release 分发 bash 脚本）。**新部署请直接用 [A.3](#a3-后台常驻与开机自启cli-原生推荐)** —— `clawmessenger start` / `stop` / `install-service` 已经原生覆盖了下面全部动作，不用再下载、`chmod`、也不受 GitHub 连通性影响。
 
-仓库在 `packages/xiachat-cli/scripts/linux/` 下提供 `clawmessenger-daemon.sh`，动作名与 Windows 版**一一对应**：
+仓库在 `packages/agentsbb-cli/scripts/linux/` 下提供 `clawmessenger-daemon.sh`，动作名与 Windows 版**一一对应**：
 
 | 文件 | 用途 |
 |------|------|
@@ -864,7 +864,7 @@ GitHub Release 直链在国内经常连不上（典型报错 `curl: (28) Failed 
    停止：`pkill -f 'clawmessenger run'`（一并停掉它拉起的 agent 子进程）。看日志：`tail -f ~/.clawmessenger/logs/supervisor.out.log`。
    代价是没有 `status` / `logs` / 开机自启，且**必须用 `setsid`**——少了它，`nohup ... &` 在部分 shell 里仍会随终端退出被 HUP 掉（supervisor 只处理 SIGINT / SIGTERM，不处理 SIGHUP）。
 
-3. **从仓库复制**：脚本源码在 `packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh`（约 530 行，纯 bash）。在能访问仓库的机器上取出内容、原样存成同名文件再 `chmod +x` 即可。**注意保持 LF 行尾**（别经过会把行尾改成 CRLF 的编辑器/传输方式），否则会报 `bad interpreter: /usr/bin/env bash^M`。
+3. **从仓库复制**：脚本源码在 `packages/agentsbb-cli/scripts/linux/clawmessenger-daemon.sh`（约 530 行，纯 bash）。在能访问仓库的机器上取出内容、原样存成同名文件再 `chmod +x` 即可。**注意保持 LF 行尾**（别经过会把行尾改成 CRLF 的编辑器/传输方式），否则会报 `bad interpreter: /usr/bin/env bash^M`。
 
 #### 命令
 

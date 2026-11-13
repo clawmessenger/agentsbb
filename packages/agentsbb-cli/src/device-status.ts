@@ -2,7 +2,7 @@
  * 设备运行状态：`device_status_request` / `device_status_report`。
  *
  * 为什么需要这一对：web 与小程序「设备详情」页的四个面板（系统健康状态、
- * 会话列表、任务队列、命令控制）全部依赖它。xiachat-cli 之前从未实现 ——
+ * 会话列表、任务队列、命令控制）全部依赖它。agentsbb-cli 之前从未实现 ——
  * 2026-11-05 现场三端详情页固定等满 15 秒超时，再报一句「设备可能离线」，
  * 而设备其实一直在线（同一次现场：`agent-permissions.json` 正常、进程有
  * 融云 ESTABLISHED 连接、二进制里连 `device_status_request` 这个字符串都不存在）。

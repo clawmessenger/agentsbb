@@ -46,9 +46,9 @@ clawmessenger pair --ticket pt_<64hex> --server https://your-server
 3. 기기에서 설치하고 실행합니다:
 
 ```bash
-pnpm --filter @quukk/xiachat-cli build:bin
-node packages/xiachat-cli/dist/clawmessenger.bundle.js agents   # 로컬 agent CLI 나열
-node packages/xiachat-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
+pnpm --filter @quukk/agentsbb-cli build:bin
+node packages/agentsbb-cli/dist/clawmessenger.bundle.js agents   # 로컬 agent CLI 나열
+node packages/agentsbb-cli/dist/clawmessenger.bundle.js pair --ticket pt_<64hex> --server https://your-server
 ```
 
 4. CLI가 티켓을 클레임하면 대화상자가 자동으로 **Device bound**로 전환됩니다.

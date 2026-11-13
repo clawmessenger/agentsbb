@@ -59,7 +59,7 @@ const (
 	clawAdminDiscussionHostTimeoutInit = 120
 
 	// clawAdminDiscussionHostMaxModelSegment 是 provider / model 单段的字符上限，
-	// 与设备端（xiachat-cli/src/model-catalog.ts 的 ROUTE_RE）以及 web 的
+	// 与设备端（agentsbb-cli/src/model-catalog.ts 的 ROUTE_RE）以及 web 的
 	// segment() 一致：超过这个长度设备侧本来也解析不出 route。
 	clawAdminDiscussionHostMaxModelSegment = 128
 	// 向主持节点要一次模型目录的等待上限。
@@ -990,7 +990,7 @@ func (h *Handler) ClawAdminDiscussionHostModelCatalog(w http.ResponseWriter, r *
 	}
 
 	// refresh=1：「重新检测」要求的强制重枚举。设备端对「缓存还新鲜」的请求会直接
-	// 回旧清单（packages/xiachat-cli 的 ModelCatalogLoader），不带这个标志的话，
+	// 回旧清单（packages/agentsbb-cli 的 ModelCatalogLoader），不带这个标志的话，
 	// 用户在设备上刚改了模型、点一下「重新检测」拿到的还是旧的那份。
 	refresh := clawAdminCatalogRefreshRequested(r)
 	now := time.Now()

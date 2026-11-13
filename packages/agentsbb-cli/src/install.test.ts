@@ -109,7 +109,7 @@ describe("isSeaExecutable", () => {
   });
 
   it("rejects node script entrypoints (dev mode)", () => {
-    expect(isSeaExecutable("D:\\repo\\packages\\xiachat-cli\\dist\\bin.js")).toBe(false);
+    expect(isSeaExecutable("D:\\repo\\packages\\agentsbb-cli\\dist\\bin.js")).toBe(false);
     expect(isSeaExecutable("/repo/dist/bin.js")).toBe(false);
   });
 
@@ -117,7 +117,7 @@ describe("isSeaExecutable", () => {
     // scripts/build-exe.mjs 产出 dist/agentsbb.sea.cjs，发布流水线的版本闸门
     // 用 `node dist/agentsbb.sea.cjs --version` 跑它。判成 exe 会让一次版本
     // 检查去动真实安装目录、并把 node 二进制复制成 ~/.local/bin/agentsbb。
-    expect(isSeaExecutable("packages/xiachat-cli/dist/agentsbb.sea.cjs")).toBe(false);
+    expect(isSeaExecutable("packages/agentsbb-cli/dist/agentsbb.sea.cjs")).toBe(false);
     expect(isSeaExecutable("/repo/dist/agentsbb.sea.cjs")).toBe(false);
     expect(isSeaExecutable("/repo/dist/entry.mjs")).toBe(false);
   });

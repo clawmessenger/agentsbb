@@ -16,7 +16,7 @@ import (
 // DiscussionBridge (see discussion_bridge.go), and every other agent node is
 // asked over IM with the `discussion/your_turn` command
 // (discussion_coordinator.go). The Node CLI answers that command from
-// packages/xiachat-cli/src/im.ts and honours the round, speaking_order and
+// packages/agentsbb-cli/src/im.ts and honours the round, speaking_order and
 // model parameters it carries — which is exactly what these four capabilities
 // advertise:
 //
@@ -26,7 +26,7 @@ import (
 //	discussion_role_recommendation the node can propose the role line-up
 //
 // Until this set existed the column was never populated: the Node CLI does not
-// send `capabilities` at all (packages/xiachat-cli/src/api.ts defaults it to
+// send `capabilities` at all (packages/agentsbb-cli/src/api.ts defaults it to
 // []), and ensureAgentNode created every agent node with a hard-coded '[]'.
 // Every surface that gates on these values — the admin host picker, the web
 // host picker (agentsbb-web/src/lib/discussion-host.ts) — therefore listed

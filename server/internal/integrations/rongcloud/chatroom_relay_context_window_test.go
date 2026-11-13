@@ -121,7 +121,7 @@ func TestRelayHistoryWindow_LastSpeakerKeepsOneReply(t *testing.T) {
 	assertRelayWindow(t, window, []string{"u:问题四", "C:丙四"})
 }
 
-// TestBuildPrompt_KeepsGroupChatPrefix：设备端（xiachat-cli）靠提示词开头的
+// TestBuildPrompt_KeepsGroupChatPrefix：设备端（agentsbb-cli）靠提示词开头的
 // "[group chat] " 判定场合；前缀一旦变了，群聊会被当成私聊处理。
 func TestBuildPrompt_KeepsGroupChatPrefix(t *testing.T) {
 	hub := &chatroomRelayHub{}

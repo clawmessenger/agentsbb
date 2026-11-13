@@ -25,7 +25,7 @@ Web 设备详情 → 一键唤醒 / 圆桌设置里唤醒离线设备 → 请求
 2. **旧 Python 后端有真实现，但设备端缺对端。** `clawmessenger-server/discussion/node_requests.py:235`
    的 `start_runtime_recovery` 向节点 rc 账号发 `device_control` / `command: recover_runtime`，
    节点回 `device_control_result`，由 `message_router.py` 交给 broker 收口。
-   而当前 CLI 的 `MessageDispatcher.handle`（`packages/xiachat-cli/src/im.ts:70`）
+   而当前 CLI 的 `MessageDispatcher.handle`（`packages/agentsbb-cli/src/im.ts:70`）
    只认三类入站：`RC:TxtMsg` / `card_action` / `command`，其中 `command` 只处理
    **模型目录请求**和 **discussion 的 your_turn** —— 没有 `device_control`、没有 `recover_runtime`。
 
@@ -33,7 +33,7 @@ Web 设备详情 → 一键唤醒 / 圆桌设置里唤醒离线设备 → 请求
 
 | 能力 | 位置 | 状态 |
 |---|---|---|
-| 常驻 supervisor | `packages/xiachat-cli/src/main.ts:257` `runSupervisor` | 已有，但有缺口（见 1.4） |
+| 常驻 supervisor | `packages/agentsbb-cli/src/main.ts:257` `runSupervisor` | 已有，但有缺口（见 1.4） |
 | agent CLI 发现 | `agents.ts:227` `discoverAgents()` + `KNOWN_AGENT_CLIS`（25 个） | 已有 |
 | agent CLI 执行 | `agents.ts:270` `runAgentCommand` / `agents.ts:327` `runAgentTurn` | 已有，含超时与 stdout 截断 |
 | **运行时探测** | `model-catalog.ts:63` `AGENT_MODEL_LIST` / `modelListSpec()`（`opencode models` / `openclaw models list --json`） | 已有，本质就是一次运行时健康探测 |
@@ -185,7 +185,7 @@ web  im.ts:645 → onPrivateProtocolCommand → handleNodeModelCatalogResponse()
 
 ## §5 CLI 侧设计
 
-### 5.1 新增 `packages/xiachat-cli/src/runtime-recovery.ts`
+### 5.1 新增 `packages/agentsbb-cli/src/runtime-recovery.ts`
 
 纯函数 + 一个 prober，全部可单测：
 
