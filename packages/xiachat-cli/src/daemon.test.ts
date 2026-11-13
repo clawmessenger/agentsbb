@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import type { SpawnOptions } from "node:child_process";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import {
   STARTUP_VBS_TEMPLATE_MARKER,
   STARTUP_VBS_TEMPLATE_MARKER_V2,
   STARTUP_VBS_WATCHDOG_LOOP_MARKER,
+  WATCHDOG_LOOP_INTERVAL_MS,
   WATCHDOG_LOOP_PID_FILE,
   writeSupervisorState,
   type DaemonOverrides,
@@ -1348,6 +1349,114 @@ describe("watchdog --loop（常驻看门狗循环）", () => {
     expect(existsSync(lockPath(h.paths))).toBe(false);
     expect(h.lines.join("")).toContain("removed resident watchdog loop");
   });
+
+  it("锁 mtime 恰好等于 2 周期阈值 → 仍算新鲜：第二实例不接管、不动锁", async () => {
+    // 阈值方向必须是「≤ 2 个周期都算新鲜」：写盘延迟与检查耗时会吃掉几毫秒，
+    // 不能把还活着的同伴挤下岗。用实测 mtime 反推时钟，避开文件系统精度抖动。
+    let clock = 0;
+    const h = harness({ watchdogLoopMaxTicks: 1, now: () => clock });
+    state(h.paths, 4242);
+    h.alive.add(4242);
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(lockPath(h.paths), "4242\n");
+    clock = statSync(lockPath(h.paths)).mtimeMs + 2 * WATCHDOG_LOOP_INTERVAL_MS;
+
+    await h.daemon.watchdogLoop();
+
+    expect(h.spawns).toHaveLength(0);
+    // 锁还是同伴的：恰好压线不构成接管理由。
+    expect(readFileSync(lockPath(h.paths), "utf8").trim()).toBe("4242");
+    expect(h.lines.join("")).toBe("");
+  });
+
+  it("锁 mtime 只超过阈值 1ms → 判过期：即使 pid 活着（被复用）也接管", async () => {
+    let clock = 0;
+    const h = harness(
+      { watchdogLoopMaxTicks: 1, now: () => clock },
+      { spawnPid: 777 },
+    );
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(lockPath(h.paths), "4242\n");
+    clock = statSync(lockPath(h.paths)).mtimeMs + 2 * WATCHDOG_LOOP_INTERVAL_MS + 1;
+    h.alive.add(4242); // pid 被复用：只看 pid 会误判「同伴还活着」
+    h.alive.add(777);
+    h.publishOnSpawn = (pid) => {
+      writeSupervisorState({ pid, startedAt: 1_000_000, execPath: EXE, cwd: h.home, agents: ["claude"] }, h.paths);
+    };
+
+    await h.daemon.watchdogLoop();
+
+    // 过期锁不构成单实例保护：接管后照常检查并拉起 supervisor。
+    expect(h.spawns).toHaveLength(1);
+  });
+
+  it("锁 mtime 在未来（机器时钟被回调）→ 仍算新鲜：第二实例不接管", async () => {
+    // 陈旧检测只有一个方向（现在晚于 mtime 才可能过期）；mtime 在未来说明
+    // 持有者的时钟比我们快，不能因此判它死了。
+    let clock = 0;
+    const h = harness({ watchdogLoopMaxTicks: 1, now: () => clock });
+    state(h.paths, 4242);
+    h.alive.add(4242);
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(lockPath(h.paths), "4242\n");
+    clock = statSync(lockPath(h.paths)).mtimeMs - 10 * 60_000; // mtime 比时钟晚 10 分钟
+
+    await h.daemon.watchdogLoop();
+
+    expect(h.spawns).toHaveLength(0);
+    expect(readFileSync(lockPath(h.paths), "utf8").trim()).toBe("4242");
+    expect(h.lines.join("")).toBe("");
+  });
+
+  it("start 失败后循环继续：下个周期还会重试", async () => {
+    const h = harness({ watchdogLoopMaxTicks: 2 }, { spawnPid: 555 });
+    // 555 拉起后立刻死掉（不在 alive 集合）：每一轮 start 都抛「failed to stay up」。
+    await h.daemon.watchdogLoop();
+
+    // 两个周期各试了一次：第一轮的失败没有终止循环。
+    expect(h.spawns).toHaveLength(2);
+    const log = readFileSync(join(h.paths.logDir, "watchdog.log"), "utf8");
+    expect(log.split("watchdog loop: start failed:")).toHaveLength(3); // 2 次失败 + split 尾部
+    // 循环正常走完（maxTicks 边界）后锁被清掉。
+    expect(existsSync(lockPath(h.paths))).toBe(false);
+  });
+
+  it("uninstall 在 loop 不在位时不误杀任何进程", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-loop-uninstall-none-"));
+    dirs.push(dir);
+    const h = harness({
+      platform: "win32",
+      env: { APPDATA: dir, PATH: "C://bin" },
+      autostartPaths: { startupVbs: join(dir, "clawmessenger.vbs"), watchdogCmd: join(dir, "watchdog.cmd") },
+    });
+    // supervisor 在跑：uninstall 拆的是自启项，不许碰它。
+    state(h.paths, 4242);
+    h.alive.add(4242);
+
+    await h.daemon.uninstall();
+
+    // 没有锁文件 = loop 不在位：对谁都不能发信号。
+    expect(h.signals).toEqual([]);
+    expect(h.lines.join("")).not.toContain("removed resident watchdog loop");
+  });
+
+  it("uninstall 对锁里的死 pid 不发信号：只清锁", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-loop-uninstall-dead-"));
+    dirs.push(dir);
+    const h = harness({
+      platform: "win32",
+      env: { APPDATA: dir, PATH: "C://bin" },
+      autostartPaths: { startupVbs: join(dir, "clawmessenger.vbs"), watchdogCmd: join(dir, "watchdog.cmd") },
+    });
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(lockPath(h.paths), "9999\n"); // 持有者已被强杀：pid 不在 alive 集合
+
+    await h.daemon.uninstall();
+
+    expect(h.signals).toEqual([]);
+    expect(existsSync(lockPath(h.paths))).toBe(false);
+    expect(h.lines.join("")).not.toContain("removed resident watchdog loop");
+  });
 });
 
 // schtasks 被拦机器的 serviceHealth 三态：loop 进程在位 = ready；loop 行在 VBS 里
@@ -1528,5 +1637,54 @@ describe("refreshStartupScript 对 v2 模板的 loop 补丁", () => {
     expect(result).toMatchObject({ updated: false, reason: "already-current" });
     // schtasks 成功的机器不该被塞进 loop 行（计划任务就是正路）。
     expect(readFileSync(vbs, "utf8")).toBe(before);
+  });
+
+  it("v1 旧模板（无任何版本标记）：自愈块与 loop 行一次补齐，标记直升 v3", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-vbs-v1-"));
+    dirs.push(dir);
+    const vbs = join(dir, "clawmessenger.vbs");
+    const exe = "C:\\Program Files\\clawmessenger\\clawmessenger.exe";
+    // 远程升级前最老的存量形状：没有自愈块、没有版本标记，只有一条 run 行。
+    writeFileSync(
+      vbs,
+      [
+        "' clawmessenger: start the agent supervisor at logon, without a console window.",
+        'Set sh = CreateObject("WScript.Shell")',
+        'sh.CurrentDirectory = "C:\\\\Users\\\\op"',
+        'sh.Run """C:\\\\Program Files\\\\clawmessenger\\\\clawmessenger.exe"" run --model kimi", 0, False',
+        "",
+      ].join("\r\n"),
+    );
+    const h = harness({
+      platform: "win32",
+      env: { APPDATA: dir, PATH: "C:\\bin" },
+      autostartPaths: { startupVbs: vbs },
+      selfArgv: () => ({ exec: exe, args: [] }),
+    });
+
+    const result = await h.daemon.refreshStartupScript();
+    expect(result).toMatchObject({ updated: true, path: vbs });
+
+    const body = readFileSync(vbs, "utf8");
+    // 自愈块补上了，且只有一份。
+    expect(body.split("exePath = ").length - 1).toBe(1);
+    // loop 行也补上了。
+    expect(body).toContain(`' ${STARTUP_VBS_WATCHDOG_LOOP_MARKER}`);
+    expect(body).toContain("watchdog --loop");
+    // 标记直升 v3（v1 没有 v2 标记行可升，补自愈块时带的就是 v3 标记）。
+    expect(body.split(`' ${STARTUP_VBS_TEMPLATE_MARKER}`).length - 1).toBe(1);
+    expect(body).not.toContain(STARTUP_VBS_TEMPLATE_MARKER_V2);
+    // 安装时的 --model 参数原样保留。
+    expect(body).toContain('run --model kimi", 0, False');
+    // 顺序：自愈块 → loop 行 → 原有的 run 行（都插在第一条 sh.Run 之前）。
+    const healAt = body.indexOf("exePath = ");
+    const loopAt = body.indexOf("watchdog --loop");
+    const runAt = body.indexOf("run --model kimi");
+    expect(healAt).toBeGreaterThanOrEqual(0);
+    expect(healAt).toBeLessThan(loopAt);
+    expect(loopAt).toBeLessThan(runAt);
+
+    const second = await h.daemon.refreshStartupScript();
+    expect(second).toMatchObject({ updated: false, reason: "already-current" });
   });
 });
