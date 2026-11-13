@@ -5,7 +5,7 @@
 # 发布链路：push tag `agentsbb-v*.*.*` → GitHub Actions
 # (.github/workflows/agentsbb-release.yml) 在各平台 runner 上用 Node SEA
 # 构建 -> 创建 GitHub Release -> 应用内直链
-# https://github.com/quukk/agentsbb/releases/latest/download/agentsbb-windows-x64.exe
+# https://github.com/clawmessenger/agentsbb/releases/latest/download/agentsbb-windows-x64.exe
 # 即刻生效。
 #
 # 过渡期双名单：release 同时上传 `agentsbb-*`（新）与 `clawmessenger-*`（旧）两套资产，
@@ -94,4 +94,4 @@ fi
 echo "==> pushing main + ${TAG} (this triggers the release workflow)"
 git push origin main
 git push origin "${TAG}"
-echo "==> done. Watch the run: https://github.com/quukk/agentsbb/actions"
+echo "==> done. Watch the run: https://github.com/clawmessenger/agentsbb/actions"

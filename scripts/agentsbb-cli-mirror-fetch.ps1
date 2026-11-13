@@ -43,7 +43,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # 发布仓库地址属于 git remote 事务，改名期保持原值（见 RELEASES_REPO 白名单）。
-$repo = 'quukk/agentsbb'
+$repo = 'clawmessenger/agentsbb'
 $defaultAssets = @(
   'agentsbb-windows-x64.exe',
   'agentsbb-windows-x64-daemon-scripts.zip',

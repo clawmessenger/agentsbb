@@ -35,11 +35,12 @@ import * as path from "node:path";
 /**
  * GitHub repo that publishes the CLI releases.
  *
- * 从 `clawmessenger/claw-messenger` 迁到 `quukk/agentsbb`（org → 个人账号）。
- * 旧 slug 仍由 GitHub 的改名/转移重定向兜底，所以 1.3.34 以前的老客户端
- * 不会因为这次改名而断了自动更新。
+ * 从 `clawmessenger/claw-messenger` 改名为 `clawmessenger/agentsbb`（仓库仍在
+ * clawmessenger org 下：它处在 multica-ai/multica 的 fork network 里，GitHub
+ * 不允许同一网络下同一个人再持有第二个仓库，所以无法转到 quukk）。
+ * 旧 slug 由 GitHub 的改名重定向兜底，1.3.34 以前的老客户端不会因此断更。
  */
-export const RELEASES_REPO = "quukk/agentsbb";
+export const RELEASES_REPO = "clawmessenger/agentsbb";
 
 const STAGED_SUFFIX = ".new-";
 const BACKUP_SUFFIX = ".old-";

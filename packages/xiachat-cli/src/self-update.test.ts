@@ -281,7 +281,7 @@ function cdnStub(opts: {
     }
     if (url.includes("/releases/latest/download/")) {
       const loc = opts.tag
-        ? `https://github.com/quukk/agentsbb/releases/download/${opts.tag}/SHA256SUMS`
+        ? `https://github.com/clawmessenger/agentsbb/releases/download/${opts.tag}/SHA256SUMS`
         : "";
       return {
         ok: false,
@@ -328,7 +328,7 @@ describe("release lookup fallback", () => {
     );
     const exe = plan.release.assets.find((a) => a.name === plan.assetName);
     expect(exe?.url).toBe(
-      "https://github.com/quukk/agentsbb/releases/download/agentsbb-v1.2.0/agentsbb-windows-x64.exe",
+      "https://github.com/clawmessenger/agentsbb/releases/download/agentsbb-v1.2.0/agentsbb-windows-x64.exe",
     );
     expect(plan.release.assets.some((a) => a.name === "SHA256SUMS")).toBe(true);
   });
@@ -462,7 +462,7 @@ describe("stageUpdateFromMirrors", () => {
       assetName: "agentsbb-windows-x64.exe",
       sha256: sum(binary),
       mirrors: [
-        "https://github.com/quukk/agentsbb/releases/download/agentsbb-v1.3.0/agentsbb-windows-x64.exe",
+        "https://github.com/clawmessenger/agentsbb/releases/download/agentsbb-v1.3.0/agentsbb-windows-x64.exe",
         "/api/agent/upgrade/download?version=1.3.0&asset=agentsbb-windows-x64.exe&token=t",
       ],
     };
