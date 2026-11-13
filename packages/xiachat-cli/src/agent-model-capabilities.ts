@@ -50,7 +50,7 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   // 前缀（models.go:348-353 ModelSelectorMustBeProviderQualified）。
   opencode: { catalogSource: "cli", modelInjection: "argv" },
 
-  // codebuddy：目录走 clawmessenger-provider.json 端点 probe；probe 失败时用
+  // codebuddy：目录走 agentsbb-provider.json（旧名文件兜底）端点 probe；probe 失败时用
   // codebuddyStaticModels 兜底（models.go:2974-2982）——但只在端点配置存在时
   // 才给：注入走 CODEBUDDY_MODEL（agents.ts agentRuntimeEnv），没有网关配置时
   // 该变量根本不会被设置，选了等于没选。

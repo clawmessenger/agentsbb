@@ -117,7 +117,7 @@ describe("probeAgentCliInfo", () => {
 // --- 缓存 + 后台刷新 -------------------------------------------------------
 
 describe("AgentCliInfoProbe", () => {
-  /** 极简内存文件系统，替代真实 ~/.clawmessenger。 */
+  /** 极简内存文件系统，替代真实 ~/.agentsbb。 */
   const createStore = () => {
     const files = new Map<string, string>();
     return {

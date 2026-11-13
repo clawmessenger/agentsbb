@@ -49,7 +49,7 @@ func downloadRequest(t *testing.T, query string) *httptest.ResponseRecorder {
 }
 
 func TestClawUpgradeDownloadServesVerifiedBytesAndCachesOnce(t *testing.T) {
-	payload := bytes.Repeat([]byte("clawmessenger-upgrade-payload\n"), 64)
+	payload := bytes.Repeat([]byte("agentsbb-upgrade-payload\n"), 64)
 	server, hits := fakeReleaseWeb(t, clawUpgradeWindowsAsset, payload)
 	t.Setenv("CLAW_UPGRADE_RELEASE_WEB", server.URL)
 	t.Setenv("CLAW_UPGRADE_CACHE_DIR", t.TempDir())
@@ -238,7 +238,7 @@ func cachedAssetPath(t *testing.T, cacheDir, version string) (string, bool) {
 // 摘要不匹配 → 必须拒绝，且**不落盘**：坏文件进了缓存，所有回退到代理的设备
 // 会一起失败（设备侧 checksum_mismatch），而服务端只剩一行 info。
 func TestClawUpgradeDownloadRejectsAssetThatFailsTheChecksum(t *testing.T) {
-	payload := bytes.Repeat([]byte("clawmessenger-upgrade-payload\n"), 32)
+	payload := bytes.Repeat([]byte("agentsbb-upgrade-payload\n"), 32)
 	cacheDir, hits := clawDownloadChecksumSetup(t, payload)
 	setClawUpgradeCachedReleaseForTest("1.3.0", map[string]string{
 		// 故意给一个「格式合法但和内容对不上」的摘要。
@@ -268,7 +268,7 @@ func TestClawUpgradeDownloadRejectsAssetThatFailsTheChecksum(t *testing.T) {
 // 摘要匹配 → 正常下发，且盘上缓存的内容与上游逐字节一致。
 // 这是「校验通过」的正面路径：只测拒绝会让「永远拒绝」也绿。
 func TestClawUpgradeDownloadServesAssetThatPassesTheChecksum(t *testing.T) {
-	payload := bytes.Repeat([]byte("clawmessenger-upgrade-payload\n"), 32)
+	payload := bytes.Repeat([]byte("agentsbb-upgrade-payload\n"), 32)
 	cacheDir, _ := clawDownloadChecksumSetup(t, payload)
 	setClawUpgradeCachedReleaseForTest("1.3.0", map[string]string{
 		clawUpgradeWindowsAsset: sha256HexForTest(payload),
@@ -304,7 +304,7 @@ func TestClawUpgradeDownloadServesAssetThatPassesTheChecksum(t *testing.T) {
 // **静默把不匹配的当匹配**（用例 A 已钉住）。若将来改成「没有摘要就拒绝」，这条
 // 用例必须同步改 —— 那种改动会让「SUMS 与 digest 都缺」的版本连代理都下不了。
 func TestClawUpgradeDownloadSkipsChecksumWhenTheReleaseHasNone(t *testing.T) {
-	payload := bytes.Repeat([]byte("clawmessenger-upgrade-payload\n"), 32)
+	payload := bytes.Repeat([]byte("agentsbb-upgrade-payload\n"), 32)
 	cacheDir, _ := clawDownloadChecksumSetup(t, payload)
 	// 空 map：latest 解析完成了，但没有任何来源给出这个资产的摘要。
 	setClawUpgradeCachedReleaseForTest("1.3.0", map[string]string{})

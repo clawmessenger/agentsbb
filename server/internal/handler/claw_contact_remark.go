@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-// 联系人备注接口。给 clawmessenger-web / clawmessenger-uniapp 的通讯录与名片用。
+// 联系人备注接口。给 agentsbb-web / agentsbb-uniapp 的通讯录与名片用。
 //
 // 设计要点（改之前先读，这几条都是被具体问题逼出来的）：
 //

@@ -29,7 +29,7 @@ import (
 // send `capabilities` at all (packages/xiachat-cli/src/api.ts defaults it to
 // []), and ensureAgentNode created every agent node with a hard-coded '[]'.
 // Every surface that gates on these values — the admin host picker, the web
-// host picker (clawmessenger-web/src/lib/discussion-host.ts) — therefore listed
+// host picker (agentsbb-web/src/lib/discussion-host.ts) — therefore listed
 // nothing. Deriving them from ai_type is what keeps the advertised set equal to
 // what the runtime actually asks the node to do.
 var discussionCapabilities = []string{

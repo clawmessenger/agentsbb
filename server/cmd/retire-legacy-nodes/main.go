@@ -8,7 +8,7 @@
 // the account and only shrinking the local row, would leave the device deriving
 // the old id on its next register and recreate the very group we removed.
 //
-// The CLI used to mint "clawmessenger-<uuid>" (50 chars). RongCloud caps a user
+// The CLI used to mint "agentsbb-<uuid>" (50 chars). RongCloud caps a user
 // id at 64 and the server reserves 33 of them for "rc_node_" + "_" + the
 // longest agent name, leaving 31 for the machine segment; anything longer was
 // sha256-ed into an opaque "m_<24 hex>" key. v0.2.3 minted 10 base36 chars,
@@ -163,7 +163,7 @@ func run() error {
 
 	if !*commit {
 		fmt.Println("DRY RUN — nothing was written. Re-run with -commit to retire these nodes.")
-		fmt.Println("After that, on each affected device: stop it, delete ~/.clawmessenger/machine_id, and run `clawmessenger pair` again.")
+		fmt.Println("After that, on each affected device: stop it, delete ~/.agentsbb/machine_id, and run `agentsbb pair` again.")
 		return nil
 	}
 
@@ -235,8 +235,8 @@ func run() error {
 	}
 	fmt.Println("done. Re-pair each affected device to register it under a short machine id:")
 	fmt.Println("  1. stop the device process")
-	fmt.Println("  2. delete ~/.clawmessenger/machine_id (and ~/.clawmessenger/processed-uids-*.json)")
-	fmt.Println("  3. run `clawmessenger pair --ticket <pt_...>` again")
+	fmt.Println("  2. delete ~/.agentsbb/machine_id (and ~/.agentsbb/processed-uids-*.json)")
+	fmt.Println("  3. run `agentsbb pair --ticket <pt_...>` again")
 	return nil
 }
 

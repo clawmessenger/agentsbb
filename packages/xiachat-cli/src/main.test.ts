@@ -15,7 +15,7 @@ import type { FetchLike } from "./self-update.js";
 
 const dirs: string[] = [];
 function tempKeystore(): Keystore {
-  const d = mkdtempSync(join(tmpdir(), "clawmessenger-main-"));
+  const d = mkdtempSync(join(tmpdir(), "agentsbb-main-"));
   dirs.push(d);
   return new Keystore(join(d, "creds.json"));
 }
@@ -24,7 +24,7 @@ afterEach(() => {
   dirs.length = 0;
 });
 
-describe("clawmessenger register", () => {
+describe("agentsbb register", () => {
   it("stores credentials from the server response", async () => {
     const keystore = tempKeystore();
     const fakeApi = {
@@ -39,7 +39,7 @@ describe("clawmessenger register", () => {
       stdout: process.stdout,
       machineId: () => "test-machine-1",
     });
-    await program.parseAsync(["node", "clawmessenger", "register", "--name", "我的Claude", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "agentsbb", "register", "--name", "我的Claude", "--ai-type", "claude", "--server", "http://srv"]);
     const stored = keystore.load();
     expect(stored?.nodeId).toBe("node_1");
     expect(stored?.token).toBe("tok_1");
@@ -64,8 +64,8 @@ describe("clawmessenger register", () => {
       stdout: process.stdout,
       machineId: () => "test-machine-2",
     });
-    await program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
-    await program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "agentsbb", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
+    await program.parseAsync(["node", "agentsbb", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]);
     expect(seenMac[0]).toBe("test-machine-2");
     expect(seenMac[1]).toBe(seenMac[0]);
   });
@@ -77,7 +77,7 @@ describe("clawmessenger register", () => {
       stdout: process.stdout,
     });
     await expect(
-      program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude"]),
+      program.parseAsync(["node", "agentsbb", "register", "--name", "n", "--ai-type", "claude"]),
     ).rejects.toThrow();
   });
 
@@ -98,13 +98,13 @@ describe("clawmessenger register", () => {
       machineId: () => "test-machine-1",
     });
     await expect(
-      program.parseAsync(["node", "clawmessenger", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]),
+      program.parseAsync(["node", "agentsbb", "register", "--name", "n", "--ai-type", "claude", "--server", "http://srv"]),
     ).rejects.toThrow(/--pairing-ticket/);
     expect(keystore.load()).toBeNull();
   });
 });
 
-describe("clawmessenger pair", () => {
+describe("agentsbb pair", () => {
   /**
    * 2026-10-27 flaky 定位（Tess）：这三例在负载下发过 `Test timed out in
    * 20000ms/60000ms`，断言本身一次都没失败过。
@@ -145,7 +145,7 @@ describe("clawmessenger pair", () => {
       ensureOpencode: async () => ({}),
     });
     await expect(
-      program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_1"]),
+      program.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_1"]),
     ).rejects.toThrow(/already claimed/);
     // The register step still persisted its own node identity, but the
     // claimed-by-another-device result must not overwrite it.
@@ -176,14 +176,14 @@ describe("clawmessenger pair", () => {
       ensureOpencode: async () => ({}),
     });
     // A retried claim after a lost response: same ticket, same machine.
-    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
-    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_same"]);
     expect(seenIdemKeys).toHaveLength(2);
     expect(seenIdemKeys[0]).toBe(seenIdemKeys[1]);
     expect(seenIdemKeys[0]).toMatch(/^idem-[0-9a-f]{24}$/);
 
     // A different ticket on the same machine derives a different key.
-    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_other"]);
+    await program.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_other"]);
     expect(seenIdemKeys[2]).not.toBe(seenIdemKeys[0]);
   });
 
@@ -206,7 +206,7 @@ describe("clawmessenger pair", () => {
       machineId: () => "machine-B",
       ensureOpencode: async () => ({}),
     });
-    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
+    await program.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_same"]);
     const machineBKey = seenIdemKeys[0];
     const program2 = buildProgram({
       keystore,
@@ -215,7 +215,7 @@ describe("clawmessenger pair", () => {
       machineId: () => "machine-C",
       ensureOpencode: async () => ({}),
     });
-    await program2.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_same"]);
+    await program2.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_same"]);
     expect(seenIdemKeys[1]).not.toBe(machineBKey);
   });
 });
@@ -271,14 +271,14 @@ describe("waitForAliveFor 的第三个参数是毫秒，不是次数（B1 的根
 });
 
 // 后台常驻命令面：这些动作以前只能靠随 Release 分发的守护脚本提供
-// （clawmessenger-daemon.sh / .cmd），现在直接编进 CLI。
+// （agentsbb-daemon.sh / .cmd），现在直接编进 CLI。
 function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: string[] } {
   const calls: string[] = [];
   const daemon: Daemon = {
     start: async (o) => { calls.push(`start:${JSON.stringify(o ?? {})}`); },
     stop: async () => { calls.push("stop"); },
     restart: async (o) => { calls.push(`restart:${JSON.stringify(o ?? {})}`); },
-    status: () => ({ platform: "linux", running: false, stale: false, agents: [], logs: [], serviceName: "clawmessenger" }),
+    status: () => ({ platform: "linux", running: false, stale: false, agents: [], logs: [], serviceName: "agentsbb" }),
     logs: (o) => { calls.push(`logs:${o?.lines ?? 40}`); },
     // 看门狗：计划任务每 5 分钟调一次，绝大多数时候返回 false（什么都没做）。
     watchdog: async (o) => { calls.push(`watchdog:${JSON.stringify(o ?? {})}`); return true; },
@@ -290,7 +290,7 @@ function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: s
     installService: async (o) => { calls.push(`install-service:${JSON.stringify(o ?? {})}`); },
     uninstall: async () => { calls.push("uninstall"); },
     // 登录自启脚本的模板刷新：这里不需要模拟文件系统，记一笔即可。
-    refreshStartupScript: async () => ({ updated: false, path: "/nonexistent/clawmessenger.vbs", reason: "no-logon-script" }),
+    refreshStartupScript: async () => ({ updated: false, path: "/nonexistent/agentsbb.vbs", reason: "no-logon-script" }),
     // 常驻自愈判据：默认「非 Windows，无需看门狗」—— Linux 上 install-service
     // 装的是 systemd 单元，而不是计划任务。
     serviceHealth: () => ({ ready: true, detail: "systemd 服务" }),
@@ -299,7 +299,7 @@ function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: s
   return { daemon, calls };
 }
 
-describe("clawmessenger status", () => {
+describe("agentsbb status", () => {
   it("prints stored identity", async () => {
     const keystore = tempKeystore();
     keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
@@ -309,9 +309,9 @@ describe("clawmessenger status", () => {
       apiFactory: () => { throw new Error("should not be called"); },
       stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
       daemon: fakeDaemon().daemon,
-      daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), "agentsbb-daemon-unused")),
     });
-    await program.parseAsync(["node", "clawmessenger", "status"]);
+    await program.parseAsync(["node", "agentsbb", "status"]);
     expect(lines.join("")).toContain("node_9");
   });
 
@@ -331,13 +331,13 @@ describe("clawmessenger status", () => {
           pid: 4242,
           uptimeMs: 65_000,
           agents: ["claude", "codex"],
-          logs: ["/home/u/.clawmessenger/logs/supervisor.log"],
-          serviceName: "clawmessenger",
+          logs: ["/home/u/.agentsbb/logs/supervisor.log"],
+          serviceName: "agentsbb",
         }),
       }).daemon,
-      daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), "agentsbb-daemon-unused")),
     });
-    await program.parseAsync(["node", "clawmessenger", "status"]);
+    await program.parseAsync(["node", "agentsbb", "status"]);
     const text = lines.join("");
     expect(text).toContain("node_9");
     expect(text).toContain("daemon : running in the background (PID 4242, up 1m05s)");
@@ -346,7 +346,7 @@ describe("clawmessenger status", () => {
   });
 });
 
-describe("clawmessenger background commands", () => {
+describe("agentsbb background commands", () => {
   it("start passes --model and --workdir through", async () => {
     const { daemon, calls } = fakeDaemon();
     const program = buildProgram({
@@ -355,7 +355,7 @@ describe("clawmessenger background commands", () => {
       stdout: process.stdout,
       daemon,
     });
-    await program.parseAsync(["node", "clawmessenger", "start", "--model", "gpt-5", "--workdir", "/srv/work"]);
+    await program.parseAsync(["node", "agentsbb", "start", "--model", "gpt-5", "--workdir", "/srv/work"]);
     expect(calls).toEqual(['start:{"model":"gpt-5","workdir":"/srv/work"}']);
   });
 
@@ -367,8 +367,8 @@ describe("clawmessenger background commands", () => {
       stdout: process.stdout,
       daemon,
     });
-    await program.parseAsync(["node", "clawmessenger", "stop"]);
-    await program.parseAsync(["node", "clawmessenger", "restart"]);
+    await program.parseAsync(["node", "agentsbb", "stop"]);
+    await program.parseAsync(["node", "agentsbb", "restart"]);
     expect(calls).toEqual(["stop", "restart:{}"]);
   });
 
@@ -380,9 +380,9 @@ describe("clawmessenger background commands", () => {
       stdout: process.stdout,
       daemon,
     });
-    await program.parseAsync(["node", "clawmessenger", "logs", "--lines", "5"]);
-    await program.parseAsync(["node", "clawmessenger", "logs"]);
-    await program.parseAsync(["node", "clawmessenger", "logs", "--lines", "not-a-number"]);
+    await program.parseAsync(["node", "agentsbb", "logs", "--lines", "5"]);
+    await program.parseAsync(["node", "agentsbb", "logs"]);
+    await program.parseAsync(["node", "agentsbb", "logs", "--lines", "not-a-number"]);
     expect(calls).toEqual(["logs:5", "logs:40", "logs:40"]);
   });
 
@@ -394,8 +394,8 @@ describe("clawmessenger background commands", () => {
       stdout: process.stdout,
       daemon,
     });
-    await program.parseAsync(["node", "clawmessenger", "install-service"]);
-    await program.parseAsync(["node", "clawmessenger", "uninstall"]);
+    await program.parseAsync(["node", "agentsbb", "install-service"]);
+    await program.parseAsync(["node", "agentsbb", "uninstall"]);
     expect(calls).toEqual(["install-service:{}", "uninstall"]);
   });
 
@@ -407,7 +407,7 @@ describe("clawmessenger background commands", () => {
       stdout: process.stdout,
       daemon,
     });
-    await program.parseAsync(["node", "clawmessenger", "watchdog"]);
+    await program.parseAsync(["node", "agentsbb", "watchdog"]);
     expect(calls).toEqual(["watchdog:{}"]);
   });
 
@@ -431,12 +431,12 @@ describe("clawmessenger background commands", () => {
       apiFactory: () => { throw new Error("should not be called"); },
       stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
       daemon,
-      daemonPaths: defaultDaemonPaths(join(tmpdir(), "clawmessenger-daemon-unused")),
+      daemonPaths: defaultDaemonPaths(join(tmpdir(), "agentsbb-daemon-unused")),
     });
     for (const action of ["start", "stop", "restart", "logs", "watchdog", "install-service", "uninstall"]) {
-      await program.parseAsync(["node", "clawmessenger", "daemon", action]);
+      await program.parseAsync(["node", "agentsbb", "daemon", action]);
     }
-    await program.parseAsync(["node", "clawmessenger", "daemon", "status"]);
+    await program.parseAsync(["node", "agentsbb", "daemon", "status"]);
     expect(calls).toEqual(["start:{}", "stop", "restart:{}", "logs:40", "watchdog:{}", "install-service:{}", "uninstall"]);
     expect(lines.join("")).toContain("not running in the background");
   });
@@ -449,21 +449,21 @@ describe("clawmessenger background commands", () => {
       stdout: process.stdout,
       daemon,
     });
-    await expect(program.parseAsync(["node", "clawmessenger", "daemon", "explode"])).rejects.toThrow(
+    await expect(program.parseAsync(["node", "agentsbb", "daemon", "explode"])).rejects.toThrow(
       /unknown daemon action 'explode'/,
     );
     expect(calls).toEqual([]);
   });
 });
 
-describe("clawmessenger run (supervisor mode)", () => {
+describe("agentsbb run (supervisor mode)", () => {
   // 回归护栏：supervisor 会被 start 之外的入口直接拉起（开机自启 .vbs、守护脚本的
-  // -Action run、手敲 `clawmessenger run`），那些入口绕过 start 的检查。两份
+  // -Action run、手敲 `agentsbb run`），那些入口绕过 start 的检查。两份
   // supervisor 派生同样的融云节点 id —— 互相踢线 + 同一条私聊被各答一次。
   it("refuses to start a second supervisor while one is already running", async () => {
     const keystore = tempKeystore();
     keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
-    const stateDir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-guard-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "agentsbb-supervisor-guard-"));
     dirs.push(stateDir);
     const paths = defaultDaemonPaths(stateDir);
     // 需要一个「确实活着、但不是本进程」的 pid，否则会命中「pid 就是我自己」的放行分支。
@@ -478,7 +478,7 @@ describe("clawmessenger run (supervisor mode)", () => {
         JSON.stringify({
           pid,
           startedAt: 1,
-          execPath: "/opt/clawmessenger/clawmessenger",
+          execPath: "/opt/agentsbb/agentsbb",
           cwd: "/home/u",
           agents: ["opencode", "ops"],
         }),
@@ -491,13 +491,13 @@ describe("clawmessenger run (supervisor mode)", () => {
         stdout: { write: (s: string) => { lines.push(s); return true; } } as unknown as NodeJS.WriteStream,
         daemonPaths: paths,
       });
-      await program.parseAsync(["node", "clawmessenger", "run"]);
+      await program.parseAsync(["node", "agentsbb", "run"]);
 
       const text = lines.join("");
-      expect(text).toContain(`another clawmessenger supervisor is already running (PID ${pid}`);
+      expect(text).toContain(`another agentsbb supervisor is already running (PID ${pid}`);
       expect(text).toContain("opencode, ops");
-      expect(text).toContain("clawmessenger stop");
-      expect(text).toContain("CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR=1");
+      expect(text).toContain("agentsbb stop");
+      expect(text).toContain("AGENTSBB_ALLOW_DUPLICATE_SUPERVISOR=1");
       expect(process.exitCode).toBe(1);
     } finally {
       process.exitCode = previousExitCode;
@@ -511,7 +511,7 @@ describe("clawmessenger run (supervisor mode)", () => {
   it("refuses via the singleton port lock when no live pid file exists", async () => {
     const keystore = tempKeystore();
     keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
-    const stateDir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-lock-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "agentsbb-supervisor-lock-"));
     dirs.push(stateDir);
     const paths = defaultDaemonPaths(stateDir);
     // 不写任何 pid/state 文件 —— findLiveSupervisor 返回 null，走端口锁。
@@ -527,10 +527,10 @@ describe("clawmessenger run (supervisor mode)", () => {
     });
     const previousExitCode = process.exitCode;
     try {
-      await program.parseAsync(["node", "clawmessenger", "run"]);
+      await program.parseAsync(["node", "agentsbb", "run"]);
       const text = lines.join("");
       expect(text).toContain("singleton lock held, no live pid file");
-      expect(text).toContain("CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR=1");
+      expect(text).toContain("AGENTSBB_ALLOW_DUPLICATE_SUPERVISOR=1");
       expect(process.exitCode).toBe(1);
     } finally {
       process.exitCode = previousExitCode;
@@ -540,7 +540,7 @@ describe("clawmessenger run (supervisor mode)", () => {
   it("starts normally when the singleton lock is acquired", async () => {
     const keystore = tempKeystore();
     keystore.save({ nodeId: "node_9", token: "t", serverUrl: "http://srv" });
-    const stateDir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-lock-ok-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "agentsbb-supervisor-lock-ok-"));
     dirs.push(stateDir);
     const paths = defaultDaemonPaths(stateDir);
 
@@ -561,7 +561,7 @@ describe("clawmessenger run (supervisor mode)", () => {
         return child as unknown as ChildProcess;
       }) as unknown as typeof spawn,
     });
-    await program.parseAsync(["node", "clawmessenger", "run"]).catch(() => {});
+    await program.parseAsync(["node", "agentsbb", "run"]).catch(() => {});
     // 启动路径走到了 runSupervisor（锁没拦），无论后续怎么失败都行。
     expect(lockReleased).toBe(false); // 失败路径由 runSupervisor 的清理负责释放；这里只验证没被锁拒绝
     const text = lines.join("");
@@ -584,7 +584,7 @@ describe("allowDuplicateSupervisor", () => {
   });
 });
 
-describe("clawmessenger agent", () => {
+describe("agentsbb agent", () => {
   const credsKeystore = () => {
     const keystore = tempKeystore();
     keystore.save({
@@ -599,15 +599,15 @@ describe("clawmessenger agent", () => {
 
   function setScope(value: string | undefined): () => void {
     const previousScope = process.env[OPS_SCOPE_ENV];
-    const previousCreds = process.env.CLAWMESSENGER_AGENT_CREDS;
+    const previousCreds = process.env.AGENTSBB_AGENT_CREDS;
     if (value === undefined) delete process.env[OPS_SCOPE_ENV];
     else process.env[OPS_SCOPE_ENV] = value;
-    delete process.env.CLAWMESSENGER_AGENT_CREDS;
+    delete process.env.AGENTSBB_AGENT_CREDS;
     return () => {
       if (previousScope === undefined) delete process.env[OPS_SCOPE_ENV];
       else process.env[OPS_SCOPE_ENV] = previousScope;
-      if (previousCreds === undefined) delete process.env.CLAWMESSENGER_AGENT_CREDS;
-      else process.env.CLAWMESSENGER_AGENT_CREDS = previousCreds;
+      if (previousCreds === undefined) delete process.env.AGENTSBB_AGENT_CREDS;
+      else process.env.AGENTSBB_AGENT_CREDS = previousCreds;
     };
   }
 
@@ -629,7 +629,7 @@ describe("clawmessenger agent", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "agent", "restart"]);
+      await program.parseAsync(["node", "agentsbb", "agent", "restart"]);
 
       expect(setDeviceControl).toHaveBeenCalledWith("node_machine", "dc", "sec", "opencode", "restart");
       expect(lines.join("")).toContain("重启指令已下发");
@@ -651,7 +651,7 @@ describe("clawmessenger agent", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "agent", "stop", "hermes"]);
+      await program.parseAsync(["node", "agentsbb", "agent", "stop", "hermes"]);
 
       expect(setDeviceControl).not.toHaveBeenCalled();
       expect(lines.join("")).toContain("只负责 opencode");
@@ -683,7 +683,7 @@ describe("clawmessenger agent", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "agent", "stop"]);
+      await program.parseAsync(["node", "agentsbb", "agent", "stop"]);
 
       expect(setDeviceControl).toHaveBeenCalledWith("node_machine", "dc", "sec", "hermes", "stop");
       expect(lines.join("")).toContain("停止指令已下发");
@@ -707,7 +707,7 @@ describe("clawmessenger agent", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "agent", "stop"]);
+      await program.parseAsync(["node", "agentsbb", "agent", "stop"]);
 
       const out = lines.join("");
       expect(out).toContain("没有找到智能体");
@@ -735,7 +735,7 @@ describe("clawmessenger agent", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "agent", "stop", "opencode"]);
+      await program.parseAsync(["node", "agentsbb", "agent", "stop", "opencode"]);
 
       expect(lines.join("")).toContain("未上线");
       expect(process.exitCode).toBe(1);
@@ -756,7 +756,7 @@ describe("ops scope guard", () => {
     const env = { [OPS_SCOPE_ENV]: "opencode_330076275" };
     const stop = wholeMachineActionRejection("stop", env) ?? "";
     expect(stop).toContain("只负责本账号");
-    expect(stop).toContain("clawmessenger start");
+    expect(stop).toContain("agentsbb start");
     expect(wholeMachineActionRejection("restart", env) ?? "").toContain("--all-agents");
   });
 
@@ -769,7 +769,7 @@ describe("ops scope guard", () => {
     expect(scopeDaemonReport(report, "").agents).toEqual(report.agents);
   });
 
-  it("blocks `clawmessenger stop` before it reaches the daemon", async () => {
+  it("blocks `agentsbb stop` before it reaches the daemon", async () => {
     const previous = process.env[OPS_SCOPE_ENV];
     const previousExitCode = process.exitCode;
     process.env[OPS_SCOPE_ENV] = "opencode_330076275";
@@ -784,7 +784,7 @@ describe("ops scope guard", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "stop"]);
+      await program.parseAsync(["node", "agentsbb", "stop"]);
 
       expect(stopDaemon).not.toHaveBeenCalled();
       expect(lines.join("")).toContain("只负责本账号");
@@ -797,7 +797,7 @@ describe("ops scope guard", () => {
   });
 });
 
-// 2026-10-20 11:33 的现场：运维助手在会话里执行 `clawmessenger stop`，把拉起它的
+// 2026-10-20 11:33 的现场：运维助手在会话里执行 `agentsbb stop`，把拉起它的
 // supervisor 连同自己一起杀掉 —— 失败/取消终帧没机会发，前端气泡永远停在
 // 「正在思考 3m42s」，整台设备的智能体也全部下线。
 // 这条守卫与 ops 作用域无关：**任何**由 supervisor 拉起的子进程都不许停整机。
@@ -811,11 +811,11 @@ describe("supervised self-kill guard", () => {
     const env = { [SUPERVISED_ENV]: "1" };
     const stop = supervisedSelfKillRejection("stop", env) ?? "";
     expect(stop).toContain("supervisor");
-    expect(stop).toContain("clawmessenger agent stop|start");
+    expect(stop).toContain("agentsbb agent stop|start");
     expect(supervisedSelfKillRejection("restart", env) ?? "").toContain("supervisor");
   });
 
-  it("blocks `clawmessenger stop` before it reaches the daemon", async () => {
+  it("blocks `agentsbb stop` before it reaches the daemon", async () => {
     const previous = process.env[SUPERVISED_ENV];
     const previousExitCode = process.exitCode;
     process.env[SUPERVISED_ENV] = "1";
@@ -830,7 +830,7 @@ describe("supervised self-kill guard", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "stop"]);
+      await program.parseAsync(["node", "agentsbb", "stop"]);
 
       expect(stopDaemon).not.toHaveBeenCalled();
       expect(lines.join("")).toContain("supervisor");
@@ -857,7 +857,7 @@ describe("supervised self-kill guard", () => {
         daemonPaths: defaultDaemonPaths(),
       });
 
-      await program.parseAsync(["node", "clawmessenger", "restart", "--all-agents"]);
+      await program.parseAsync(["node", "agentsbb", "restart", "--all-agents"]);
 
       expect(restartDaemon).not.toHaveBeenCalled();
       expect(lines.join("")).toContain("supervisor");
@@ -870,11 +870,11 @@ describe("supervised self-kill guard", () => {
   });
 });
 
-describe("clawmessenger pair — browser authorization (no ticket)", () => {
+describe("agentsbb pair — browser authorization (no ticket)", () => {
   const deviceSession = {
     ticket: "pt_device",
     userCode: "ABCD2345",
-    verifyUrl: "https://clawmessenger.quukk.com/pair?code=ABCD2345",
+    verifyUrl: "https://agentsbb.quukk.com/pair?code=ABCD2345",
     expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
     intervalSeconds: 2,
   };
@@ -907,7 +907,7 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
       devicePollMs: 1,
     });
 
-    await program.parseAsync(["node", "clawmessenger", "pair"]);
+    await program.parseAsync(["node", "agentsbb", "pair"]);
 
     const output = lines.join("");
     expect(output).toContain(deviceSession.verifyUrl);
@@ -946,7 +946,7 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
       devicePollMs: 1,
     });
 
-    await program.parseAsync(["node", "clawmessenger", "pair", "--no-start"]);
+    await program.parseAsync(["node", "agentsbb", "pair", "--no-start"]);
     expect(polls).toBe(3);
   });
 
@@ -972,7 +972,7 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
       devicePollMs: 1,
     });
 
-    await expect(program.parseAsync(["node", "clawmessenger", "pair"])).rejects.toThrow(/过期/);
+    await expect(program.parseAsync(["node", "agentsbb", "pair"])).rejects.toThrow(/过期/);
   });
 
   it("never calls the device-code API when a manual ticket is supplied", async () => {
@@ -994,7 +994,7 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
       daemonPaths: defaultDaemonPaths(join(tmpdir(), `cm-pair-${process.pid}`)),
     });
 
-    await program.parseAsync(["node", "clawmessenger", "pair", "--ticket", "pt_manual"]);
+    await program.parseAsync(["node", "agentsbb", "pair", "--ticket", "pt_manual"]);
     expect(keystore.load()?.nodeId).toBe("node_1");
   });
 });
@@ -1011,8 +1011,8 @@ describe("clawmessenger pair — browser authorization (no ticket)", () => {
  *   · `--no-restart` / 智能体进程里只交换不重启；
  *   · 模型与工作目录要跟着重启带过去，否则设备会静默回落默认模型。
  */
-describe("clawmessenger update", () => {
-  const ASSET = "clawmessenger-linux-x64";
+describe("agentsbb update", () => {
+  const ASSET = "agentsbb-linux-x64";
 
   /** Buffer → 独立的 ArrayBuffer（`buf.buffer` 会带出 SharedArrayBuffer 的联合类型）。 */
   const toArrayBuffer = (b: Buffer): ArrayBuffer => {
@@ -1033,7 +1033,7 @@ describe("clawmessenger update", () => {
           ok: true,
           status: 200,
           json: async () => ({
-            tag_name: `clawmessenger-v${version}`,
+            tag_name: `agentsbb-v${version}`,
             assets: [
               { name: ASSET, browser_download_url: `https://cdn.test/${ASSET}`, size: payload.length },
               { name: "SHA256SUMS", browser_download_url: "https://cdn.test/SHA256SUMS", size: sums.length },
@@ -1067,9 +1067,9 @@ describe("clawmessenger update", () => {
 
   /** 临时安装目录：target 是一份「旧 exe」，旁边放状态/pid 文件。 */
   function installFixture(opts: { running: boolean; model?: string; cwd?: string }) {
-    const root = mkdtempSync(join(tmpdir(), "clawmessenger-update-"));
+    const root = mkdtempSync(join(tmpdir(), "agentsbb-update-"));
     dirs.push(root);
-    const target = join(root, "clawmessenger");
+    const target = join(root, "agentsbb");
     writeFileSync(target, "OLD-EXE-BYTES");
     const paths = defaultDaemonPaths(join(root, "state"));
     mkdirSync(paths.stateDir, { recursive: true });
@@ -1121,7 +1121,7 @@ describe("clawmessenger update", () => {
     const lines: string[] = [];
 
     const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
-    await program.parseAsync(["node", "clawmessenger", "update"]);
+    await program.parseAsync(["node", "agentsbb", "update"]);
 
     const out = lines.join("");
     expect(out).toContain("current: 1.3.22");
@@ -1132,7 +1132,7 @@ describe("clawmessenger update", () => {
     expect(out).toContain("updated to 1.3.23 and restarted");
     // 磁盘上真的是新 exe，旧的那份被改名留作回滚。
     expect(readFileSync(target, "utf8")).toBe(payload.toString());
-    const backups = readdirSync(dirname(target)).filter((f) => f.startsWith("clawmessenger.old-"));
+    const backups = readdirSync(dirname(target)).filter((f) => f.startsWith("agentsbb.old-"));
     expect(backups.length).toBe(1);
   });
 
@@ -1144,12 +1144,12 @@ describe("clawmessenger update", () => {
     const lines: string[] = [];
 
     const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
-    await program.parseAsync(["node", "clawmessenger", "update", "--no-restart"]);
+    await program.parseAsync(["node", "agentsbb", "update", "--no-restart"]);
 
     expect(fake.calls.filter((c) => c.startsWith("restart"))).toHaveLength(0);
     expect(readFileSync(target, "utf8")).toBe("OLD-EXE-BYTES");
     expect(existsSync(`${target}.new-1.3.23`)).toBe(true);
-    expect(lines.join("")).toContain("run `clawmessenger restart`");
+    expect(lines.join("")).toContain("run `agentsbb restart`");
   });
 
   it("says already up to date and touches nothing", async () => {
@@ -1159,7 +1159,7 @@ describe("clawmessenger update", () => {
     const lines: string[] = [];
 
     const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
-    await program.parseAsync(["node", "clawmessenger", "update"]);
+    await program.parseAsync(["node", "agentsbb", "update"]);
 
     expect(lines.join("")).toContain("already up to date");
     expect(fake.calls).toHaveLength(0);
@@ -1174,7 +1174,7 @@ describe("clawmessenger update", () => {
     const lines: string[] = [];
 
     const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
-    await program.parseAsync(["node", "clawmessenger", "update"]);
+    await program.parseAsync(["node", "agentsbb", "update"]);
 
     expect(fake.calls).toHaveLength(0);
     expect(readFileSync(target, "utf8")).toBe(payload.toString());
@@ -1190,7 +1190,7 @@ describe("clawmessenger update", () => {
     vi.stubEnv(SUPERVISED_ENV, "1");
     try {
       const program = programFor({ target, paths, fetchImpl, daemon: fake.daemon, lines });
-      await program.parseAsync(["node", "clawmessenger", "update"]);
+      await program.parseAsync(["node", "agentsbb", "update"]);
     } finally {
       vi.unstubAllEnvs();
     }
@@ -1226,7 +1226,7 @@ describe("clawmessenger update", () => {
           assetName: ASSET,
           sha256: sha,
           force: false,
-          mirrors: ["https://mirror.test/1.3.23/clawmessenger-linux-x64"],
+          mirrors: ["https://mirror.test/1.3.23/agentsbb-linux-x64"],
         },
       }),
     }) as unknown as XiachatApi;
@@ -1235,7 +1235,7 @@ describe("clawmessenger update", () => {
     const lines: string[] = [];
 
     const program = programFor({ target, paths, fetchImpl: mirrorFetch, daemon: fake.daemon, lines, keystore, apiFactory });
-    await program.parseAsync(["node", "clawmessenger", "update"]);
+    await program.parseAsync(["node", "agentsbb", "update"]);
 
     const out = lines.join("");
     expect(out).toContain("using the server's upgrade intent: 1.3.23");

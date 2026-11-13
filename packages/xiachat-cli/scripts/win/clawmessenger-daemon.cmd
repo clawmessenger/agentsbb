@@ -1,29 +1,19 @@
 @echo off
-rem clawmessenger background daemon - thin wrapper that forwards to the
-rem PowerShell script sitting next to it. See CLAWMESSENGER_GUIDE.zh.md (Appendix A).
+rem Deprecated alias: clawmessenger-daemon.cmd now forwards to
+rem agentsbb-daemon.cmd.
+rem TODO(rebrand-retire): delete this file when the shim retires in v1.6.0.
 rem
-rem   clawmessenger-daemon.cmd start            start in background (survives closing the window)
-rem   clawmessenger-daemon.cmd stop             stop everything
-rem   clawmessenger-daemon.cmd restart          restart
-rem   clawmessenger-daemon.cmd status           show status
-rem   clawmessenger-daemon.cmd logs             tail the log
-rem   clawmessenger-daemon.cmd install-startup  silent auto-start on logon (no admin needed)
-rem   clawmessenger-daemon.cmd install          scheduled-task auto-start (needs admin)
-rem   clawmessenger-daemon.cmd uninstall        remove auto-start
+rem English-only on purpose: cmd.exe renders the console in the OEM/ANSI
+rem codepage, so a UTF-8 Chinese line would print mojibake unless we flip the
+rem codepage (a global side effect on the user's console). The bilingual notice
+rem lives in clawmessenger-daemon.ps1, which is UTF-8 with BOM and renders fine.
 setlocal
-set "SCRIPT=%~dp0clawmessenger-daemon.ps1"
+set "SCRIPT=%~dp0agentsbb-daemon.cmd"
 if not exist "%SCRIPT%" (
-  echo [ERROR] clawmessenger-daemon.ps1 not found next to this file: "%SCRIPT%"
+  echo [ERROR] agentsbb-daemon.cmd not found next to this file: "%SCRIPT%"
   exit /b 1
 )
-if "%~1"=="" (
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Action status
-  echo.
-  echo usage: clawmessenger-daemon.cmd start / stop / restart / status / logs
-  echo        clawmessenger-daemon.cmd install-startup / install / uninstall
-  echo        extra args are passed through, e.g.:  ... start -Model gpt-5
-  pause
-  exit /b 0
-)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
-exit /b %errorlevel%
+echo [DEPRECATED] clawmessenger-daemon.cmd has been renamed to agentsbb-daemon.cmd;
+echo              this shim will be removed in an upcoming release.
+"%SCRIPT%" %*
+endlocal & exit /b %ERRORLEVEL%

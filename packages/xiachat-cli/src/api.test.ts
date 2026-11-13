@@ -182,7 +182,7 @@ describe("XiachatApi", () => {
         version: "1.3.19",
         platform: "win32-x64",
         hostname: "HOST-A",
-        installDir: "C:\\Users\\ops\\.clawmessenger\\bin",
+        installDir: "C:\\Users\\ops\\.agentsbb\\bin",
       });
       expect(captured["POST /api/claw/device/control"]).toMatchObject({
         nodeId: "node_1",
@@ -191,7 +191,7 @@ describe("XiachatApi", () => {
         version: "1.3.19",
         platform: "win32-x64",
         hostname: "HOST-A",
-        installDir: "C:\\Users\\ops\\.clawmessenger\\bin",
+        installDir: "C:\\Users\\ops\\.agentsbb\\bin",
       });
 
       await api.fetchDeviceControl("node_1", "dc_1", "s3cret", { version: "1.3.19" });

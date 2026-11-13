@@ -460,7 +460,7 @@ export async function runServerSession(opts: RunServerSessionOpts): Promise<RunS
   try {
     // 1) 建会话。title 只用于 opencode 自己的会话列表，不影响语义。
     const created = await requestJson(
-      opts.baseUrl, "POST", "/session", { title: "clawmessenger" }, agent, abort.signal,
+      opts.baseUrl, "POST", "/session", { title: "agentsbb" }, agent, abort.signal,
     );
     if (created.status !== 200) {
       throw new OpenCodeServerError(`POST /session -> HTTP ${created.status}: ${created.body.slice(0, 200)}`);

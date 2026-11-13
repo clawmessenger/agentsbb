@@ -10,7 +10,7 @@ package rongcloud
 // 设备跑完 agent 回一条 command_result，服务端据此推进下一位。这样：
 //
 //   - 设备端（CLI）零改动，也不需要 wire/delta 两张表；
-//   - C 端（clawmessenger-web）拿到的仍是**标准 v3 事件**（v3_envelope +
+//   - C 端（agentsbb-web）拿到的仍是**标准 v3 事件**（v3_envelope +
 //     discussion_event 广播），前端 lib/discussion-v3.ts 无需改动。
 //
 // 服务端状态机（与 Python 同构）：

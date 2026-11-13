@@ -1,10 +1,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { stateHome } from "./paths.js";
 
 export function defaultKeystorePath(): string {
-  return join(homedir(), ".clawmessenger", "credentials.json");
+  return join(stateHome(), "credentials.json");
 }
 
 // 升级进行中的小账本。
@@ -15,7 +15,7 @@ export function defaultKeystorePath(): string {
 // （版本号编译进镜像）。把它写在启动前就好的文件里，重启后的第一个 supervisor
 // 才能回报 succeeded 而不是让页面永远停在「重启中」。
 export function defaultUpgradeInflightPath(): string {
-  return join(homedir(), ".clawmessenger", "upgrade-inflight.json");
+  return join(stateHome(), "upgrade-inflight.json");
 }
 
 // Local record of RongCloud message UIDs the run loop has already acted on.
@@ -27,7 +27,7 @@ export function defaultUpgradeInflightPath(): string {
 // they would otherwise race on a single shared file.
 export function defaultProcessedUidsPath(nodeId?: string): string {
   const suffix = nodeId ? `-${nodeId.replace(/[^A-Za-z0-9._-]/g, "_")}` : "";
-  return join(homedir(), ".clawmessenger", `processed-uids${suffix}.json`);
+  return join(stateHome(), `processed-uids${suffix}.json`);
 }
 
 // 已答轮次台账（见 answered-turns.ts）。processed-uids 按融云 messageUId 去重，
@@ -38,7 +38,7 @@ export function defaultProcessedUidsPath(nodeId?: string): string {
 // 覆盖。
 export function defaultAnsweredTurnsPath(nodeId?: string): string {
   const suffix = nodeId ? `-${nodeId.replace(/[^A-Za-z0-9._-]/g, "_")}` : "";
-  return join(homedir(), ".clawmessenger", `answered-turns${suffix}.json`);
+  return join(stateHome(), `answered-turns${suffix}.json`);
 }
 
 // Length of a freshly minted machine id, in decimal digits.
@@ -90,8 +90,9 @@ export function randomMachineId(length: number = MACHINE_ID_LENGTH): string {
 export function machineId(keystorePath: string = defaultKeystorePath()): string {
   const idPath = join(dirnameOf(keystorePath), "machine_id");
   try {
-    // Returned verbatim, including the legacy "clawmessenger-<uuid>" form: the
-    // device is already bound to the RongCloud account derived from it, so
+    // Returned verbatim, including the legacy "clawmessenger-<uuid>" form
+    // TODO(rebrand-retire): legacy id 形态随存量设备退役后移除引用说明.
+    // The device is already bound to the RongCloud account derived from it, so
     // re-minting would orphan that account and duplicate every node under it.
     const existing = readFileSync(idPath, "utf8").trim();
     if (existing) return existing;
@@ -118,4 +119,6 @@ function dirnameOf(p: string): string {
 
 // 发布版默认指向线上生产环境（站点根，不是子路径：API 由调用方拼 /api/...）。
 // 别的环境一律由调用方显式传 --server，不要在这里加分支。
+// TODO(rebrand-retire): 域名切换是独立 DNS 事务；clawmessenger.quukk.com 仍是
+// 唯一已知线上值，DNS 切换到 agentsbb 域名后改此默认值（部署说明 T05 跟踪）。
 export const DEFAULT_SERVER_URL = "https://clawmessenger.quukk.com";

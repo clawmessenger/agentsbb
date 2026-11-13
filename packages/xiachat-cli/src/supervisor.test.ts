@@ -82,7 +82,7 @@ function makeHarness(
   bound: unknown[] = BOUND_OPS,
   overrides: Record<string, unknown> = {},
 ): Harness {
-  const dir = mkdtempSync(join(tmpdir(), "clawmessenger-supervisor-"));
+  const dir = mkdtempSync(join(tmpdir(), "agentsbb-supervisor-"));
   dirs.push(dir);
   const keystore = new Keystore(join(dir, "creds.json"));
   keystore.save({ nodeId: "node_machine", token: "t", credentialId: "dc", deviceSecret: "sec", serverUrl: "http://unused.local" });
@@ -125,21 +125,21 @@ function makeHarness(
     onSupervisorSignal: (fn) => { shutdown = fn },
     supervisorControlPollMs: CONTROL_TICK_MS,
     // 这些用例跑的是真正的 `run`，state/pid 文件必须落在临时目录里：
-    //   · 用默认的 ~/.clawmessenger，`run` 会读到**这台机器上真实在跑的 supervisor**
+    //   · 用默认的 ~/.agentsbb，`run` 会读到**这台机器上真实在跑的 supervisor**
     //     → 被新加的防重复护栏拒绝启动 → 所有用例超时；
     //   · 更要命的是 onStopped 会 clearSupervisorState(真实路径)，把线上的
     //     supervisor.pid 删掉 —— 下次 `run` / 开机自启就以为没人跑而多起一份。
-    daemonPaths: defaultDaemonPaths(join(dir, ".clawmessenger")),
+    daemonPaths: defaultDaemonPaths(join(dir, ".agentsbb")),
     // 单例端口锁同理：测试里必须用假锁，否则会在真实 127.0.0.1:41307 上
     // 和其他并发测试进程（或本机活着的 supervisor）抢同一个端口。
     acquireLock: () => Promise.resolve({ release: () => {} }),
     // 升级相关的默认值全部指向临时目录：真正的安装路径是
-    // %LOCALAPPDATA%\clawmessenger\clawmessenger.exe，测试一旦真的交换就会
+    // %LOCALAPPDATA%\agentsbb\agentsbb.exe，测试一旦真的交换就会
     // 把开发机上装着的 CLI 换掉。
     version: "1.2.0",
     platform: "win32",
     arch: "x64",
-    upgradeTarget: join(dir, "install", "clawmessenger.exe"),
+    upgradeTarget: join(dir, "install", "agentsbb.exe"),
     upgradeInflightPath: join(dir, "upgrade-inflight.json"),
     // 默认下载失败：不想让「忘了 mock」的用例悄悄跑通一次升级。
     upgradeFetch: (async () => ({
@@ -151,7 +151,7 @@ function makeHarness(
     // 默认不真的 spawn `__relaunch`：那会多出一个子进程并影响子进程计数断言。
     relaunch: () => {},
     // agent CLI 的版本/路径探测同样不该真的跑：默认实现会读宿主机
-    // ~/.clawmessenger/agent-cli-info.json 并起 `<cli> --version` 子进程，
+    // ~/.agentsbb/agent-cli-info.json 并起 `<cli> --version` 子进程，
     // 于是「observed 里只有 agent/state/version」这类断言会随开发机装了什么
     // 而飘（本机就真的探出了 opencode 1.19.4）。用例只关心上报管道，
     // 需要断言字段时由单个用例用 overrides 注入带值的 stub。
@@ -159,7 +159,7 @@ function makeHarness(
     ...overrides,
   });
 
-  const run = program.parseAsync(["node", "clawmessenger", "run"]);
+  const run = program.parseAsync(["node", "agentsbb", "run"]);
   const harness: Harness = {
     dir,
     spawned,
@@ -198,7 +198,7 @@ const errorLog: string[] = [];
 let errorSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
-  delete process.env.CLAWMESSENGER_AGENT_CREDS;
+  delete process.env.AGENTSBB_AGENT_CREDS;
   errorLog.length = 0;
   errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
     errorLog.push(args.map(String).join(" "));
@@ -233,7 +233,7 @@ describe("runSupervisor restart backoff", () => {
     const h = await startSupervisor();
     expect(h.spawned).toHaveLength(1);
     expect(h.spawned[0].args.slice(-3)).toEqual(["run", "--agent", "ops"]);
-    expect(JSON.parse(String(h.spawned[0].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({
+    expect(JSON.parse(String(h.spawned[0].env.AGENTSBB_AGENT_CREDS))).toMatchObject({
       nodeId: "node_ops",
       token: "tok",
       serverUrl: "http://unused.local",
@@ -255,8 +255,8 @@ describe("runSupervisor restart backoff", () => {
     // per-agent ops：各带自己的 workdir 后缀与子进程凭据。
     expect(harness.spawned[1].args.slice(-5)).toEqual(["run", "--agent", "ops", "--ops-suffix", "hermes_key1"]);
     expect(harness.spawned[2].args.slice(-5)).toEqual(["run", "--agent", "ops", "--ops-suffix", "opencode_key1"]);
-    expect(JSON.parse(String(harness.spawned[1].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({ nodeId: "node_ops_hermes", token: "tok_h" });
-    expect(JSON.parse(String(harness.spawned[2].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({ nodeId: "node_ops_opencode", token: "tok_o" });
+    expect(JSON.parse(String(harness.spawned[1].env.AGENTSBB_AGENT_CREDS))).toMatchObject({ nodeId: "node_ops_hermes", token: "tok_h" });
+    expect(JSON.parse(String(harness.spawned[2].env.AGENTSBB_AGENT_CREDS))).toMatchObject({ nodeId: "node_ops_opencode", token: "tok_o" });
   });
 
   // 操作员在控制台停掉 ops，per-agent 运维子进程必须一起停（共享 "ops" 控制键）。
@@ -480,7 +480,7 @@ describe("per-agent restart via control version", () => {
     h.spawned[0].child.emit("exit", 0);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(h.spawned).toHaveLength(3);
-    expect(JSON.parse(String(h.spawned[2].env.CLAWMESSENGER_AGENT_CREDS))).toMatchObject({ nodeId: "node_open" });
+    expect(JSON.parse(String(h.spawned[2].env.AGENTSBB_AGENT_CREDS))).toMatchObject({ nodeId: "node_open" });
     expect(errorLog.some((m) => m.includes("restarting in"))).toBe(false);
   });
 });
@@ -495,12 +495,12 @@ describe("device exe upgrade", () => {
   const intent = (over: Partial<DeviceUpgradeIntent> = {}): DeviceUpgradeIntent => ({
     generation: 7,
     targetVersion: "1.3.0",
-    assetName: "clawmessenger-windows-x64.exe",
+    assetName: "agentsbb-windows-x64.exe",
     sha256: NEW_SHA,
     force: false,
     mirrors: [
-      "https://github.com/clawmessenger/claw-messenger/releases/download/clawmessenger-v1.3.0/clawmessenger-windows-x64.exe",
-      "/api/agent/upgrade/download?version=1.3.0&asset=clawmessenger-windows-x64.exe&token=t",
+      "https://github.com/agentsbb/claw-messenger/releases/download/agentsbb-v1.3.0/agentsbb-windows-x64.exe",
+      "/api/agent/upgrade/download?version=1.3.0&asset=agentsbb-windows-x64.exe&token=t",
     ],
     ...over,
   });
@@ -590,7 +590,7 @@ describe("device exe upgrade", () => {
     await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
     vi.useFakeTimers();
     const report = vi.spyOn(h.api, "reportDeviceUpgrade").mockResolvedValue(undefined);
-    const target = join(h.dir, "install", "clawmessenger.exe");
+    const target = join(h.dir, "install", "agentsbb.exe");
     mkdirSync(join(h.dir, "install"), { recursive: true });
     writeFileSync(target, "OLD-BINARY");
     vi.mocked(h.api.fetchDeviceControl).mockResolvedValue({
@@ -624,7 +624,7 @@ describe("device exe upgrade", () => {
     await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
     vi.useFakeTimers();
     const report = vi.spyOn(h.api, "reportDeviceUpgrade").mockResolvedValue(undefined);
-    const target = join(h.dir, "install", "clawmessenger.exe");
+    const target = join(h.dir, "install", "agentsbb.exe");
     mkdirSync(join(h.dir, "install"), { recursive: true });
     writeFileSync(target, "OLD-BINARY");
     vi.mocked(h.api.fetchDeviceControl).mockResolvedValue({
@@ -659,7 +659,7 @@ describe("device exe upgrade", () => {
     vi.useFakeTimers();
     const report = vi.spyOn(h.api, "reportDeviceUpgrade").mockResolvedValue(undefined);
     mkdirSync(join(h.dir, "install"), { recursive: true });
-    writeFileSync(join(h.dir, "install", "clawmessenger.exe"), "OLD-BINARY");
+    writeFileSync(join(h.dir, "install", "agentsbb.exe"), "OLD-BINARY");
     vi.mocked(h.api.fetchDeviceControl).mockResolvedValue({
       agents: [{ agent: "ops", nodeId: "node_ops", desiredState: "running", version: 0 }],
       upgrade: intent(),
@@ -778,7 +778,7 @@ describe("__relaunch helper", () => {
   it("heals a missing target from the backup before starting it", async () => {
     const dir = mkdtempSync(process.env.TEMP ?? ".");
     dirs.push(dir);
-    const target = join(dir, "install", "clawmessenger.exe");
+    const target = join(dir, "install", "agentsbb.exe");
     mkdirSync(join(dir, "install"));
     // 交换只做了一半：target 不见了，只剩备份。
     writeFileSync(`${target}.old-1234`, "OLD-BINARY");
@@ -803,7 +803,7 @@ describe("__relaunch helper", () => {
     });
 
     await program.parseAsync([
-      "node", "clawmessenger", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
+      "node", "agentsbb", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
       "--args", JSON.stringify(["--model", "kimi"]),
     ]);
 
@@ -817,7 +817,7 @@ describe("__relaunch helper", () => {
   it("retries once and leaves a marker when the target dies right after spawn", async () => {
     const dir = mkdtempSync(process.env.TEMP ?? ".");
     dirs.push(dir);
-    const target = join(dir, "install", "clawmessenger.exe");
+    const target = join(dir, "install", "agentsbb.exe");
     mkdirSync(join(dir, "install"));
     writeFileSync(target, "SOME-BINARY");
 
@@ -837,11 +837,11 @@ describe("__relaunch helper", () => {
     });
 
     await program.parseAsync([
-      "node", "clawmessenger", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
+      "node", "agentsbb", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
     ]);
 
     expect(attempts).toBe(2);
-    // 标记文件落在 ~/.clawmessenger/ 下供人工排查；测试里不校验具体 home，只要
+    // 标记文件落在 ~/.agentsbb/ 下供人工排查；测试里不校验具体 home，只要
     // 不抛异常即可（写入失败也不能让 helper 崩掉）。
     expect(process.exitCode ?? 0).toBe(1);
     process.exitCode = undefined;
@@ -859,7 +859,7 @@ describe("relaunch lock handover", () => {
   it("spawns and releases the lock before the child reports it holds it", async () => {
     const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-lock-"));
     dirs.push(dir);
-    const target = join(dir, "clawmessenger.exe");
+    const target = join(dir, "agentsbb.exe");
     writeFileSync(target, "CURRENT-BINARY");
 
     const events: string[] = [];
@@ -881,7 +881,7 @@ describe("relaunch lock handover", () => {
     });
 
     await program.parseAsync([
-      "node", "clawmessenger", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
+      "node", "agentsbb", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
     ]);
 
     expect(events).toEqual(["spawn", "release"]);
@@ -902,9 +902,9 @@ describe("relaunch lock handover", () => {
   it("fails when the child stays alive but never takes the lock", async () => {
     const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-lock-"));
     dirs.push(dir);
-    const target = join(dir, "clawmessenger.exe");
+    const target = join(dir, "agentsbb.exe");
     writeFileSync(target, "CURRENT-BINARY");
-    process.env.CLAWMESSENGER_HOME = join(dir, ".clawmessenger");
+    process.env.CLAWMESSENGER_HOME = join(dir, ".agentsbb");
     const output: string[] = [];
     try {
       const program = buildProgram({
@@ -922,7 +922,7 @@ describe("relaunch lock handover", () => {
       });
 
       await program.parseAsync([
-        "node", "clawmessenger", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
+        "node", "agentsbb", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
       ]);
 
       const text = output.join("");
@@ -930,7 +930,7 @@ describe("relaunch lock handover", () => {
       expect(text).not.toContain("lock handed over");
       expect(text).toMatch(/never reported holding the supervisor lock/);
       // 零痕迹是这条 bug 最难查的部分：失败必须留下可读的标记。
-      const marker = JSON.parse(readFileSync(join(dir, ".clawmessenger", "relaunch-failed.json"), "utf8")) as {
+      const marker = JSON.parse(readFileSync(join(dir, ".agentsbb", "relaunch-failed.json"), "utf8")) as {
         reason: string;
       };
       expect(marker.reason).toBe("lock_handover_timeout");
@@ -945,9 +945,9 @@ describe("relaunch lock handover", () => {
   it("does not report a handover when the child says it never got the lock", async () => {
     const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-lock-"));
     dirs.push(dir);
-    const target = join(dir, "clawmessenger.exe");
+    const target = join(dir, "agentsbb.exe");
     writeFileSync(target, "CURRENT-BINARY");
-    process.env.CLAWMESSENGER_HOME = join(dir, ".clawmessenger");
+    process.env.CLAWMESSENGER_HOME = join(dir, ".agentsbb");
     const output: string[] = [];
     try {
       const program = buildProgram({
@@ -965,14 +965,14 @@ describe("relaunch lock handover", () => {
       });
 
       await program.parseAsync([
-        "node", "clawmessenger", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
+        "node", "agentsbb", "__relaunch", "--wait-pid", "0", "--target", target, "--timeout", "1000",
       ]);
 
       const text = output.join("");
       expect(process.exitCode ?? 0).toBe(1);
       expect(text).not.toContain("lock handed over");
       expect(text).toMatch(/reported no singleton lock/);
-      const marker = JSON.parse(readFileSync(join(dir, ".clawmessenger", "relaunch-failed.json"), "utf8")) as {
+      const marker = JSON.parse(readFileSync(join(dir, ".agentsbb", "relaunch-failed.json"), "utf8")) as {
         reason: string;
       };
       expect(marker.reason).toBe("lock_not_held");
@@ -1105,13 +1105,13 @@ describe("relaunch failure marker", () => {
   it("logs the previous relaunch failure on startup and clears it", async () => {
     const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-marker-"));
     dirs.push(dir);
-    const markerDir = join(dir, ".clawmessenger");
+    const markerDir = join(dir, ".agentsbb");
     mkdirSync(markerDir, { recursive: true });
     const markerPath = join(markerDir, "relaunch-failed.json");
     writeFileSync(
       markerPath,
       `${JSON.stringify({
-        target: join(dir, "clawmessenger.exe"),
+        target: join(dir, "agentsbb.exe"),
         args: [],
         reason: "lock_handover_timeout",
         detail: "pid 123 never reported holding the supervisor lock",
@@ -1136,17 +1136,17 @@ describe("startup script backfill", () => {
     const h = makeHarness([], BOUND_OPS, {
       refreshStartupScript: async () => {
         calls += 1;
-        return { updated: true, path: "/tmp/clawmessenger.vbs" };
+        return { updated: true, path: "/tmp/agentsbb.vbs" };
       },
     });
     await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
     expect(calls).toBe(1);
-    expect(h.output.join("")).toContain("refreshed /tmp/clawmessenger.vbs");
+    expect(h.output.join("")).toContain("refreshed /tmp/agentsbb.vbs");
   });
 
   it("does not report anything when the script was already current", async () => {
     const h = makeHarness([], BOUND_OPS, {
-      refreshStartupScript: async () => ({ updated: false, path: "/tmp/clawmessenger.vbs", reason: "already-current" }),
+      refreshStartupScript: async () => ({ updated: false, path: "/tmp/agentsbb.vbs", reason: "already-current" }),
     });
     await vi.waitFor(() => expect(h.spawned.length).toBeGreaterThan(0), { timeout: 5_000 });
     expect(h.output.join("")).not.toContain("refreshed");
@@ -1162,7 +1162,7 @@ describe("__relaunch 对不退出旧进程的处置", () => {
   function fixture(): { dir: string; target: string } {
     const dir = mkdtempSync(join(process.env.TEMP ?? ".", "relaunch-kill-"));
     dirs.push(dir);
-    const target = join(dir, "clawmessenger.exe");
+    const target = join(dir, "agentsbb.exe");
     writeFileSync(target, "NEW-BINARY");
     return { dir, target };
   }
@@ -1195,7 +1195,7 @@ describe("__relaunch 对不退出旧进程的处置", () => {
     // 这条要断言「成功路径不设失败码」，先清干净再跑。
     process.exitCode = undefined;
     await program.parseAsync([
-      "node", "clawmessenger", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "1",
+      "node", "agentsbb", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "1",
     ]);
 
     // 超时那一刻强杀，而不是放弃。
@@ -1228,7 +1228,7 @@ describe("__relaunch 对不退出旧进程的处置", () => {
     });
 
     await program.parseAsync([
-      "node", "clawmessenger", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "1",
+      "node", "agentsbb", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "1",
     ]);
 
     // 杀不掉时**绝不能**起第二份（两份 supervisor 会登录同一批融云节点互相踢线）。
@@ -1260,7 +1260,7 @@ describe("__relaunch 对不退出旧进程的处置", () => {
     });
 
     await program.parseAsync([
-      "node", "clawmessenger", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "60000",
+      "node", "agentsbb", "__relaunch", "--wait-pid", "4242", "--target", target, "--timeout", "60000",
     ]);
 
     expect(kills).toHaveLength(0);

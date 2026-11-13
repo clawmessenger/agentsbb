@@ -15,17 +15,17 @@ import { staticModelCatalogFor } from "./model-static-catalogs.js";
 
 // Protocol v2 model-catalog responder for the web's 设备管理 → 默认模型 panel.
 //
-// clawmessenger-web sends a private "command" message
+// agentsbb-web sends a private "command" message
 //   { msg_type: "discussion_model_catalog_request", protocolVersion: 2,
 //     requestId: <uuid>, timestamp: <ms> }
 // to the node's RongCloud user and waits 8s (15s when the node looks offline)
 // for a "discussion_model_catalog_response" from that same user. Only the
-// OpenClaw plugin (oepnclaw-clawmessenger) implemented that responder, so nodes
+// OpenClaw plugin (oepnclaw-agentsbb) implemented that responder, so nodes
 // driven by this CLI (opencode / codex / hermes / ...) never answered and the
 // panel stayed on "正在获取设备模型目录…".
 //
 // Wire shape must stay byte-compatible with the web's normalizeCatalog
-// (clawmessenger-web/src/services/node-model-catalog.ts): exactly the keys
+// (agentsbb-web/src/services/node-model-catalog.ts): exactly the keys
 // msg_type/protocolVersion/requestId/defaultModel/providers/timestamp, each
 // provider exactly {id,name,models}, each model exactly {id,name}.
 

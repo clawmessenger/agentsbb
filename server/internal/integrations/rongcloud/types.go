@@ -48,7 +48,7 @@ type CommandContent struct {
 // Two clients put the same objectName ("command") on the wire with different
 // key styles: the device CLI (packages/xiachat-cli/src/protocol.ts) sends
 // snake_case — request_id / params — while the web client (sendSystemRequest in
-// clawmessenger-web/src/services/im.ts) sends camelCase — requestId / payload.
+// agentsbb-web/src/services/im.ts) sends camelCase — requestId / payload.
 // Parsing only snake_case made every web request look like it had no request_id,
 // so handleCommand dropped it before dispatch: the web's group.create never
 // reached a handler. Accepting either is the whole fix.

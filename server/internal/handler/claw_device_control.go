@@ -40,7 +40,7 @@ type clawDeviceControlState struct {
 	BehaviorPrompt  string `json:"behaviorPrompt"`
 }
 
-// ClawDeviceControl POST /api/claw/device/control —— clawmessenger supervisor 轮询
+// ClawDeviceControl POST /api/claw/device/control —— agentsbb supervisor 轮询
 // 本机各 agent 的期望运行状态。认证与 device/nodes、device/heartbeat 一致（机器节点
 // device credential）。
 //
@@ -327,7 +327,7 @@ func applyDevicePermissions(states []clawDeviceControlState, refs []rongcloud.Ag
 // ---- 按账号启停（设备端 / 运维助手） ---------------------------------------
 //
 // 管理端一直是按节点启停（/api/admin/nodes/{id}/start|stop），但设备侧的运维
-// 助手只有整机级的 `clawmessenger stop/restart` —— 一句话就能把同机其他账号
+// 助手只有整机级的 `agentsbb stop/restart` —— 一句话就能把同机其他账号
 // 的智能体一起拉下来。这条接口把「启停某一个智能体」的能力下放到设备凭据，
 // 让运维助手（以及后台）用同一张 control 表、同一套收敛逻辑，粒度收窄到账号。
 

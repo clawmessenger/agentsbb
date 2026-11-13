@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 // dist/bin.js already runs under plain `node` (ESM, type: module), so a
 // bundle was a nicety, not a requirement.
 const here = dirname(fileURLToPath(import.meta.url));
-const out = join(here, "..", "dist", "clawmessenger.bundle.js");
+const out = join(here, "..", "dist", "agentsbb.bundle.js");
 
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(
@@ -21,4 +21,4 @@ writeFileSync(
   ].join("\n"),
 );
 chmodSync(out, 0o755);
-console.log("wrote dist/clawmessenger.bundle.js — run with: node dist/clawmessenger.bundle.js <cmd>");
+console.log("wrote dist/agentsbb.bundle.js — run with: node dist/agentsbb.bundle.js <cmd>");

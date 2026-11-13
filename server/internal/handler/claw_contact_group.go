@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// 通讯录分组接口。给 clawmessenger-web / clawmessenger-uniapp 的通讯录左栏用。
+// 通讯录分组接口。给 agentsbb-web / agentsbb-uniapp 的通讯录左栏用。
 //
 // 设计要点（改之前先读，这几条都是被具体问题逼出来的）：
 //

@@ -26,12 +26,31 @@ import { dirname, join } from "node:path";
 // 标记注释圈定我们这一段，只替换标记之间的内容，前后文原样保留；文件不存在才
 // 创建。任何一步失败都只返回 false，绝不让一轮对话因为写不了指令文件而失败。
 
-export const CODEX_OUTPUT_STYLE_BEGIN = "<!-- clawmessenger:output-style:begin -->";
-export const CODEX_OUTPUT_STYLE_END = "<!-- clawmessenger:output-style:end -->";
+export const CODEX_OUTPUT_STYLE_BEGIN = "<!-- agentsbb:output-style:begin -->";
+export const CODEX_OUTPUT_STYLE_END = "<!-- agentsbb:output-style:end -->";
+
+// 旧品牌名下写入设备的标记。存量机器的 AGENTS.md 里还是这一对 —— 合并/摘除前
+// 先把旧标记归一成新标记，否则旧文件会被追加出重复段（幂等性被改名破坏）。
+// TODO(rebrand-retire): 旧标记兼容移除于 v1.6+
+export const LEGACY_CODEX_OUTPUT_STYLE_BEGIN = "<!-- clawmessenger:output-style:begin -->";
+export const LEGACY_CODEX_OUTPUT_STYLE_END = "<!-- clawmessenger:output-style:end -->";
+// TODO(rebrand-retire): 旧标记兼容移除于 v1.6+
+export const LEGACY_CODEX_BEHAVIOR_BEGIN = "<!-- clawmessenger:behavior:begin -->";
+export const LEGACY_CODEX_BEHAVIOR_END = "<!-- clawmessenger:behavior:end -->";
+
+/** 把旧品牌标记归一成新标记（只做字符串归一，不写盘；写盘仍走原入口）。 */
+function normalizeLegacyMarkers(base: string): string {
+  // TODO(rebrand-retire): 旧标记兼容移除于 v1.6+
+  return base
+    .split(LEGACY_CODEX_OUTPUT_STYLE_BEGIN).join(CODEX_OUTPUT_STYLE_BEGIN)
+    .split(LEGACY_CODEX_OUTPUT_STYLE_END).join(CODEX_OUTPUT_STYLE_END)
+    .split(LEGACY_CODEX_BEHAVIOR_BEGIN).join(CODEX_BEHAVIOR_BEGIN)
+    .split(LEGACY_CODEX_BEHAVIOR_END).join(CODEX_BEHAVIOR_END);
+}
 
 export const CODEX_OUTPUT_STYLE_BODY = [
   CODEX_OUTPUT_STYLE_BEGIN,
-  "## 输出风格（由 ClawMessenger 设备端维护，可整段删除）",
+  "## 输出风格（由 AgentsBB 设备端维护，可整段删除）",
   "",
   "- 正文只写成品内容。不要在正文里叙述你的执行过程、环境检查、工具选择或实现思路，",
   "  例如「我先核对字数」「这里没有安装 Python，我改用 PowerShell 直接按字符计数」。",
@@ -55,7 +74,7 @@ export function codexAgentsPath(env: NodeJS.ProcessEnv = process.env, home?: str
  * - 已有标记段：原地替换（前后文保留），用于升级文案而不重复堆叠
  */
 export function mergeCodexOutputStyle(existing: string | null | undefined): string {
-  return mergeMarkedBlock(existing ?? "", CODEX_OUTPUT_STYLE_BEGIN, CODEX_OUTPUT_STYLE_END, CODEX_OUTPUT_STYLE_BODY);
+  return mergeMarkedBlock(normalizeLegacyMarkers(existing ?? ""), CODEX_OUTPUT_STYLE_BEGIN, CODEX_OUTPUT_STYLE_END, CODEX_OUTPUT_STYLE_BODY);
 }
 
 /**
@@ -98,20 +117,20 @@ function removeMarkedBlock(base: string, beginMarker: string, endMarker: string)
 //
 // 用**独立标记**（不是 output-style 那一对）：两份文本语义不同、生命周期也不同
 // （输出风格常驻；行为规范只在私聊轮次存在），共用标记会互相覆盖成一份。
-export const CODEX_BEHAVIOR_BEGIN = "<!-- clawmessenger:behavior:begin -->";
-export const CODEX_BEHAVIOR_END = "<!-- clawmessenger:behavior:end -->";
+export const CODEX_BEHAVIOR_BEGIN = "<!-- agentsbb:behavior:begin -->";
+export const CODEX_BEHAVIOR_END = "<!-- agentsbb:behavior:end -->";
 
 /** 把行为规范合并进已有内容；`prompt` 为空 = 摘掉这一节。 */
 export function mergeCodexBehaviorPrompt(
   existing: string | null | undefined,
   prompt: string | null | undefined,
 ): string {
-  const base = existing ?? "";
+  const base = normalizeLegacyMarkers(existing ?? "");
   const text = (prompt ?? "").trim();
   if (!text) return removeMarkedBlock(base, CODEX_BEHAVIOR_BEGIN, CODEX_BEHAVIOR_END);
   const body = [
     CODEX_BEHAVIOR_BEGIN,
-    "## 行为规范（由 ClawMessenger 设备端维护，可整段删除）",
+    "## 行为规范（由 AgentsBB 设备端维护，可整段删除）",
     "",
     text,
     CODEX_BEHAVIOR_END,

@@ -35,7 +35,7 @@ type RetirementGroup struct {
 //
 // maxMachineIDLength is the longest machine id to keep: MachineIdentityBudget
 // retires exactly the ids the server had to hash (the CLI's 50-character
-// "clawmessenger-<uuid>"), while ShortMachineIDMax additionally retires
+// "agentsbb-<uuid>"), while ShortMachineIDMax additionally retires
 // anything that is merely longer than the 8-11 character format — useful for
 // sweeping ids minted by other clients.
 func IsLegacyMachineIdentity(n db.RongcloudNode, maxMachineIDLength int) bool {

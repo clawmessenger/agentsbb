@@ -43,7 +43,7 @@ type clawDeviceObservedState struct {
 	// CliPath/CliVersion 是**这个 agent 自己的 CLI** 的安装路径与版本（迁移 612）。
 	//
 	// 与机器维度的 install_dir / exe_version 分工：那两列讲的是 supervisor
-	// （clawmessenger 自己），这两列讲的是真正干活的 codex/opencode/qwen。后台
+	// （agentsbb 自己），这两列讲的是真正干活的 codex/opencode/qwen。后台
 	// 「设备详情」的「安装目录」「版本」展示的是这两个 —— 运维要翻的是 agent 的
 	// 日志，不是 supervisor 的目录。空串 = 设备没探到（没装 / 超时），写入端
 	// 保留旧值而不是把已知版本抹掉。

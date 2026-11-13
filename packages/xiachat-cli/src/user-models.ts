@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { stateHome } from "./paths.js";
 
 // 「按用户」的模型偏好。
 //
@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 // 讨论组角色的会话里。A 把模型换成 glm-5.3 不该顺手把 B 手里的 claude 也换掉。
 // 融云每条消息都带 fromUserId，天然就是这把钥匙。
 //
-// 为什么落盘而不是只放内存：supervisor 会因为升级 / 崩溃自愈 / `clawmessenger
+// 为什么落盘而不是只放内存：supervisor 会因为升级 / 崩溃自愈 / `agentsbb
 // restart` 反复拉起子进程。内存版一重启就退回节点默认，用户会以为「我设的模型
 // 自己变了」——这种「改了但没保住」比「不让改」更伤。
 //
@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 // processed-uids 的处理方式）。
 export function defaultUserModelsPath(nodeId?: string): string {
   const suffix = nodeId ? `-${nodeId.replace(/[^A-Za-z0-9._-]/g, "_")}` : "";
-  return join(homedir(), ".clawmessenger", `user-models${suffix}.json`);
+  return join(stateHome(), `user-models${suffix}.json`);
 }
 
 export interface UserModelStore {

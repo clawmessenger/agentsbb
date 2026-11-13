@@ -4,7 +4,7 @@ package rongcloud
 //
 // uniapp 的「龙虾」模块（subPackages/lobster/pages/lobster/{index,edit,detail}.vue）
 // 通过 IM 命令通道管理龙虾档案，客户端定义见
-// clawmessenger-uniapp/src/utils/system-service-client.js:720-730：
+// agentsbb-uniapp/src/utils/system-service-client.js:720-730：
 //
 //	getList   → 列表（data 是数组，页面直接 res.data 赋值）
 //	getDetail → {lobsterId}

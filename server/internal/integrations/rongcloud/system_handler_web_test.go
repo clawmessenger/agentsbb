@@ -153,7 +153,7 @@ func TestChatroomCommandKeepsTheDeviceShapeForTheCLI(t *testing.T) {
 
 // --- 404 契约 ----------------------------------------------------------------
 
-// Mirrors clawmessenger-web isLegacyChatroomActionError: code 404 AND the message
+// Mirrors agentsbb-web isLegacyChatroomActionError: code 404 AND the message
 // containing both "chatroom/<action>" and "未知". Reword it and join/leave/
 // invite/destroy stop degrading silently during a rolling deploy.
 func TestUnknownActionMessageSatisfiesTheWebLegacyPredicate(t *testing.T) {

@@ -8,14 +8,14 @@
 // 为什么不走 node_modules/.bin：Windows 上 `.bin/esbuild` 是 `.cmd` 批处理，必须
 // `shell: true` 才能起，而一旦过 shell 参数就会被重新解析 —— 这正好是 1.3.0 首次
 // 发布时那个 bug 的土壤：define 的参数被双重 JSON 编码成
-// `--define:__CLAWMESSENGER_VERSION__="\"1.3.0\""`，POSIX 上无 shell 原样交给
-// esbuild，注入进二进制的字符串**自带引号**（`clawmessenger --version` 打印
+// `--define:__AGENTSBB_VERSION__="\"1.3.0\""`，POSIX 上无 shell 原样交给
+// esbuild，注入进二进制的字符串**自带引号**（`agentsbb --version` 打印
 // `"1.3.0"`，报给服务端的版本也跟着带引号）；Windows 上 cmd 吃掉一层转义，
 // 反而「碰巧正确」。用 process.execPath 直接跑 JS 入口，两个平台拿到完全相同的
 // argv，没有第二套解析器可以偏离。
 //
 // Usage:
-//   node scripts/build-exe.mjs                          # dist/clawmessenger.exe from src/bin.ts
+//   node scripts/build-exe.mjs                          # dist/agentsbb.exe from src/bin.ts
 //   node scripts/build-exe.mjs --entry <file> --name <name>
 import { spawnSync } from "node:child_process";
 import {
@@ -170,7 +170,7 @@ function opt(name, fallback) {
 }
 
 const entry = resolve(opt("--entry", join(pkgRoot, "src", "bin.ts")));
-const exeName = opt("--name", "clawmessenger");
+const exeName = opt("--name", "agentsbb");
 const isWindows = process.platform === "win32";
 
 const distDir = join(pkgRoot, "dist");
@@ -180,21 +180,28 @@ const exePath = join(distDir, isWindows ? `${exeName}.exe` : exeName);
 // 1. Bundle to a single CJS file (SEA entry must be CommonJS).
 //
 // 版本号在这里注入（等价于 Go 的 -ldflags -X）：`--version` 显式指定，否则取
-// 环境变量 CLAWMESSENGER_VERSION，最后退回 package.json。发布流水线在 tag 上
-// 传 CLAWMESSENGER_VERSION，于是 exe 里编进去的版本就是 tag 的版本 —— 不需要
-// 有人记得手改 src/version.ts（那正是「上报的版本和实际装的不一致」的来源）。
+// 环境变量 AGENTSBB_VERSION（过渡期兼容旧名 CLAWMESSENGER_VERSION），最后退回
+// package.json。发布流水线在 tag 上传 AGENTSBB_VERSION，于是 exe 里编进去的
+// 版本就是 tag 的版本 —— 不需要有人记得手改 src/version.ts（那正是「上报的
+// 版本和实际装的不一致」的来源）。
 //
-// 流水线传进来的可能是 `clawmessenger-v1.3.0`（tag）而不是 `1.3.0`，这里统一
+// 流水线传进来的可能是 `agentsbb-v1.3.0`（tag）而不是 `1.3.0`，这里统一
 // 归一成 x.y.z 并**拒绝**任何不是 x.y.z 的输入：一个编错版本的包会让设备每次
 // 「升级成功」都被自己判成 restart_failed，而管理端看不出原因（审查报告 S1）。
 const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8"));
-const rawVersion = (opt("--version", process.env.CLAWMESSENGER_VERSION || pkg.version) || pkg.version).trim();
+// 双读用数组 + find，而不是 `a ?? b || c`：`??` 与 `||` 混用是语法错误，而且
+// 空字符串（CI 里 `AGENTSBB_VERSION=""` 这种）该当成「没设」而不是「版本是空」。
+// TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_VERSION 于 v1.6+
+const envVersion = [process.env.AGENTSBB_VERSION, process.env.CLAWMESSENGER_VERSION]
+  .map((value) => (value ?? "").trim())
+  .find((value) => value !== "");
+const rawVersion = (opt("--version", envVersion ?? pkg.version) || pkg.version).trim();
 const versionMatch = rawVersion.match(/(\d+\.\d+\.\d+)/);
 const injectedVersion = versionMatch ? versionMatch[1] : "";
 if (!injectedVersion) {
   fail(
     `cannot resolve a version from ${JSON.stringify(rawVersion)}: ` +
-      "pass --version x.y.z, set CLAWMESSENGER_VERSION=x.y.z, or set package.json#version",
+      "pass --version x.y.z, set AGENTSBB_VERSION=x.y.z, or set package.json#version",
   );
 }
 if (injectedVersion !== rawVersion) {
@@ -209,7 +216,7 @@ console.log(
 // define 的值**只能编码一次**：JSON.stringify 一次得到的 `"1.3.0"`（带引号的
 // JSON 字符串字面量）正是 esbuild 期望的形式。编码两次会得到 `"\"1.3.0\""`，
 // 注入进二进制的字符串自带引号 —— 见文件头关于 1.3.0 首次发布的注释。
-const defineArg = `--define:__CLAWMESSENGER_VERSION__=${JSON.stringify(injectedVersion)}`;
+const defineArg = `--define:__AGENTSBB_VERSION__=${JSON.stringify(injectedVersion)}`;
 runTool("esbuild", esbuildCli, [
   entry,
   "--bundle",
@@ -425,4 +432,4 @@ if (isMac && !attempt.signed.ok) {
   );
 }
 
-console.log(`built ${exePath} (clawmessenger ${injectedVersion})`);
+console.log(`built ${exePath} (agentsbb ${injectedVersion})`);

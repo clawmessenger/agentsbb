@@ -1,15 +1,15 @@
 // 后台常驻（supervisor 托管）——CLI 原生实现，跨平台，不依赖任何外部脚本。
 //
 // 为什么需要它
-//   `clawmessenger run` 只有前台模式，而且 supervisor 只处理 SIGINT / SIGTERM
+//   `agentsbb run` 只有前台模式，而且 supervisor 只处理 SIGINT / SIGTERM
 //   （**不处理 SIGHUP**）：关掉终端窗口、Ctrl+D、注销，这台设备上的所有智能体
 //   会一起下线。CLI 过去没有托管命令，只能靠随 Release 分发的 PowerShell / bash
 //   守护脚本 —— 脚本得先下载再 chmod，国内网络还经常取不到（GitHub 443 超时）。
 //   现在这些动作直接编进 exe，命令面与脚本一一对应：
 //
-//     clawmessenger start / stop / restart / status / logs
-//     clawmessenger install-service / uninstall
-//     clawmessenger daemon <action>        # 等价的显式命名空间
+//     agentsbb start / stop / restart / status / logs
+//     agentsbb install-service / uninstall
+//     agentsbb daemon <action>        # 等价的显式命名空间
 //
 // 实现要点
 //   * 启动：把 `run`（supervisor 模式）作为 **detached** 子进程拉起，脱离调用方
@@ -42,13 +42,14 @@ import {
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
+import { stateHome } from "./paths.js";
 
-export const DAEMON_SERVICE_NAME = "clawmessenger";
+export const DAEMON_SERVICE_NAME = "agentsbb";
 
 /**
  * Windows 看门狗的计划任务名（`schtasks /Delete /TN` 按这个名字删）。
  */
-export const WATCHDOG_TASK_NAME = "clawmessenger-watchdog";
+export const WATCHDOG_TASK_NAME = "agentsbb-watchdog";
 
 /**
  * 看门狗检查间隔（分钟）。
@@ -66,7 +67,7 @@ export const WATCHDOG_INTERVAL_MINUTES = 5;
 /**
  * 常驻看门狗循环的检查间隔（毫秒）。
  *
- * `clawmessenger watchdog --loop` 的节奏：进程常驻，每 30 秒确认一次 supervisor
+ * `agentsbb watchdog --loop` 的节奏：进程常驻，每 30 秒确认一次 supervisor
  * 是否存活。它是计划任务看门狗（每 5 分钟）的降级替代 —— 有些机器的安全策略
  * 直接拦掉 `schtasks.exe`，计划任务永远装不上，唯一的兜底就是这个常驻进程。
  * 30 秒意味着最坏下线半分钟，比计划任务的 5 分钟好一个数量级；代价是一个
@@ -94,7 +95,7 @@ export const WATCHDOG_LOOP_PID_FILE = "watchdog-loop.pid";
  * STARTUP_VBS_WATCHDOG_LOOP_MARKER）。注意 v3 模板落盘时**不一定**含 loop 行 ——
  * schtasks 注册成功时不需要它，只有降级路径才会把 loop 行补进去。
  */
-export const STARTUP_VBS_TEMPLATE_MARKER = "clawmessenger-vbs-template: 3 (self-heal + watchdog-loop)";
+export const STARTUP_VBS_TEMPLATE_MARKER = "agentsbb-vbs-template: 3 (self-heal + watchdog-loop)";
 
 /**
  * 上一版（v2）模板的标记。
@@ -104,7 +105,7 @@ export const STARTUP_VBS_TEMPLATE_MARKER = "clawmessenger-vbs-template: 3 (self-
  * includes("vbs-template: 2") 之类的散字符串，是为了让「还有哪些旧版本要兼容」
  * 只看这一处。
  */
-export const STARTUP_VBS_TEMPLATE_MARKER_V2 = "clawmessenger-vbs-template: 2 (self-heal)";
+export const STARTUP_VBS_TEMPLATE_MARKER_V2 = "agentsbb-vbs-template: 2 (self-heal)";
 
 /**
  * VBS 里常驻看门狗 loop 行的独立标记。
@@ -113,7 +114,7 @@ export const STARTUP_VBS_TEMPLATE_MARKER_V2 = "clawmessenger-vbs-template: 2 (se
  * 注册成功的机器），也可能含（降级机器）。只有这个独立标记能准确回答
  * 「这份 VBS 会不会拉起 loop」，install-service 的降级写入与就地补丁都用它判重。
  */
-export const STARTUP_VBS_WATCHDOG_LOOP_MARKER = "clawmessenger-vbs-watchdog-loop: 1";
+export const STARTUP_VBS_WATCHDOG_LOOP_MARKER = "agentsbb-vbs-watchdog-loop: 1";
 
 /**
  * VBS 里的自愈块：target 不存在就从同目录的 `.old-*` / `.new-*` 里挑最新的一个
@@ -124,7 +125,7 @@ export const STARTUP_VBS_WATCHDOG_LOOP_MARKER = "clawmessenger-vbs-watchdog-loop
  * exe 里）。登录自启是唯一的「exe 之外」的执行点。
  *
  * `.part` 必须排除：下载中间态是 `<dest>.part`，即
- * `clawmessenger.exe.new-<version>.part`。它命中 `.new-` 前缀且 `Size > 0`，
+ * `agentsbb.exe.new-<version>.part`。它命中 `.new-` 前缀且 `Size > 0`，
  * 断电留下的半截 exe 会被当成恢复源 MoveFile 成 target —— 而 target 一旦存在，
  * 后面的 heal 链就认为「没事」，故障比没有恢复更隐蔽（审查报告 M3b）。
  */
@@ -272,7 +273,7 @@ export interface Daemon {
   watchdog(o?: DaemonStartOptions): Promise<boolean>;
   /**
    * 常驻看门狗循环：进程不退出，每 30 秒（WATCHDOG_LOOP_INTERVAL_MS）检查一次
-   * supervisor 是否存活，不在就拉起。`clawmessenger watchdog --loop` 的实现。
+   * supervisor 是否存活，不在就拉起。`agentsbb watchdog --loop` 的实现。
    *
    * 为什么需要它：计划任务看门狗依赖 `schtasks.exe`，而有些机器（包括开发机）
    * 的安全策略直接拦掉它 —— 看门狗永远装不上，设备崩溃后无人拉起。这个常驻
@@ -367,7 +368,8 @@ export interface DaemonOverrides {
 
 // ---------------------------------------------------------------- 路径与默认实现
 
-export function defaultDaemonPaths(stateDir = process.env.CLAWMESSENGER_HOME || join(homedir(), ".clawmessenger")): DaemonPaths {
+// TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_HOME 于 v1.6+
+export function defaultDaemonPaths(stateDir = stateHome()): DaemonPaths {
   const logDir = join(stateDir, "logs");
   return {
     stateDir,
@@ -433,7 +435,8 @@ function defaultIsAlive(pid: number): boolean {
  * 只在真的要并排跑第二份（例如本机调试）时才用 —— 两份 supervisor 会派生
  * **完全相同**的融云节点 id，互相踢线，且每条私聊被各答一次。
  */
-export const ALLOW_DUPLICATE_SUPERVISOR_ENV = "CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR";
+// TODO(rebrand-retire): 双读过渡，旧名 CLAWMESSENGER_ALLOW_DUPLICATE_SUPERVISOR 移除于 v1.6+
+export const ALLOW_DUPLICATE_SUPERVISOR_ENV = "AGENTSBB_ALLOW_DUPLICATE_SUPERVISOR";
 
 export function readSupervisorPid(paths: DaemonPaths = defaultDaemonPaths()): number | undefined {
   try {
@@ -453,7 +456,7 @@ export function readSupervisorPid(paths: DaemonPaths = defaultDaemonPaths()): nu
  *
  * 为什么 `run` 也必须自己看一遍：`start` 的拦截只覆盖「通过 start 启动」这一条路，
  * 而 supervisor 还会被别的入口直接拉起 —— 开机自启的 .vbs / 守护脚本的
- * `-Action run` / 用户在终端里手敲 `clawmessenger run`。这些入口全部绕过 start，
+ * `-Action run` / 用户在终端里手敲 `agentsbb run`。这些入口全部绕过 start，
  * 于是能在已有一份在跑的情况下再起一份：两份都派生同样的融云节点 id，互相踢线
  * （设备列表一会在线一会离线），同一条私聊被两套各答一次（重复回复）。
  */
@@ -569,8 +572,14 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   const runCommand =
     overrides.runCommand ??
     ((file: string, args: string[]) => {
-      const r = spawnSyncFn(file, args, { encoding: "utf8" });
-      return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+      // 必须拿 buffer 再解码：中文 Windows 上 schtasks / tasklist / sc 的输出
+      // 走 ANSI 代码页（GBK），按 utf8 直接解会把中文报错打成 U+FFFD，且碎过
+      // 之后无法还原。decodeCommandOutput 先试严格 utf8 再试 gbk，Linux/macOS
+      // 的 utf8 输出同样无损，所以这条路径全平台通用。
+      const r = spawnSyncFn(file, args, { encoding: "buffer" });
+      const stdout = r.stdout ? decodeCommandOutput(r.stdout) : "";
+      const stderr = r.stderr ? decodeCommandOutput(r.stderr) : "";
+      return { status: r.status, stdout, stderr };
     });
 
   const autostartPaths = overrides.autostartPaths ?? {};
@@ -579,7 +588,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     autostartPaths.userUnit ??
     join(env.XDG_CONFIG_HOME || join(home, ".config"), "systemd", "user", `${DAEMON_SERVICE_NAME}.service`);
   const LAUNCH_AGENT =
-    autostartPaths.launchAgent ?? join(home, "Library", "LaunchAgents", "com.clawmessenger.supervisor.plist");
+    autostartPaths.launchAgent ?? join(home, "Library", "LaunchAgents", "com.agentsbb.supervisor.plist");
   const STARTUP_VBS =
     autostartPaths.startupVbs ??
     join(
@@ -589,10 +598,10 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       "Start Menu",
       "Programs",
       "Startup",
-      "clawmessenger.vbs",
+      "agentsbb.vbs",
     );
-  // 看门狗脚本放在状态目录（跟着 CLAWMESSENGER_HOME 走），不塞进用户盘符根目录：
-  // 它只是个薄壳，真正的判断在 `clawmessenger watchdog` 里，升级后自动跟着新 exe 走。
+  // 看门狗脚本放在状态目录（跟着 AGENTSBB_HOME 走），不塞进用户盘符根目录：
+  // 它只是个薄壳，真正的判断在 `agentsbb watchdog` 里，升级后自动跟着新 exe 走。
   const WATCHDOG_CMD = autostartPaths.watchdogCmd ?? join(paths.stateDir, "watchdog.cmd");
   // 常驻看门狗 loop 的单实例锁：内容是持有者的 pid，mtime 是「还活着」的心跳。
   const WATCHDOG_LOOP_LOCK = join(paths.stateDir, WATCHDOG_LOOP_PID_FILE);
@@ -680,7 +689,8 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   };
 
   const resolveWorkdir = (workdir?: string): string => {
-    const wd = workdir || env.CLAWMESSENGER_WORKDIR || home;
+    // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_WORKDIR 于 v1.6+
+    const wd = workdir || env.AGENTSBB_WORKDIR || env.CLAWMESSENGER_WORKDIR || home;
     if (!existsSync(wd)) throw new Error(`--workdir does not exist: ${wd}`);
     return wd;
   };
@@ -708,7 +718,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       }
       if (parts.length === 0) return undefined;
       if (parts.length === 1 && !existsSync(WATCHDOG_CMD) && !vbsHasWatchdogLoop()) {
-        parts.push(`no crash watchdog (re-run \`clawmessenger install-service\`)`);
+        parts.push(`no crash watchdog (re-run \`agentsbb install-service\`)`);
       }
       return parts.join(" + ");
     }
@@ -744,12 +754,12 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       const hasAutostart = existsSync(STARTUP_VBS);
       const hasWatchdogCmd = existsSync(WATCHDOG_CMD);
       if (!hasAutostart && !hasWatchdogCmd) {
-        return { ready: false, detail: "未安装登录自启与崩溃看门狗：执行 clawmessenger install-service" };
+        return { ready: false, detail: "未安装登录自启与崩溃看门狗：执行 agentsbb install-service" };
       }
       if (!hasWatchdogCmd) {
         return {
           ready: false,
-          detail: "只装了登录自启，缺崩溃看门狗：执行 clawmessenger install-service",
+          detail: "只装了登录自启，缺崩溃看门狗：执行 agentsbb install-service",
         };
       }
       // 中文 Windows 上 schtasks.exe 的 stdout/stderr 是 ANSI（GBK/cp936）编码，
@@ -772,7 +782,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         if (vbsHasWatchdogLoop()) {
           return {
             ready: false,
-            detail: "常驻看门狗未运行，将在下次登录时随自启脚本拉起（schtasks 不可用，已降级）；可重跑 clawmessenger install-service 激活",
+            detail: "常驻看门狗未运行，将在下次登录时随自启脚本拉起（schtasks 不可用，已降级）；可重跑 agentsbb install-service 激活",
           };
         }
         return {
@@ -785,11 +795,11 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     if (platform === "linux") {
       if (existsSync(SYSTEM_UNIT)) return { ready: true, detail: `systemd 服务 ${SYSTEM_UNIT}` };
       if (existsSync(USER_UNIT)) return { ready: true, detail: `systemd 用户服务 ${USER_UNIT}` };
-      return { ready: false, detail: "未安装 systemd 服务：执行 clawmessenger install-service" };
+      return { ready: false, detail: "未安装 systemd 服务：执行 agentsbb install-service" };
     }
     if (platform === "darwin") {
       if (existsSync(LAUNCH_AGENT)) return { ready: true, detail: `LaunchAgent ${LAUNCH_AGENT}` };
-      return { ready: false, detail: "未安装 LaunchAgent：执行 clawmessenger install-service" };
+      return { ready: false, detail: "未安装 LaunchAgent：执行 agentsbb install-service" };
     }
     return { ready: false, detail: `平台 ${platform} 不支持常驻自愈` };
   };
@@ -804,7 +814,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     if (running) {
       out(`already running: supervisor PID ${running.pid}`);
       if (running.state?.agents.length) out(` (agents: ${running.state.agents.join(", ")})`);
-      out("\n  restart with: clawmessenger restart\n  stop with:    clawmessenger stop\n");
+      out("\n  restart with: agentsbb restart\n  stop with:    agentsbb stop\n");
       return;
     }
     const workdir = resolveWorkdir(o.workdir);
@@ -863,7 +873,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     out(`started in the background: supervisor PID ${pid}\n`);
     out(`  exe     : ${exec}\n  workdir : ${workdir}\n  log     : ${target}\n`);
     if (state?.agents.length) out(`  agents  : ${state.agents.join(", ")}\n`);
-    out("  status  : clawmessenger status      stop: clawmessenger stop\n");
+    out("  status  : agentsbb status      stop: agentsbb stop\n");
     out("  note    : heartbeats take a few seconds; refresh the device list shortly.\n");
   }
 
@@ -882,8 +892,8 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       clearSupervisorState(paths);
       out(
         stale
-          ? "no clawmessenger supervisor is running (cleared a stale pid/state file).\n"
-          : "no clawmessenger supervisor is running.\n",
+          ? "no agentsbb supervisor is running (cleared a stale pid/state file).\n"
+          : "no agentsbb supervisor is running.\n",
       );
       return;
     }
@@ -912,7 +922,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     }
     clearSupervisorState(paths);
     if (isAlive(pid)) {
-      err(`stop failed: PID ${pid} is still alive — run clawmessenger stop again.\n`);
+      err(`stop failed: PID ${pid} is still alive — run agentsbb stop again.\n`);
       return;
     }
     out("stopped. agent heartbeats stop now; the admin page shows the device offline in ~90s.\n");
@@ -1155,7 +1165,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     // claude）常装在 nvm 之类不在默认 PATH 里的位置，漏掉就会被跳过。
     const content = [
       "[Unit]",
-      "Description=clawmessenger agent supervisor (RongCloud IM)",
+      "Description=agentsbb agent supervisor (RongCloud IM)",
       "After=network-online.target",
       "Wants=network-online.target",
       "",
@@ -1189,7 +1199,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       '<plist version="1.0">',
       "<dict>",
       "  <key>Label</key>",
-      "  <string>com.clawmessenger.supervisor</string>",
+      "  <string>com.agentsbb.supervisor</string>",
       "  <key>ProgramArguments</key>",
       "  <array>",
       args,
@@ -1222,8 +1232,8 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     // 这里有**两层**引号，别混：
     //   第一层是 shell 命令行，只有含空白的参数才需要 `"…"`；
     //   第二层是 VBScript 字符串字面量，字面量里的每个 `"` 都要写成 `""`。
-    // 合起来 `"C:\...\clawmessenger.exe" run` 落盘正是
-    //   sh.Run """C:\...\clawmessenger.exe"" run", 0, False
+    // 合起来 `"C:\...\agentsbb.exe" run` 落盘正是
+    //   sh.Run """C:\...\agentsbb.exe"" run", 0, False
     // 0.2.49 及之前漏了最外层的开引号（写成 `""C:\...exe"" run`），VBScript 把它解析成
     // 空字符串紧跟一个裸标识符 → 语法错误弹窗，开机自启从来没生效过（2026-10-22 重启
     // 后运维节点全离线就是这个）。daemon.test.ts 之前也按错的形状断言，所以一直是绿的。
@@ -1237,8 +1247,8 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     // 唯一的自救路径，两处各写一份迟早漂移（审查报告 M3b 就是这么漏掉 .part 的）。
     return [
       `' ${STARTUP_VBS_TEMPLATE_MARKER}`,
-      "' clawmessenger: start the agent supervisor at logon, without a console window.",
-      "' Generated by `clawmessenger install-service`. Remove with `clawmessenger uninstall`.",
+      "' agentsbb: start the agent supervisor at logon, without a console window.",
+      "' Generated by `agentsbb install-service`. Remove with `agentsbb uninstall`.",
       'Set sh = CreateObject("WScript.Shell")',
       `sh.CurrentDirectory = "${workdir}"`,
       ...startupVbsSelfHealLines(argv[0]),
@@ -1267,7 +1277,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     const log = join(paths.logDir, "watchdog.log");
     return [
       "@echo off",
-      "rem Generated by `clawmessenger install-service`. Remove with `clawmessenger uninstall`.",
+      "rem Generated by `agentsbb install-service`. Remove with `agentsbb uninstall`.",
       `rem Started by the "${WATCHDOG_TASK_NAME}" scheduled task every ${WATCHDOG_INTERVAL_MINUTES} minutes:`,
       "rem it exits immediately unless the supervisor is gone.",
       `${cmdline} >> "${log}" 2>&1`,
@@ -1317,7 +1327,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
       err(`could not restart the background supervisor either: ${detail}\n`);
-      err("this device is offline now — after fixing the autostart entry, run `clawmessenger start`.\n");
+      err("this device is offline now — after fixing the autostart entry, run `agentsbb start`.\n");
     }
   }
 
@@ -1405,7 +1415,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         err(`systemd-analyze verify rejected the unit:\n${tailLines(rejected, 25).replace(/^/gm, "  ")}\n`);
         err(`unit file ${unit.path}:\n${unit.content.replace(/^/gm, "  ")}\n`);
         err("nothing was stopped and the autostart entry was NOT enabled — the device stays online.\n");
-        err("fix the line reported above, or drop the entry with `clawmessenger uninstall`.\n");
+        err("fix the line reported above, or drop the entry with `agentsbb uninstall`.\n");
         return;
       }
 
@@ -1422,7 +1432,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         dumpSystemdDiagnostics(sctl, unit.path, unit.content);
         await restoreAfterFailedService(
           o,
-          `the unit is at ${unit.path}, but systemd refused it (details above). It is left in place so the output can be inspected; \`clawmessenger uninstall\` removes it.`,
+          `the unit is at ${unit.path}, but systemd refused it (details above). It is left in place so the output can be inspected; \`agentsbb uninstall\` removes it.`,
         );
         return;
       }
@@ -1435,7 +1445,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       }
       out(`  manage : ${sctl.join(" ")} {start|stop|restart|status} ${DAEMON_SERVICE_NAME}\n`);
       out(`  logs   : journalctl${unit.scope === "user" ? " --user" : ""} -u ${DAEMON_SERVICE_NAME} -f\n`);
-      out("  remove : clawmessenger uninstall\n");
+      out("  remove : agentsbb uninstall\n");
       out("  note   : the PATH baked into the unit is the one from this command — re-run install-service after moving an agent CLI.\n");
       return;
     }
@@ -1451,17 +1461,19 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         const list = runCommand("launchctl", ["list"]);
         const hit = `${list.stdout ?? ""}${list.stderr ?? ""}`
           .split(/\r?\n/)
-          .filter((l) => l.includes("clawmessenger"))
+          // 过渡期双名单：旧 launchd 标签也要能被看到。
+          // TODO(rebrand-retire): 移除 clawmessenger 匹配于 v1.6+
+          .filter((l) => l.includes("agentsbb") || l.includes("clawmessenger"))
           .join("\n");
-        if (hit.trim()) err(`$ launchctl list (clawmessenger entries)\n${hit.replace(/^/gm, "  ")}\n`);
+        if (hit.trim()) err(`$ launchctl list (agentsbb + legacy entries)\n${hit.replace(/^/gm, "  ")}\n`);
         err(`plist ${LAUNCH_AGENT}:\n${launchAgentPlist(o).replace(/^/gm, "  ")}\n`);
         await restoreAfterFailedService(o, "the LaunchAgent is written, but launchctl refused to load it (details above).");
         return;
       }
       out(`installed LaunchAgent: ${LAUNCH_AGENT}\n`);
-      out("  manage : launchctl list | grep clawmessenger ; launchctl unload/load -w <plist>\n");
+      out("  manage : launchctl list | grep agentsbb ; launchctl unload/load -w <plist>\n");
       out(`  logs   : ${join(paths.logDir, "supervisor.log")}\n`);
-      out("  remove : clawmessenger uninstall\n");
+      out("  remove : agentsbb uninstall\n");
       return;
     }
     if (platform === "win32") {
@@ -1523,9 +1535,9 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         }
       }
 
-      out("  it runs `clawmessenger run` hidden at every logon (no admin rights needed).\n");
-      out("  start it now with: clawmessenger start\n");
-      out("  remove with:       clawmessenger uninstall\n");
+      out("  it runs `agentsbb run` hidden at every logon (no admin rights needed).\n");
+      out("  start it now with: agentsbb start\n");
+      out("  remove with:       agentsbb uninstall\n");
       out("  note: the launcher carries the PATH from this command; re-run install-service if an agent CLI moves.\n");
       return;
     }
@@ -1538,6 +1550,67 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     } catch {
       return env.USER || env.USERNAME || "root";
     }
+  }
+
+  /**
+   * 清掉旧品牌名（clawmessenger）登记过的自启项：systemd 双级 unit、launchd
+   * 旧标签、Windows 计划任务与启动夹 VBS。全部 best-effort：单步失败只跳过，
+   * 绝不抛 —— uninstall 与接管流程都会调用它，清理失败不能阻断新链路。
+   *
+   * TODO(rebrand-retire): 旧名清理移除于 v1.6+（存量设备全部接管后）
+   */
+  function removeLegacyAutostartEntries(): string[] {
+    const removed: string[] = [];
+    try {
+      if (platform === "linux") {
+        const legacySystemUnit = "/etc/systemd/system/clawmessenger.service";
+        const legacyUserUnit = join(
+          env.XDG_CONFIG_HOME || join(home, ".config"), "systemd", "user", "clawmessenger.service",
+        );
+        for (const [unit, sctl] of [[legacySystemUnit, ["systemctl"]], [legacyUserUnit, ["systemctl", "--user"]]] as const) {
+          try {
+            if (existsSync(unit)) {
+              const r = runCommand(sctl[0], [...sctl.slice(1), "disable", "--now", "clawmessenger"]);
+              if (r.status === 0) removed.push(`legacy systemd service (${unit})`);
+              rmSync(unit, { force: true });
+            }
+          } catch {
+            // best effort
+          }
+        }
+      } else if (platform === "darwin") {
+        const legacyPlist = join(home, "Library", "LaunchAgents", "com.clawmessenger.supervisor.plist");
+        try {
+          if (existsSync(legacyPlist)) {
+            runCommand("launchctl", ["remove", "com.clawmessenger.supervisor"]);
+            rmSync(legacyPlist, { force: true });
+            removed.push(`legacy LaunchAgent (${legacyPlist})`);
+          }
+        } catch {
+          // best effort
+        }
+      } else if (platform === "win32") {
+        const legacyStartupVbs = join(
+          env.APPDATA || join(home, "AppData", "Roaming"),
+          "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "clawmessenger.vbs",
+        );
+        try {
+          if (existsSync(legacyStartupVbs)) {
+            rmSync(legacyStartupVbs, { force: true });
+            removed.push(`legacy logon autostart (${legacyStartupVbs})`);
+          }
+        } catch {
+          // best effort
+        }
+        for (const task of ["ClawMessenger Agents", "clawmessenger-watchdog"]) {
+          const r = runCommand("schtasks", ["/Delete", "/F", "/TN", task]);
+          if (r.status === 0) removed.push(`legacy watchdog task (${task})`);
+        }
+      }
+    } catch {
+      // never let legacy cleanup break the uninstall / takeover chain
+    }
+    return removed;
   }
 
   async function uninstall(): Promise<void> {
@@ -1582,12 +1655,16 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         removed.push(`watchdog script (${WATCHDOG_CMD})`);
       }
     }
+    // 过渡期：把旧品牌名下登记过的自启也一并清掉，避免 uninstall 留尾巴。
+    // 放在最后：上面的新名删除（schtasks /Delete 等）必须先被记录。
+    // TODO(rebrand-retire): 旧名清理移除于 v1.6+（存量设备全部接管后）
+    removed.push(...removeLegacyAutostartEntries());
     if (removed.length === 0) {
       out("no autostart entry was configured.\n");
     } else {
       for (const r of removed) out(`removed ${r}\n`);
     }
-    out("(the running supervisor was left alone; stop it with `clawmessenger stop`)\n");
+    out("(the running supervisor was left alone; stop it with `agentsbb stop`)\n");
   }
 
   return {
@@ -1612,13 +1689,13 @@ export function formatDaemonStatus(report: DaemonStatusReport, paths: DaemonPath
     lines.push("daemon : not running in the background (agents should be offline)");
     if (report.stale) {
       lines.push("         a stale pid/state file was left behind (a previous crash or `kill -9`);");
-      lines.push("         run `clawmessenger stop` to clear it, then `clawmessenger start`.");
+      lines.push("         run `agentsbb stop` to clear it, then `agentsbb start`.");
     }
-    lines.push("         start it with: clawmessenger start");
+    lines.push("         start it with: agentsbb start");
   }
   const logShown = report.logs[0] ?? report.logs.join(", ");
   lines.push(`logs   : ${logShown || paths.logDir}`);
-  lines.push(`autostart: ${report.autostart ?? "not configured (clawmessenger install-service)"}`);
+  lines.push(`autostart: ${report.autostart ?? "not configured (agentsbb install-service)"}`);
   if (report.note) lines.push(`note   : ${report.note}`);
   return `${lines.join("\n")}\n`;
 }

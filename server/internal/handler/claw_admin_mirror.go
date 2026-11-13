@@ -62,31 +62,94 @@ const (
 
 // clawMirrorRequiredAssets 是「一个可用版本」的最小资产集：发布矩阵的 4 个平台
 // 二进制 + 2 个守护脚本压缩包 + 校验和清单。与 clawUpgradeAssetsByPlatform 同源
-// （Windows 一项复用常量），与 claw-cli-mirror-sync.sh 的 DEFAULT_ASSETS 一致。
+// （Windows 一项复用常量），与 agentsbb-cli-mirror-sync.sh 的 DEFAULT_ASSETS 一致。
 // 上传与拉取都按这份清单要求齐全 —— 部分激活留给手工脚本（它有 --only），
 // 后台按钮只做整包切换，避免「镜像里只有半个平台」这种最难排查的状态。
+//
+// 这是**新名单**（agentsbb-*）。改名过渡期 Release 里同时存在旧名单
+// （clawmessenger-*）的别名资产，见 clawMirrorLegacyAssets。
 var clawMirrorRequiredAssets = []string{
 	clawUpgradeWindowsAsset,
-	"clawmessenger-windows-x64-daemon-scripts.zip",
-	"clawmessenger-linux-x64",
-	"clawmessenger-linux-arm64",
-	"clawmessenger-linux-daemon-scripts.tar.gz",
-	"clawmessenger-darwin-arm64",
+	"agentsbb-windows-x64-daemon-scripts.zip",
+	"agentsbb-linux-x64",
+	"agentsbb-linux-arm64",
+	"agentsbb-linux-daemon-scripts.tar.gz",
+	"agentsbb-darwin-arm64",
 	"SHA256SUMS",
 }
+
+// clawMirrorAssetPrefix / clawMirrorLegacyAssetPrefix 是两套资产名的前缀。
+const (
+	clawMirrorAssetPrefix       = "agentsbb-"
+	clawMirrorLegacyAssetPrefix = "clawmessenger-"
+)
+
+// clawMirrorLegacyName 把新名单里的资产名映射成旧名单的等价名。
+// SHA256SUMS / VERSION / MANIFEST 这类与品牌无关的文件返回空串。
+func clawMirrorLegacyName(asset string) string {
+	if !strings.HasPrefix(asset, clawMirrorAssetPrefix) {
+		return ""
+	}
+	return clawMirrorLegacyAssetPrefix + strings.TrimPrefix(asset, clawMirrorAssetPrefix)
+}
+
+// clawMirrorLegacyAssets 是改名前的等价整包（由新名单机械派生，两套不会漂移）。
+//
+// 为什么后端要认两套：过渡期管理员手里的「镜像包」可能是改名前的工具打的
+// （里面是 clawmessenger-*），而 Release 里两种名字都有。整包校验必须能认出来
+// 是哪一套，否则升级窗口内后台上传会全量 400 —— 而那正是最需要它可用的时刻。
+// TODO(rebrand-retire): 1.3.x 全部升级后删除（连同 Release 里的旧名别名资产）。
+var clawMirrorLegacyAssets = func() []string {
+	out := make([]string, 0, len(clawMirrorRequiredAssets))
+	for _, asset := range clawMirrorRequiredAssets {
+		if legacy := clawMirrorLegacyName(asset); legacy != "" {
+			out = append(out, legacy)
+		}
+	}
+	return out
+}()
 
 // clawMirrorOptionalAssets 是上传时顺带接受、但不参与校验的文件。
 var clawMirrorOptionalAssets = []string{"VERSION", "MANIFEST"}
 
 func clawMirrorAllowedNames() map[string]bool {
-	allowed := make(map[string]bool, len(clawMirrorRequiredAssets)+len(clawMirrorOptionalAssets))
+	allowed := make(map[string]bool, len(clawMirrorRequiredAssets)+len(clawMirrorLegacyAssets)+len(clawMirrorOptionalAssets))
 	for _, name := range clawMirrorRequiredAssets {
+		allowed[name] = true
+	}
+	for _, name := range clawMirrorLegacyAssets {
 		allowed[name] = true
 	}
 	for _, name := range clawMirrorOptionalAssets {
 		allowed[name] = true
 	}
 	return allowed
+}
+
+// clawMirrorMissingAssets 返回 set 里「present 中不存在」的条目（保序）。
+func clawMirrorMissingAssets(present map[string]bool, set []string) []string {
+	missing := make([]string, 0, len(set))
+	for _, asset := range set {
+		if !present[asset] {
+			missing = append(missing, asset)
+		}
+	}
+	return missing
+}
+
+// clawMirrorPickAssetSet 从「已提供的文件名」里挑出完整的一套名单。
+//
+// 新名单优先：整包既有新名又有旧名时按新名核对；只有旧名时才认旧名单。
+// 返回 (要严格核对的名单, 另一套名单, 是否找到完整一套)。没找到时 chosen 固定是
+// 新名单 —— 报错文案要对准目标态，而不是把两套名字混着抛给管理员。
+func clawMirrorPickAssetSet(present map[string]bool) (chosen, other []string, ok bool) {
+	if len(clawMirrorMissingAssets(present, clawMirrorRequiredAssets)) == 0 {
+		return clawMirrorRequiredAssets, clawMirrorLegacyAssets, true
+	}
+	if len(clawMirrorMissingAssets(present, clawMirrorLegacyAssets)) == 0 {
+		return clawMirrorLegacyAssets, clawMirrorRequiredAssets, true
+	}
+	return clawMirrorRequiredAssets, clawMirrorLegacyAssets, false
 }
 
 // clawMirrorDir 返回镜像根目录；未配置返回空串。
@@ -351,7 +414,13 @@ func clawMirrorPullFromGitHub(ctx context.Context, dir, publicBase string) error
 	if err != nil {
 		return fmt.Errorf("解析 GitHub 最新版本失败: %w", err)
 	}
-	tag := "clawmessenger-v" + release.Version
+	tag := clawUpgradeTagFromVersion(release.Version)
+	if strings.TrimSpace(release.Tag) != "" {
+		// Release 上的 tag 是权威值：过渡期它可能是旧前缀（clawmessenger-v1.3.33）。
+		// 照抄比重新拼更诚实 —— 这个 tag 会原样写进 VERSION 与 latest-release.json
+		// 的 tag_name，客户端按它比对版本，两个前缀它都认。
+		tag = strings.TrimSpace(release.Tag)
+	}
 	clawMirror.update(tag, "")
 	if stale {
 		// 缓存降级时的 latest 可能比真 latest 旧：显式留痕，管理员看到的是
@@ -368,20 +437,28 @@ func clawMirrorPullFromGitHub(ctx context.Context, dir, publicBase string) error
 	downloaded := map[string]string{}
 	for _, asset := range clawMirrorRequiredAssets {
 		clawMirror.update("", "下载 "+asset)
-		url := release.Assets[asset]
+		// 资产名先按新名单找，找不到再退回旧名单的等价名：品牌改名后的第一次
+		// 发布之前，GitHub 上的 latest 仍然是纯旧名单的 Release。落盘用**实际
+		// 拿到的那套名字**，校验阶段会据此挑对应名单。
+		assetURL, local := release.Assets[asset], asset
+		if assetURL == "" {
+			if legacy := clawMirrorLegacyName(asset); legacy != "" && release.Assets[legacy] != "" {
+				assetURL, local = release.Assets[legacy], legacy
+			}
+		}
 		// 运维显式配了 CLAW_UPGRADE_RELEASE_WEB（gh 代理）时，构造 URL 优先于
 		// GitHub API 返回的 github.com 直链 —— 直链在这类机器上本来就不通。
 		if override := clawUpgradeWebBase(); override != "https://github.com" {
-			url = clawUpgradeAssetURL(release.Tag, asset)
+			assetURL = clawUpgradeAssetURL(tag, local)
 		}
-		if url == "" {
+		if assetURL == "" {
 			return fmt.Errorf("GitHub Release 里没有资产 %s", asset)
 		}
-		sum, derr := clawMirrorDownload(ctx, client, url, filepath.Join(stage, asset))
+		sum, derr := clawMirrorDownload(ctx, client, assetURL, filepath.Join(stage, local))
 		if derr != nil {
-			return fmt.Errorf("下载 %s 失败: %w", asset, derr)
+			return fmt.Errorf("下载 %s 失败: %w", local, derr)
 		}
-		downloaded[asset] = sum
+		downloaded[local] = sum
 	}
 	if err := clawMirrorVerifyStage(stage, downloaded); err != nil {
 		return err
@@ -499,10 +576,11 @@ func clawMirrorUploadInto(w http.ResponseWriter, r *http.Request, dir, publicBas
 			uploaded[name] = true
 		}
 	}
-	for _, required := range clawMirrorRequiredAssets {
-		if !uploaded[required] {
-			return fmt.Errorf("缺少 %s —— 后台上传必须是一整包（6 个资产 + SHA256SUMS）", required)
-		}
+	// 整包校验：新旧两套名单任选其一，缺哪个就按**新名单**报缺（新名单是目标态，
+	// 旧名单只是过渡期能把改名前的包传上来的兼容口）。
+	if chosen, _, complete := clawMirrorPickAssetSet(uploaded); !complete {
+		missing := clawMirrorMissingAssets(uploaded, chosen)
+		return fmt.Errorf("缺少 %s —— 后台上传必须是一整包（6 个资产 + SHA256SUMS）", strings.Join(missing, " / "))
 	}
 
 	// 版本号：form tag → form version → 包内 VERSION 文件。三处都没有就不切换：
@@ -532,13 +610,16 @@ func clawMirrorUploadInto(w http.ResponseWriter, r *http.Request, dir, publicBas
 		}
 	}
 	if tag == "" && version != "" {
-		tag = "clawmessenger-v" + strings.TrimPrefix(version, "v")
+		tag = clawUpgradeTagFromVersion(version)
 	}
 	version = clawUpgradeVersionFromTag(tag)
 	if !clawUpgradeVersionPattern.MatchString(version) {
-		return fmt.Errorf("无法确定版本号：请在表单里填 tag（如 clawmessenger-v1.3.33）或 version（如 1.3.33）")
+		return fmt.Errorf("无法确定版本号：请在表单里填 tag（如 agentsbb-v1.4.0）或 version（如 1.4.0）")
 	}
-	tag = "clawmessenger-v" + version
+	// 统一归一成新前缀：管理员传旧 tag（clawmessenger-v1.3.33）或只传版本号都接受，
+	// 落盘的 tag 一律是新前缀 —— 两个前缀客户端都认，新前缀是目标态。
+	// TODO(rebrand-retire): 不再接受旧前缀输入后，这里只剩一行拼接。
+	tag = clawUpgradeTagFromVersion(version)
 	clawMirror.update(tag, "")
 
 	dirMode := os.FileMode(clawMirrorDirMode)
@@ -590,6 +671,11 @@ func clawMirrorUploadInto(w http.ResponseWriter, r *http.Request, dir, publicBas
 
 // clawMirrorVerifyStage 对照 SHA256SUMS 核对 staging 里每个必需资产的哈希。
 // computed 是写入时顺手算出的哈希；不一致立即报错，绝不切换。
+//
+// 两套名单的处理方式：先看 staging 里齐的是哪一套（clawMirrorPickAssetSet），
+// 那一套**逐个严格核对**；另一套里的文件如果也在 staging 里（整包同时带了新旧
+// 两个名字，Release 上的别名资产就是这样），同样要能对上清单 —— 否则等于放过了
+// 一个没校验过的文件。不在 staging 里的另一套条目直接跳过，不算缺。
 func clawMirrorVerifyStage(stage string, computed map[string]string) error {
 	raw, err := os.ReadFile(filepath.Join(stage, "SHA256SUMS"))
 	if err != nil {
@@ -599,23 +685,36 @@ func clawMirrorVerifyStage(stage string, computed map[string]string) error {
 	if len(sums) == 0 {
 		return errors.New("SHA256SUMS 解析结果为空，不是 GitHub Release 签发的清单")
 	}
+	present := make(map[string]bool, len(computed))
+	for name := range computed {
+		present[name] = true
+	}
+	required, other, _ := clawMirrorPickAssetSet(present)
 	var bad []string
-	for _, asset := range clawMirrorRequiredAssets {
+	check := func(asset string, strict bool) {
 		// GitHub Release 的 SHA256SUMS 不把自身列进清单，跳过它（它的存在性
 		// 与完整性已由「上传里有这个文件 + 下载成功」保证）。
 		if asset == "SHA256SUMS" {
-			continue
+			return
 		}
 		expected, listed := sums[asset]
 		actual, hashed := computed[asset]
 		switch {
+		case !hashed:
+			if strict {
+				bad = append(bad, asset+"：文件缺失")
+			}
 		case !listed:
 			bad = append(bad, asset+"：清单里没有它的条目")
-		case !hashed:
-			bad = append(bad, asset+"：文件缺失")
 		case expected != actual:
 			bad = append(bad, fmt.Sprintf("%s：哈希不符（expected %s, actual %s）", asset, expected, actual))
 		}
+	}
+	for _, asset := range required {
+		check(asset, true)
+	}
+	for _, asset := range other {
+		check(asset, false)
 	}
 	if len(bad) > 0 {
 		return errors.New("校验未通过，已保留现有镜像：" + strings.Join(bad, "；"))
@@ -671,7 +770,13 @@ func clawMirrorWriteManifest(dir, tag string) error {
 		BrowserDownloadURL string `json:"browser_download_url"`
 		Digest             string `json:"digest"`
 	}
-	names := append([]string{}, clawMirrorRequiredAssets...)
+	// 清单要列「本镜像里真实存在」的全部资产：新旧两套名字都列（Release 上它们
+	// 就是同一份字节的别名，哈希相同）。老安装脚本按旧名找、新脚本按新名找，
+	// 两种都能命中。目录里没有的那一套直接跳过 —— 改名前的整包只有一套名字，
+	// 不该因为缺另一套就拒绝生成清单。
+	names := make([]string, 0, len(clawMirrorRequiredAssets)+len(clawMirrorLegacyAssets)+1)
+	names = append(names, clawMirrorRequiredAssets...)
+	names = append(names, clawMirrorLegacyAssets...)
 	names = append(names, "SHA256SUMS") // 清单里也列上自己，与 GitHub Release 一致
 	assets := make([]manifestAsset, 0, len(names))
 	seen := map[string]bool{}
@@ -688,7 +793,11 @@ func clawMirrorWriteManifest(dir, tag string) error {
 				if err != nil {
 					return fmt.Errorf("计算 SHA256SUMS 摘要失败: %w", err)
 				}
+			} else if _, statErr := os.Stat(filepath.Join(latest, name)); statErr != nil {
+				// 文件本身不在镜像里：不是矛盾，只是这套名字没被上传过。
+				continue
 			} else {
+				// 文件在、清单里却没有它的条目 = 清单与目录已经不一致，拒绝生成。
 				return fmt.Errorf("SHA256SUMS 里没有 %s，拒绝生成版本清单", name)
 			}
 		}
@@ -700,8 +809,10 @@ func clawMirrorWriteManifest(dir, tag string) error {
 	}
 	encoded, err := json.MarshalIndent(map[string]interface{}{
 		"tag_name": tag,
-		"name":     "clawmessenger " + version,
-		"assets":   assets,
+		// name 是给人看的显示名，用 AgentsBB（大小写规范：显示 = AgentsBB），
+		// 与 Release 标题 "AgentsBB <版本>" 一致。
+		"name":   "AgentsBB " + version,
+		"assets": assets,
 	}, "", "  ")
 	if err != nil {
 		return err

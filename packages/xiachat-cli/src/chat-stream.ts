@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import type { ActivityStep } from "./agent-activity.js";
 
 // chat_stream 协议生产端：把 agent 的一轮回答以流式快照帧发进会话，
-// web 端（clawmessenger-web src/lib/chat-stream.ts）解析后逐帧渲染。
+// web 端（agentsbb-web src/lib/chat-stream.ts）解析后逐帧渲染。
 //
 // 帧语义（与 web 端 parseChatStreamEvent 严格对齐）：
 // - text 是**全量快照**而非增量：web 端 mergeChatStreamMessage 用 seq

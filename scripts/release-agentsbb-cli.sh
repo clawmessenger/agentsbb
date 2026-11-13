@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 #
-# release-clawmessenger-cli.sh — 发布 clawmessenger CLI（Windows/Linux/macOS 单文件 exe）。
+# release-agentsbb-cli.sh — 发布 AgentsBB CLI（Windows/Linux/macOS 单文件 exe）。
 #
-# 发布链路：push tag `clawmessenger-v*.*.*` → GitHub Actions
-# (.github/workflows/clawmessenger-release.yml) 在各平台 runner 上用 Node SEA
+# 发布链路：push tag `agentsbb-v*.*.*` → GitHub Actions
+# (.github/workflows/agentsbb-release.yml) 在各平台 runner 上用 Node SEA
 # 构建 -> 创建 GitHub Release -> 应用内直链
-# https://github.com/clawmessenger/claw-messenger/releases/latest/download/clawmessenger-windows-x64.exe
+# https://github.com/clawmessenger/agentsbb/releases/latest/download/agentsbb-windows-x64.exe
 # 即刻生效。
 #
+# 过渡期双名单：release 同时上传 `agentsbb-*`（新）与 `clawmessenger-*`（旧）两套资产，
+# 供尚未升级的 1.3.x 客户端自更新；tag 也接受 `clawmessenger-v*.*.*` 触发。
+# 旧名单在 v1.6.0 随 `clawmessenger` 垫片一并退役，届时只删本脚本里带
+# TODO(rebrand-retire) 的两处 --match 与 workflow 的旧前缀触发即可。
+#
 # 用法：
-#   ./scripts/release-clawmessenger-cli.sh 0.2.1                 # bump 版本 + 提交 + 打 tag + push
-#   ./scripts/release-clawmessenger-cli.sh 0.2.1 --no-push       # 只 bump + tag，不推送
-#   ./scripts/release-clawmessenger-cli.sh --tag-only            # 不改版本，只推当前 tag
+#   ./scripts/release-agentsbb-cli.sh 0.2.1                 # bump 版本 + 提交 + 打 tag + push
+#   ./scripts/release-agentsbb-cli.sh 0.2.1 --no-push       # 只 bump + tag，不推送
+#   ./scripts/release-agentsbb-cli.sh --tag-only            # 不改版本，只推当前 tag
 #
 set -euo pipefail
 
@@ -37,19 +42,29 @@ if [[ "${TAG_ONLY}" == false ]]; then
   echo "==> bumping xiachat-cli to ${VERSION}"
   # 版本号只剩**两处**硬编码（main.ts 早已改走 cliVersion()，没有字面量了）：
   #   package.json "version"                      —— 构建脚本的默认来源
-  #   version.ts   CLAWMESSENGER_VERSION_FALLBACK —— 未注入时的运行时兜底，
+  #   version.ts   AGENTSBB_VERSION_FALLBACK      —— 未注入时的运行时兜底，
   #                                                  version.test.ts 盯着它与 package.json 一致
   # 以前只改 package.json（version.ts 漏了），测试在 bump 之后跑，脚本自己把自己挡住，
   # 而且 tag 上会留一份「fallback 撒谎」的源码。
   sed -i -E "s/(\"version\":\s*\")[0-9]+\.[0-9]+\.[0-9]+(\")/\1${VERSION}\2/" "${CLI_DIR}/package.json"
-  sed -i -E "s/(CLAWMESSENGER_VERSION_FALLBACK = \")[0-9]+\.[0-9]+\.[0-9]+(\")/\1${VERSION}\2/" "${CLI_DIR}/src/version.ts"
+  sed -i -E "s/(AGENTSBB_VERSION_FALLBACK = \")[0-9]+\.[0-9]+\.[0-9]+(\")/\1${VERSION}\2/" "${CLI_DIR}/src/version.ts"
   echo "    pkg.json   -> $(grep -m1 -oE '"version":\s*"[0-9.]+"' "${CLI_DIR}/package.json")"
-  echo "    version.ts -> $(grep -oE 'CLAWMESSENGER_VERSION_FALLBACK = "[0-9.]+"' "${CLI_DIR}/src/version.ts")"
+  echo "    version.ts -> $(grep -oE 'AGENTSBB_VERSION_FALLBACK = "[0-9.]+"' "${CLI_DIR}/src/version.ts")"
 fi
 
-TAG="clawmessenger-v${VERSION}"
+TAG="agentsbb-v${VERSION}"
 if [[ "${TAG_ONLY}" == true ]]; then
-  TAG="$(git describe --tags --abbrev=0 --match 'clawmessenger-v*')"
+  # 优先取最新的 agentsbb-v*；仓库历史上只有 clawmessenger-v* 时（首次改名发布之前）
+  # 回退到旧前缀，避免 --tag-only 在第一个新 tag 打出来之前直接报错。
+  TAG="$(git describe --tags --abbrev=0 --match 'agentsbb-v*' 2>/dev/null || true)"
+  if [[ -z "${TAG}" ]]; then
+    # TODO(rebrand-retire): 旧 tag 前缀兼容，v1.6.0 垫片退役时一并删除。
+    TAG="$(git describe --tags --abbrev=0 --match 'clawmessenger-v*' 2>/dev/null || true)"
+    if [[ -n "${TAG}" ]]; then
+      echo "!! 只找到旧前缀 tag ${TAG}；建议先发一个 agentsbb-v* 版本" >&2
+    fi
+  fi
+  [[ -n "${TAG}" ]] || { echo "!! 没有任何 agentsbb-v* tag，先跑 $0 <version>" >&2; exit 1; }
   echo "==> tag-only: using existing tag ${TAG}"
 fi
 
@@ -67,7 +82,7 @@ if [[ "${TAG_ONLY}" == false ]]; then
     echo "!! tag ${TAG} already exists locally" >&2; exit 1
   fi
   echo "==> creating tag ${TAG}"
-  git tag -a "${TAG}" -m "clawmessenger ${VERSION}"
+  git tag -a "${TAG}" -m "agentsbb ${VERSION}"
 fi
 
 if [[ "${NO_PUSH}" == true ]]; then
@@ -79,4 +94,4 @@ fi
 echo "==> pushing main + ${TAG} (this triggers the release workflow)"
 git push origin main
 git push origin "${TAG}"
-echo "==> done. Watch the run: https://github.com/clawmessenger/claw-messenger/actions"
+echo "==> done. Watch the run: https://github.com/clawmessenger/agentsbb/actions"

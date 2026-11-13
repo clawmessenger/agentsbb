@@ -2,7 +2,7 @@ package rongcloud
 
 // friend_command.go implements the service=friend command channel.
 //
-// 客户端的 9 个 action 见 clawmessenger-uniapp/src/utils/system-service-client.js:473-518：
+// 客户端的 9 个 action 见 agentsbb-uniapp/src/utils/system-service-client.js:473-518：
 //
 //	getList        → 好友列表（页面读 res.data 或 res.data.list）
 //	checkRelation  → {friendId} → {isFriend, isPending}
@@ -214,7 +214,7 @@ func (h *systemHandler) handleFriendAdd(ctx context.Context, msg NormalizedMessa
 	// 判定按「行是否存在于 rongcloud_node」做，隐藏节点（机器主节点 / ops）更该拦。
 	//
 	// 这条门禁不影响既有流程：全仓没有调用方用 friend/add 加节点
-	// （clawmessenger-uniapp 的 friendService.add 在 src/ 里零调用方），普通用户之间
+	// （agentsbb-uniapp 的 friendService.add 在 src/ 里零调用方），普通用户之间
 	// 仍走 add + optType=1（缺省仍 2 直加）。代价是本检查依赖 DB —— direct 与 request
 	// 两条路径都会受 DB 可用性影响，所以查询报错必须 fail-closed（见下）。
 	isNode, nodeErr := h.isAgentNode(ctx, friendID)

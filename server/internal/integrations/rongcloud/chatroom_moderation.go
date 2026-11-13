@@ -13,7 +13,7 @@ import (
 // removeWhitelist / getWhitelist）。
 //
 // 缺口由来：handleChatroomCommand 此前只实现房间生命周期与成员管理，这九个动作
-// 全部落进 default 的 404 分支。移动端（clawmessenger-uniapp 的
+// 全部落进 default 的 404 分支。移动端（agentsbb-uniapp 的
 // subPackages/chatroom/pages/chatroom/members.vue 拉黑/禁言、settings.vue 管理
 // 三个名单）是唯一调用方；web 不调用。
 //

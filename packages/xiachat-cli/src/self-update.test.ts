@@ -24,7 +24,7 @@ let target: string;
 
 beforeEach(() => {
   dir = mkdtempSync(path.join(os.tmpdir(), "cm-update-"));
-  target = path.join(dir, "clawmessenger.exe");
+  target = path.join(dir, "agentsbb.exe");
   writeFileSync(target, "OLD-BINARY");
 });
 
@@ -35,7 +35,7 @@ afterEach(() => {
 /** Backups parked next to the install by applyStagedUpdate. */
 function readBackups(): string[] {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter((f) => f.startsWith("clawmessenger.exe.old-"));
+  return readdirSync(dir).filter((f) => f.startsWith("agentsbb.exe.old-"));
 }
 
 const sha256 = (buf: Buffer): string => createHash("sha256").update(buf).digest("hex");
@@ -72,7 +72,7 @@ function fetchStub(opts: {
 
 describe("version helpers", () => {
   it("extracts a semver from the release tag", () => {
-    expect(versionFromTag("clawmessenger-v1.2.3")).toBe("1.2.3");
+    expect(versionFromTag("agentsbb-v1.2.3")).toBe("1.2.3");
     expect(versionFromTag("v0.2.54")).toBe("0.2.54");
   });
 
@@ -84,9 +84,9 @@ describe("version helpers", () => {
   });
 
   it("maps platform/arch onto the CI release matrix", () => {
-    expect(assetNameForPlatform("win32", "x64")).toBe("clawmessenger-windows-x64.exe");
-    expect(assetNameForPlatform("linux", "arm64")).toBe("clawmessenger-linux-arm64");
-    expect(assetNameForPlatform("darwin", "arm64")).toBe("clawmessenger-darwin-arm64");
+    expect(assetNameForPlatform("win32", "x64")).toBe("agentsbb-windows-x64.exe");
+    expect(assetNameForPlatform("linux", "arm64")).toBe("agentsbb-linux-arm64");
+    expect(assetNameForPlatform("darwin", "arm64")).toBe("agentsbb-darwin-arm64");
     // The matrix does not build these; refusing beats downloading a wrong binary.
     expect(assetNameForPlatform("win32", "arm64")).toBe("");
     expect(assetNameForPlatform("darwin", "x64")).toBe("");
@@ -106,9 +106,9 @@ describe("stageUpdate", () => {
   const NEW = Buffer.from("NEW-BINARY");
   const release: ReleaseInfo = {
     version: "1.1.0",
-    tag: "clawmessenger-v1.1.0",
+    tag: "agentsbb-v1.1.0",
     assets: [
-      { name: "clawmessenger-windows-x64.exe", url: "https://example.test/clawmessenger-windows-x64.exe", size: NEW.length },
+      { name: "agentsbb-windows-x64.exe", url: "https://example.test/agentsbb-windows-x64.exe", size: NEW.length },
       { name: "SHA256SUMS", url: "https://example.test/SHA256SUMS", size: 100 },
     ],
   };
@@ -121,8 +121,8 @@ describe("stageUpdate", () => {
       "x64",
       fetchStub({
         release,
-        files: { "clawmessenger-windows-x64.exe": NEW },
-        sums: `${sha256(NEW)}  clawmessenger-windows-x64.exe\n`,
+        files: { "agentsbb-windows-x64.exe": NEW },
+        sums: `${sha256(NEW)}  agentsbb-windows-x64.exe\n`,
       }),
     );
 
@@ -143,8 +143,8 @@ describe("stageUpdate", () => {
         "x64",
         fetchStub({
           release,
-          files: { "clawmessenger-windows-x64.exe": NEW },
-          sums: `${"0".repeat(64)}  clawmessenger-windows-x64.exe\n`,
+          files: { "agentsbb-windows-x64.exe": NEW },
+          sums: `${"0".repeat(64)}  agentsbb-windows-x64.exe\n`,
         }),
       ),
     ).rejects.toThrow(/checksum mismatch/);
@@ -156,7 +156,7 @@ describe("stageUpdate", () => {
   it("refuses to install when the release ships no SHA256SUMS", async () => {
     const noSums: ReleaseInfo = { ...release, assets: [release.assets[0]] };
     await expect(
-      stageUpdate(noSums, target, "win32", "x64", fetchStub({ release: noSums, files: { "clawmessenger-windows-x64.exe": NEW } })),
+      stageUpdate(noSums, target, "win32", "x64", fetchStub({ release: noSums, files: { "agentsbb-windows-x64.exe": NEW } })),
     ).rejects.toThrow(/SHA256SUMS/);
     expect(findStaged(target)).toHaveLength(0);
   });
@@ -216,8 +216,8 @@ describe("cleanupStaleBackups", () => {
 
     const removed = cleanupStaleBackups(target, 1);
 
-    expect(removed.sort()).toEqual(["clawmessenger.exe.old-1000", "clawmessenger.exe.old-2000"]);
-    expect(readBackups()).toEqual(["clawmessenger.exe.old-3000"]);
+    expect(removed.sort()).toEqual(["agentsbb.exe.old-1000", "agentsbb.exe.old-2000"]);
+    expect(readBackups()).toEqual(["agentsbb.exe.old-3000"]);
   });
 });
 
@@ -228,21 +228,21 @@ describe("checkForUpdate", () => {
       "win32",
       "x64",
       fetchStub({
-        release: { tag_name: "clawmessenger-v1.1.0", assets: [{ name: "clawmessenger-windows-x64.exe", browser_download_url: "https://example.test/x", size: 1 }] },
+        release: { tag_name: "agentsbb-v1.1.0", assets: [{ name: "agentsbb-windows-x64.exe", browser_download_url: "https://example.test/x", size: 1 }] },
         files: {},
       }),
     );
 
     expect(plan.latestVersion).toBe("1.1.0");
     expect(plan.updateAvailable).toBe(true);
-    expect(plan.assetName).toBe("clawmessenger-windows-x64.exe");
+    expect(plan.assetName).toBe("agentsbb-windows-x64.exe");
   });
 
   it("does not flag the same version, or an older one", async () => {
-    const same = await checkForUpdate("1.1.0", "win32", "x64", fetchStub({ release: { tag_name: "clawmessenger-v1.1.0", assets: [] }, files: {} }));
+    const same = await checkForUpdate("1.1.0", "win32", "x64", fetchStub({ release: { tag_name: "agentsbb-v1.1.0", assets: [] }, files: {} }));
     expect(same.updateAvailable).toBe(false);
 
-    const older = await checkForUpdate("1.2.0", "win32", "x64", fetchStub({ release: { tag_name: "clawmessenger-v1.1.0", assets: [] }, files: {} }));
+    const older = await checkForUpdate("1.2.0", "win32", "x64", fetchStub({ release: { tag_name: "agentsbb-v1.1.0", assets: [] }, files: {} }));
     expect(older.updateAvailable).toBe(false);
   });
 
@@ -281,7 +281,7 @@ function cdnStub(opts: {
     }
     if (url.includes("/releases/latest/download/")) {
       const loc = opts.tag
-        ? `https://github.com/clawmessenger/claw-messenger/releases/download/${opts.tag}/SHA256SUMS`
+        ? `https://github.com/clawmessenger/agentsbb/releases/download/${opts.tag}/SHA256SUMS`
         : "";
       return {
         ok: false,
@@ -306,17 +306,17 @@ describe("release lookup fallback", () => {
   const saved = { ...process.env };
   afterEach(() => {
     delete process.env.GITHUB_TOKEN;
-    delete process.env.CLAWMESSENGER_UPDATE_TOKEN;
+    delete process.env.AGENTSBB_UPDATE_TOKEN;
     process.env = { ...saved };
   });
 
   it("recovers the version from the CDN when the API is rate limited", async () => {
     const plan = await checkForUpdate(
       "1.1.0", "win32", "x64",
-      cdnStub({ apiStatus: 403, tag: "clawmessenger-v1.2.0" }),
+      cdnStub({ apiStatus: 403, tag: "agentsbb-v1.2.0" }),
     );
     expect(plan.release.source).toBe("cdn");
-    expect(plan.release.tag).toBe("clawmessenger-v1.2.0");
+    expect(plan.release.tag).toBe("agentsbb-v1.2.0");
     expect(plan.latestVersion).toBe("1.2.0");
     expect(plan.updateAvailable).toBe(true);
   });
@@ -324,11 +324,11 @@ describe("release lookup fallback", () => {
   it("builds asset URLs from the recovered tag", async () => {
     const plan = await checkForUpdate(
       "1.1.0", "win32", "x64",
-      cdnStub({ apiStatus: 403, tag: "clawmessenger-v1.2.0" }),
+      cdnStub({ apiStatus: 403, tag: "agentsbb-v1.2.0" }),
     );
     const exe = plan.release.assets.find((a) => a.name === plan.assetName);
     expect(exe?.url).toBe(
-      "https://github.com/clawmessenger/claw-messenger/releases/download/clawmessenger-v1.2.0/clawmessenger-windows-x64.exe",
+      "https://github.com/clawmessenger/agentsbb/releases/download/agentsbb-v1.2.0/agentsbb-windows-x64.exe",
     );
     expect(plan.release.assets.some((a) => a.name === "SHA256SUMS")).toBe(true);
   });
@@ -337,16 +337,16 @@ describe("release lookup fallback", () => {
     const captured: { url: string }[] = [];
     const plan = await checkForUpdate(
       "1.1.0", "win32", "x64",
-      fetchStub({ release: { tag_name: "clawmessenger-v1.2.0", assets: [] }, files: {} }),
+      fetchStub({ release: { tag_name: "agentsbb-v1.2.0", assets: [] }, files: {} }),
     );
     expect(plan.release.source).toBe("api");
     expect(captured).toHaveLength(0);
   });
 
   it("sends the configured token to the API", async () => {
-    process.env.CLAWMESSENGER_UPDATE_TOKEN = "t0ken-abc";
+    process.env.AGENTSBB_UPDATE_TOKEN = "t0ken-abc";
     const captured: { url: string; headers?: Record<string, string> }[] = [];
-    await checkForUpdate("1.1.0", "win32", "x64", cdnStub({ apiStatus: 200, tag: "clawmessenger-v1.2.0", captured }));
+    await checkForUpdate("1.1.0", "win32", "x64", cdnStub({ apiStatus: 200, tag: "agentsbb-v1.2.0", captured }));
     const apiCall = captured.find((c) => c.url.endsWith("/releases/latest"));
     expect(apiCall?.headers?.Authorization).toBe("Bearer t0ken-abc");
   });
@@ -355,14 +355,14 @@ describe("release lookup fallback", () => {
     const bin = Buffer.from("REAL-BINARY");
     const plan = await checkForUpdate(
       "1.1.0", "win32", "x64",
-      cdnStub({ apiStatus: 403, tag: "clawmessenger-v1.2.0", files: { "clawmessenger-windows-x64.exe": bin } }),
+      cdnStub({ apiStatus: 403, tag: "agentsbb-v1.2.0", files: { "agentsbb-windows-x64.exe": bin } }),
     );
     await expect(
       stageUpdate(plan.release, target, "win32", "x64",
         cdnStub({
-          apiStatus: 403, tag: "clawmessenger-v1.2.0",
-          files: { "clawmessenger-windows-x64.exe": bin },
-          sums: `${"0".repeat(64)}  clawmessenger-windows-x64.exe\n`,
+          apiStatus: 403, tag: "agentsbb-v1.2.0",
+          files: { "agentsbb-windows-x64.exe": bin },
+          sums: `${"0".repeat(64)}  agentsbb-windows-x64.exe\n`,
         })),
     ).rejects.toThrow(/checksum mismatch/i);
     expect(existsSync(stagedPath(target, "1.2.0"))).toBe(false);
@@ -372,12 +372,12 @@ describe("release lookup fallback", () => {
     const bin = Buffer.from("REAL-BINARY");
     const plan = await checkForUpdate(
       "1.1.0", "win32", "x64",
-      cdnStub({ apiStatus: 403, tag: "clawmessenger-v1.2.0", files: { "clawmessenger-windows-x64.exe": bin } }),
+      cdnStub({ apiStatus: 403, tag: "agentsbb-v1.2.0", files: { "agentsbb-windows-x64.exe": bin } }),
     );
     const stub = cdnStub({
-      apiStatus: 403, tag: "clawmessenger-v1.2.0",
-      files: { "clawmessenger-windows-x64.exe": bin },
-      sums: `${sha256(bin)}  clawmessenger-windows-x64.exe\n`,
+      apiStatus: 403, tag: "agentsbb-v1.2.0",
+      files: { "agentsbb-windows-x64.exe": bin },
+      sums: `${sha256(bin)}  agentsbb-windows-x64.exe\n`,
     });
     const staged = await stageUpdate(plan.release, target, "win32", "x64", stub);
     expect(staged.version).toBe("1.2.0");
@@ -459,11 +459,11 @@ describe("stageUpdateFromMirrors", () => {
   it("falls back to the server proxy and resolves its relative path against serverUrl", async () => {
     const plan = {
       version: "1.3.0",
-      assetName: "clawmessenger-windows-x64.exe",
+      assetName: "agentsbb-windows-x64.exe",
       sha256: sum(binary),
       mirrors: [
-        "https://github.com/clawmessenger/claw-messenger/releases/download/clawmessenger-v1.3.0/clawmessenger-windows-x64.exe",
-        "/api/agent/upgrade/download?version=1.3.0&asset=clawmessenger-windows-x64.exe&token=t",
+        "https://github.com/clawmessenger/agentsbb/releases/download/agentsbb-v1.3.0/agentsbb-windows-x64.exe",
+        "/api/agent/upgrade/download?version=1.3.0&asset=agentsbb-windows-x64.exe&token=t",
       ],
     };
     const fetchImpl = mirrorFetch({
@@ -481,7 +481,7 @@ describe("stageUpdateFromMirrors", () => {
   it("rejects bytes whose sha256 does not match and leaves nothing staged", async () => {
     const plan = {
       version: "1.3.0",
-      assetName: "clawmessenger-windows-x64.exe",
+      assetName: "agentsbb-windows-x64.exe",
       sha256: sum(Buffer.from("what-we-expected")),
       mirrors: ["https://example.test/binary"],
     };
@@ -496,7 +496,7 @@ describe("stageUpdateFromMirrors", () => {
   it("refuses to install when the server supplied no checksum", async () => {
     const plan = {
       version: "1.3.0",
-      assetName: "clawmessenger-windows-x64.exe",
+      assetName: "agentsbb-windows-x64.exe",
       sha256: "",
       mirrors: ["https://example.test/binary"],
     };

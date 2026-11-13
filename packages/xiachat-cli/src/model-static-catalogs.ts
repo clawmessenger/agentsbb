@@ -37,7 +37,7 @@ function claudeStaticCatalog(): DiscussionModelCatalog {
 }
 
 // codebuddy：models.go:2974-2982 codebuddyStaticModels（逐条对应）。仅当
-// clawmessenger-provider.json 存在（端点已配置）时才会被加载器采用 —— 注入走
+// agentsbb-provider.json 存在（端点已配置）时才会被加载器采用 —— 注入走
 // CODEBUDDY_MODEL（agents.ts agentRuntimeEnv），没有网关配置时选了等于没选；
 // provider 分组按 models.go:2934-2955 codebuddyModelProvider 的前缀规则。
 function codebuddyStaticCatalog(): DiscussionModelCatalog {

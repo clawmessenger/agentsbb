@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { stateHome } from "./paths.js";
 import { buildSpawnInvocation, discoverAgents, type AgentInfo } from "./agents.js";
 import { OPS_AGENT_NAME } from "./ops.js";
 
@@ -9,14 +10,14 @@ import { OPS_AGENT_NAME } from "./ops.js";
  * 设备上各 agent CLI 的现场事实：可执行文件路径 + 自报版本。
  *
  * 为什么需要它：后台「设备详情」与移动端面板原来展示的 `install_dir` /
- * `exe_version` 是 **clawmessenger 自己**（supervisor）的安装目录与版本。运维
+ * `exe_version` 是 **agentsbb 自己**（supervisor）的安装目录与版本。运维
  * 真正要看的是「这台机器上的 codex / opencode 装的是哪个版本、在哪个目录」——
  * 出问题时要能直接去那个目录翻日志、换二进制，而不是看到一个无关的
- * `%LOCALAPPDATA%\clawmessenger`。
+ * `%LOCALAPPDATA%\agentsbb`。
  *
  * 成本与缓存：版本号必须起一次 `<cli> --version` 子进程（qwen / codex 冷启动
  * 从几百毫秒到数秒不等），**绝不能放进 10 秒一轮的上报路径**。所以探测结果落盘
- * 缓存（`~/.clawmessenger/agent-cli-info.json`），默认 6 小时才重探一次；探测
+ * 缓存（`~/.agentsbb/agent-cli-info.json`），默认 6 小时才重探一次；探测
  * 全程在后台跑，失败/超时只留空字段，不影响轮询与启停。
  */
 
@@ -82,7 +83,7 @@ export interface AgentCliInfoCache {
 }
 
 export function defaultAgentCliInfoPath(home = homedir()): string {
-  return join(home, ".clawmessenger", "agent-cli-info.json");
+  return join(stateHome(), "agent-cli-info.json");
 }
 
 /** 读缓存；缺失/损坏都返回 null（当作从没探过，不抛）。 */

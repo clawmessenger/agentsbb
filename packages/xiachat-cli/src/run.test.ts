@@ -61,7 +61,7 @@ describe("createInboundReplayDedupe (offline replay storm)", () => {
   });
 
   it("remembers handled UIDs across restarts so a reconnect is a no-op", () => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-uids-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-uids-"));
     const path = join(dir, "processed-uids.json");
     try {
       const first = createInboundReplayDedupe({ path });
@@ -84,7 +84,7 @@ describe("createInboundReplayDedupe (offline replay storm)", () => {
   });
 
   it("starts clean when the marker file is missing or corrupt", () => {
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-uids-"));
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-uids-"));
     const path = join(dir, "processed-uids.json");
     try {
       expect(createInboundReplayDedupe({ path }).size).toBe(0);
@@ -448,7 +448,7 @@ describe("startRunLoop fast path", () => {
           transport,
           // Deliberately absent: the probe answers not_found without spawning,
           // which keeps this test free of real child processes.
-          agentExecPath: join(tmpdir(), "clawmessenger-definitely-missing-opencode"),
+          agentExecPath: join(tmpdir(), "agentsbb-definitely-missing-opencode"),
           agentName: "opencode",
           stdout: { write: () => { onWired(); return true } } as unknown as NodeJS.WriteStream,
         }),
@@ -511,7 +511,7 @@ describe("startRunLoop replay-dedupe accounting (mark-after-dispatch)", () => {
     const listeners: Array<(msg: InboundIMMessage) => void> = []
     let onWired: () => void = () => {}
     const wired = new Promise<void>((resolve) => { onWired = resolve })
-    const dir = mkdtempSync(join(tmpdir(), "clawmessenger-replay-"))
+    const dir = mkdtempSync(join(tmpdir(), "agentsbb-replay-"))
     const processedUidsPath = join(dir, "processed-uids.json")
     // 私聊闸门要有确定性行为：写一份本测试自己的权限快照（owner=user_1，
     // 本节点 allowPrivate=true），否则跑到别的机器/账号上会被真实快照拦成

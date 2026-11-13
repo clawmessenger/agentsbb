@@ -36,7 +36,7 @@ describe("mergeCodexOutputStyle", () => {
     expect(merged.startsWith("# 我的规则\n\n- 用中文回答")).toBe(true);
     expect(merged).toContain(CODEX_OUTPUT_STYLE_BEGIN);
     // 用户内容与标记段之间留一空行，且有结尾换行
-    expect(merged).toContain("用中文回答\n\n<!-- clawmessenger:output-style:begin -->");
+    expect(merged).toContain("用中文回答\n\n<!-- agentsbb:output-style:begin -->");
     expect(merged.endsWith("\n")).toBe(true);
   });
 

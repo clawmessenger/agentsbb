@@ -196,7 +196,7 @@ export function buildAutoContinuationPrompt(originalPrompt: string, incomplete: 
     "请先用一句话向用户说明刚才那步为什么失败，然后换一种可行的写法继续把用户上面的请求办完。"
       + "如果失败原因是 shell 语法不兼容（command not found、不是 cmdlet、重定向报错等），"
       + "不要再猜 shell 种类：改用与 shell 无关的写法——读文件用内置文件工具、"
-      + "运维动作用 clawmessenger 子命令（status / logs / agent start|stop|restart）。",
+      + "运维动作用 agentsbb 子命令（status / logs / agent start|stop|restart）。",
   );
   return lines.join("\n");
 }

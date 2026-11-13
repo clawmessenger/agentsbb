@@ -2,7 +2,7 @@ package rongcloud
 
 // user_command.go implements service=user 的微信小程序登录（action=wxLogin）。
 //
-// 客户端调用点：clawmessenger-uniapp/src/components/login-popup.vue:300 —
+// 客户端调用点：agentsbb-uniapp/src/components/login-popup.vue:300 —
 // `sendRequest('user','wxLogin',{code, phoneCode})`，拿 `result.data.token` 建 IM
 // 连接并写入本地存储。因此回包形状必须与既有 HTTP 登录（ClawLogin，
 // internal/handler/claw_compat.go:467-473）一致：

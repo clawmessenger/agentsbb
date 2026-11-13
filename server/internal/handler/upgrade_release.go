@@ -32,11 +32,17 @@ import (
 
 const (
 	// clawUpgradeReleasesRepo 与 CLI 内置自更新同源（self-update.ts 的 RELEASES_REPO），
-	// 不新增发布方式。
+	// 不新增发布方式。仓库地址属于 git remote 事务，品牌改名期保持原值。
 	clawUpgradeReleasesRepo = "clawmessenger/claw-messenger"
+	// clawUpgradeTagPrefix 是发布 tag 的新前缀（`agentsbb-v1.4.0`）。
+	clawUpgradeTagPrefix = "agentsbb-v"
+	// clawUpgradeLegacyTagPrefix 是改名前的 tag 前缀。过渡期仍然接受：
+	// 历史版本（<=1.3.x）的 tag 就是 `clawmessenger-v1.3.33`，代理下载要能回源到它们。
+	// TODO(rebrand-retire): 1.3.x 版本全部下线后删除（与 CLI 的 versionFromTag 同步）。
+	clawUpgradeLegacyTagPrefix = "clawmessenger-v"
 	// clawUpgradeWindowsAsset 是 Windows-x64 的资产名。保号是因为测试、提示文案
 	// 与历史 token 都按它写；平台到资产的映射统一走 clawUpgradeAssetForPlatform。
-	clawUpgradeWindowsAsset = "clawmessenger-windows-x64.exe"
+	clawUpgradeWindowsAsset = "agentsbb-windows-x64.exe"
 	// clawUpgradePlatformWindows 是设备上报的 "<os>-<arch>" 值。
 	clawUpgradePlatformWindows = "win32-x64"
 	// clawUpgradeReleaseTTL 是 latest 的缓存时长。
@@ -56,8 +62,8 @@ const (
 // release 路径，不限制字符集就是在拼一个可控 URL。
 var clawUpgradeVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
-// clawUpgradeTagPattern 从 `clawmessenger-v1.2.3` 里抠出版本号（与
-// self-update.ts 的 versionFromTag 行为一致：取第一组 x.y.z）。
+// clawUpgradeTagPattern 从 `agentsbb-v1.2.3`（历史版本：`clawmessenger-v1.2.3`）
+// 里抠出版本号（与 self-update.ts 的 versionFromTag 行为一致：取第一组 x.y.z）。
 var clawUpgradeTagPattern = regexp.MustCompile(`(\d+\.\d+\.\d+)`)
 
 // clawUpgradeRelease 是一次 latest 解析的结果。
@@ -146,11 +152,38 @@ func parseClawAssetDigest(raw string) string {
 }
 
 // clawUpgradeVersionFromTag 把 tag 归一成 x.y.z。
+//
+// 新旧两种前缀都认（`agentsbb-v1.4.0` / `clawmessenger-v1.3.33`）：regex 取第一组
+// x.y.z，前缀是什么都不影响结果，所以这里不需要分支。
 func clawUpgradeVersionFromTag(tag string) string {
 	if m := clawUpgradeTagPattern.FindStringSubmatch(tag); len(m) == 2 {
 		return m[1]
 	}
-	return strings.TrimPrefix(tag, "clawmessenger-v")
+	trimmed := strings.TrimPrefix(tag, clawUpgradeTagPrefix)
+	trimmed = strings.TrimPrefix(trimmed, clawUpgradeLegacyTagPrefix)
+	return strings.TrimPrefix(trimmed, "v")
+}
+
+// clawUpgradeTagFromVersion 把版本号还原成发布 tag（新前缀）。
+//
+// 与 CLI 的 versionFromTag 互逆：CLI 读的时候新旧两个前缀都接受，写的时候只写新前缀。
+func clawUpgradeTagFromVersion(version string) string {
+	return clawUpgradeTagPrefix + strings.TrimPrefix(strings.TrimSpace(version), "v")
+}
+
+// clawUpgradeTagCandidates 返回回源该版本时应依次尝试的 tag。
+//
+// 先新后旧：改名后发布的一切版本都是 `agentsbb-v*`；旧前缀只用于回源历史版本
+// （镜像里可能还挂着 1.3.x，或管理员给还没升级的设备下发旧版本）。
+// 调用方遇到 404 才换下一个，所以正常路径上只会多一次字符串比较。
+// TODO(rebrand-retire): 旧前缀项随 clawUpgradeLegacyTagPrefix 一起删除。
+func clawUpgradeTagCandidates(version string) []string {
+	tags := []string{clawUpgradeTagFromVersion(version)}
+	legacy := clawUpgradeLegacyTagPrefix + strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if legacy != tags[0] {
+		tags = append(tags, legacy)
+	}
+	return tags
 }
 
 // fetchClawUpgradeLatest 直连 GitHub 解析 latest：一次 API 调用拿 tag+assets
@@ -386,7 +419,7 @@ const clawUpgradeProxyNotConfigured = "UPGRADE_PROXY_NOT_CONFIGURED"
 //
 // 为什么这一条是硬性的：/api/agent/upgrade/download 是**公网、无 admin 鉴权**的
 // 端点，token 是它唯一的门禁。如果密钥就是仓库里人人可见的字面量，任何人都能
-// 给自己签一个 `9.9.9|clawmessenger-windows-x64.exe|未来时间` 的 token，让本服务
+// 给自己签一个 `9.9.9|agentsbb-windows-x64.exe|未来时间` 的 token，让本服务
 // 去 GitHub 代拉并落盘 —— 既是免费 CDN，也能把缓存目录写满、挤掉正常工作集（
 // 审查报告 S2）。少了这个 secret 的正确降级是「代理不可用、设备直连 GitHub」，
 // 而不是「代理可用且人人可签」。
@@ -498,8 +531,28 @@ func clawUpgradeMirrors(release *clawUpgradeRelease, asset, token string) (mirro
 //
 // 两处漂移的后果是静默的：服务端按 A 名签 token，设备按 B 名去下载，结果是
 // download_failed（404），而页面上只会显示「下载失败」—— 看不出是名字错了。
-// 发布矩阵（.github/workflows/clawmessenger-release.yml）是唯一真相。
+// 发布矩阵（.github/workflows/agentsbb-release.yml）是唯一真相。
+//
+// 用**新名单**（agentsbb-*）。设备不自己挑名字：升级指令里的 assetName 由服务端
+// 决定（claw_device_upgrade.go 的 intent.AssetName），老设备照单下载新名字的文件，
+// 所以这里切新名不会让存量设备 404。
+// 旧名单（clawmessenger-*）只出现在两个地方：Release 里那份字节相同的别名资产，
+// 以及 clawUpgradeLegacyAssets 的代理白名单。
 var clawUpgradeAssetsByPlatform = map[string]string{
+	clawUpgradePlatformWindows: "agentsbb-windows-x64.exe",
+	"linux-x64":                "agentsbb-linux-x64",
+	"linux-arm64":              "agentsbb-linux-arm64",
+	"darwin-arm64":             "agentsbb-darwin-arm64",
+}
+
+// clawUpgradeLegacyAssets 是改名前的等价资产名（与上面一一对应，字节也相同）。
+//
+// 只给下载代理的白名单用：端点是公开的，资产名进 URL，白名单里少一个名字就是
+// 400 —— 而「名字」在改名过渡期有两个来源（还没升级的设备手工 `agentsbb update`
+// 会按旧清单拼地址；运维手工传参也可能沿用旧名）。放行旧名不会扩大攻击面：
+// 旧名指向的仍是这个 Release 里同一个文件。
+// TODO(rebrand-retire): 1.3.x 全部升级后删除（连同 Release 里的旧名别名资产）。
+var clawUpgradeLegacyAssets = map[string]string{
 	clawUpgradePlatformWindows: "clawmessenger-windows-x64.exe",
 	"linux-x64":                "clawmessenger-linux-x64",
 	"linux-arm64":              "clawmessenger-linux-arm64",
@@ -515,6 +568,8 @@ func clawUpgradeAssetForPlatform(platform string) string {
 // clawUpgradeAssetSupported 判断资产名是否属于发布矩阵。下载代理的白名单用它：
 // 端点公开，资产名进 URL，不做白名单就等于开了一个「按名字回源任意 release
 // 资产」的代理。
+//
+// 新旧两套名字都算「属于发布矩阵」（见 clawUpgradeLegacyAssets 的说明）。
 func clawUpgradeAssetSupported(asset string) bool {
 	asset = strings.TrimSpace(asset)
 	if asset == "" {
@@ -522,6 +577,11 @@ func clawUpgradeAssetSupported(asset string) bool {
 	}
 	for _, known := range clawUpgradeAssetsByPlatform {
 		if known == asset {
+			return true
+		}
+	}
+	for _, legacy := range clawUpgradeLegacyAssets {
+		if legacy == asset {
 			return true
 		}
 	}

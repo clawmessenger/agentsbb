@@ -269,7 +269,7 @@ func (c *rongcloudAPIClient) sendCommandResult(ctx context.Context, fromUserID, 
 
 // sendWebCommandResult answers the web client's system-command channel.
 //
-// The web's handleSystemResponse (clawmessenger-web/src/services/im.ts) walks the
+// The web's handleSystemResponse (agentsbb-web/src/services/im.ts) walks the
 // message content looking for an object that carries requestId-or-request_id
 // AND a string `status`, then reads `code` and `data` off it. That is a FLAT
 // object, not the device-shaped {request_id, msg_type, payload} envelope the CLI

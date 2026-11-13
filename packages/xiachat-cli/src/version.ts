@@ -8,23 +8,23 @@
  *
  * 因此：
  *   1. 构建期由 scripts/build-exe.mjs 通过 esbuild `--define` 注入
- *      __CLAWMESSENGER_VERSION__（等价于 Go 的 -ldflags -X：发布流水线在打 tag
+ *      __AGENTSBB_VERSION__（等价于 Go 的 -ldflags -X：发布流水线在打 tag
  *      时把 tag 版本带进来，不依赖人改文件）；
  *   2. 没有注入时（tsc 直跑、vitest、开发机）退回下面这个字面量；
  *   3. version.test.ts 断言这里的字面量与 package.json 的 version 一致 ——
  *      这条断言就是「兜底不许撒谎」的护栏。
  */
 
-declare const __CLAWMESSENGER_VERSION__: string | undefined;
+declare const __AGENTSBB_VERSION__: string | undefined;
 
 /** 与 packages/xiachat-cli/package.json 的 version 手工同步（有测试盯着）。 */
-export const CLAWMESSENGER_VERSION_FALLBACK = "1.3.34";
+export const AGENTSBB_VERSION_FALLBACK = "1.3.34";
 
 /** 本进程的 CLI 版本：构建期注入优先，否则用兜底字面量。 */
 export function cliVersion(): string {
   // typeof 守卫：tsc/vitest 下这个标识符根本不存在，直接引用会 ReferenceError。
-  if (typeof __CLAWMESSENGER_VERSION__ === "string" && __CLAWMESSENGER_VERSION__.trim()) {
-    return __CLAWMESSENGER_VERSION__.trim();
+  if (typeof __AGENTSBB_VERSION__ === "string" && __AGENTSBB_VERSION__.trim()) {
+    return __AGENTSBB_VERSION__.trim();
   }
-  return CLAWMESSENGER_VERSION_FALLBACK;
+  return AGENTSBB_VERSION_FALLBACK;
 }

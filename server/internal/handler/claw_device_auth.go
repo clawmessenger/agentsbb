@@ -16,7 +16,7 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// Device-code pairing: a terminal client (clawmessenger pair without
+// Device-code pairing: a terminal client (agentsbb pair without
 // --ticket) anonymously creates a pairing session and gets back an 8-char
 // user code plus a verify URL. The logged-in human opens the URL, reviews
 // the machine's hostname and reported agent CLIs, and authorizes binding.
@@ -290,11 +290,11 @@ func (h *Handler) ClawBindPairingByCode(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if rongcloud.SessionEffectiveStatus(session, time.Now()) == "expired" {
-		clawJSON(w, 410, 410, "链接已过期，请在终端重新运行 clawmessenger pair", nil)
+		clawJSON(w, 410, 410, "链接已过期，请在终端重新运行 agentsbb pair", nil)
 		return
 	}
 	if session.Status != "claimed" {
-		clawJSON(w, 409, 409, "设备尚未连接，请先在终端运行 clawmessenger pair", nil)
+		clawJSON(w, 409, 409, "设备尚未连接，请先在终端运行 agentsbb pair", nil)
 		return
 	}
 	var req struct {
@@ -334,7 +334,7 @@ func (h *Handler) ClawBindPairingByCode(w http.ResponseWriter, r *http.Request) 
 		case errors.Is(err, rongcloud.ErrPairingSessionNotClaimed):
 			clawJSON(w, 409, 409, "设备尚未完成配对", nil)
 		case errors.Is(err, rongcloud.ErrPairingSessionExpired):
-			clawJSON(w, 410, 410, "链接已过期，请在终端重新运行 clawmessenger pair", nil)
+			clawJSON(w, 410, 410, "链接已过期，请在终端重新运行 agentsbb pair", nil)
 		default:
 			slog.Warn("claw: bind pairing by code failed", "error", err, "userId", userID)
 			clawJSON(w, 500, 500, "绑定智能体失败", nil)

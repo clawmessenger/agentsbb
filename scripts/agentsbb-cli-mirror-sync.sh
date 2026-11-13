@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claw-cli-mirror-sync.sh — 把 GitHub Release 里的 CLI 安装包镜像到本机，
+# agentsbb-cli-mirror-sync.sh — 把 GitHub Release 里的 CLI 安装包镜像到本机，
 # 给「访问不到 GitHub」的用户留一条备用下载路（见使用指南「接入提示词」第 3.5 节）。
 #
 # 为什么是这个形状：
@@ -12,22 +12,22 @@
 #      重跑本脚本即可恢复链接。反过来把 400MB 放在 webroot 里，一次清理就全没了。
 #      放同级还有个好处：SELinux Enforcing 时与 webroot 同父目录，上下文好对齐。
 #   4) 服务器自己连不上 GitHub 时（本项目当前就是这样），走 --from-dir：
-#      本机跑 claw-cli-mirror-fetch.ps1 下好打包 → 上传 → 服务器解包后 --from-dir 激活。
+#      本机跑 agentsbb-cli-mirror-fetch.ps1 下好打包 → 上传 → 服务器解包后 --from-dir 激活。
 #      这是主路径，不是应急方案；不带 --from-dir 的联网模式只是「服务器恰好能出网」时的便利。
 #
 # 不提供的东西：签名。镜像只能防传输损坏和本地篡改，不能防上游被投毒。
 # 哈希来自 GitHub 的 SHA256SUMS（TLS 传输），信任锚仍是 GitHub。
 #
 # 用法：
-#   bash scripts/claw-cli-mirror-sync.sh --bundle /tmp/claw-cli-mirror-1.3.4.tar.gz
+#   bash scripts/agentsbb-cli-mirror-sync.sh --bundle /tmp/agentsbb-cli-mirror-1.3.4.tar.gz
 #       ↑ 主路径。本机 fetch 打好的包直接喂进来：自动解包、读包内 MANIFEST/VERSION、校验后激活。
-#   bash scripts/claw-cli-mirror-sync.sh --from-dir /tmp/clawmirror    # 已自己解好包时用
-#   bash scripts/claw-cli-mirror-sync.sh --from-dir /tmp/pkgs --tag clawmessenger-v1.3.4   # 手动标版本
-#   bash scripts/claw-cli-mirror-sync.sh                     # 服务器能出网时，直接拉 latest 并激活
-#   bash scripts/claw-cli-mirror-sync.sh --dry-run           # 只打印计划，不下载不改动
-#   bash scripts/claw-cli-mirror-sync.sh --only clawmessenger-windows-x64.exe
-#   bash scripts/claw-cli-mirror-sync.sh --verify-only       # 只校验当前 latest，不下载
-#   bash scripts/claw-cli-mirror-sync.sh --mode copy         # webroot 里放真实目录（nginx 禁符号链接时用）
+#   bash scripts/agentsbb-cli-mirror-sync.sh --from-dir /tmp/clawmirror    # 已自己解好包时用
+#   bash scripts/agentsbb-cli-mirror-sync.sh --from-dir /tmp/pkgs --tag agentsbb-v1.3.4   # 手动标版本
+#   bash scripts/agentsbb-cli-mirror-sync.sh                     # 服务器能出网时，直接拉 latest 并激活
+#   bash scripts/agentsbb-cli-mirror-sync.sh --dry-run           # 只打印计划，不下载不改动
+#   bash scripts/agentsbb-cli-mirror-sync.sh --only agentsbb-windows-x64.exe
+#   bash scripts/agentsbb-cli-mirror-sync.sh --verify-only       # 只校验当前 latest，不下载
+#   bash scripts/agentsbb-cli-mirror-sync.sh --mode copy         # webroot 里放真实目录（nginx 禁符号链接时用）
 #
 # 默认目录（按线上实际布局）：
 #   --dir      /data/im/shrimp-says-test/claw-mirror        安装包存放处（webroot 同级，不在其内）
@@ -36,12 +36,14 @@
 #   对外 URL： https://newsradar.dreamdt.cn/claw-web/dl/<asset>
 #   （nginx 给 /claw-web/ 与 /claw-web/assets/ 各配了 alias；dl/ 走前者，无需改 nginx）
 #
-# 可用环境变量：CLAWMESSENGER_MIRROR_GH_BASE（默认 https://github.com）
+# 可用环境变量：AGENTSBB_MIRROR_GH_BASE（默认 https://github.com）
 
 set -euo pipefail
 
-REPO="clawmessenger/claw-messenger"
-GH_BASE="${CLAWMESSENGER_MIRROR_GH_BASE:-https://github.com}"
+REPO="clawmessenger/agentsbb"
+# TODO(rebrand-retire): AGENTSBB_MIRROR_GH_BASE 是新名；CLAWMESSENGER_MIRROR_GH_BASE
+# 过渡期仍可读，v1.6.0 垫片退役时删掉后半段。
+GH_BASE="${AGENTSBB_MIRROR_GH_BASE:-${CLAWMESSENGER_MIRROR_GH_BASE:-https://github.com}}"
 GH_LATEST="$GH_BASE/$REPO/releases/latest"
 GH_DOWNLOAD="$GH_BASE/$REPO/releases/latest/download"
 
@@ -58,12 +60,16 @@ DRY_RUN=0
 VERIFY_ONLY=0
 KEEP_PREV=1
 
-DEFAULT_ASSETS="clawmessenger-windows-x64.exe
-clawmessenger-windows-x64-daemon-scripts.zip
-clawmessenger-linux-x64
-clawmessenger-linux-arm64
-clawmessenger-linux-daemon-scripts.tar.gz
-clawmessenger-darwin-arm64"
+# 默认只镜像新名单（agentsbb-*）。Release 里同时上传旧名单（clawmessenger-*）供 1.3.x
+# 老客户端自更新，镜像侧默认不复制一份（体积翻倍），需要时用 --only 显式点名，
+# 例如：--only agentsbb-windows-x64.exe,clawmessenger-windows-x64.exe
+# TODO(rebrand-retire): 旧名单在 v1.6.0 随 `clawmessenger` 垫片一起退役。
+DEFAULT_ASSETS="agentsbb-windows-x64.exe
+agentsbb-windows-x64-daemon-scripts.zip
+agentsbb-linux-x64
+agentsbb-linux-arm64
+agentsbb-linux-daemon-scripts.tar.gz
+agentsbb-darwin-arm64"
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'warn: %s\n' "$*" >&2; }
@@ -99,7 +105,7 @@ fi
 
 # 同一个脚本会被复制到 /usr/local/bin。跑的是 A、PATH 里是 B 时，报错会指向完全不相关的
 # 旧行为（比如旧版不认 --from-dir、默认路径也不一样），所以先比一下。
-INSTALLED="/usr/local/bin/claw-cli-mirror-sync"
+INSTALLED="/usr/local/bin/agentsbb-cli-mirror-sync"
 if [ -f "$INSTALLED" ] && [ "$INSTALLED" != "$0" ]; then
   if [ "$(SHA256_OF "$INSTALLED")" != "$(SHA256_OF "$0")" ]; then
     warn "$INSTALLED 与当前脚本版本不同。建议先同步：install -m 755 \"$0\" $INSTALLED"
@@ -117,7 +123,7 @@ cleanup_bundle() { if [ -n "${BUNDLE_ROOT:-}" ]; then rm -rf "$BUNDLE_ROOT"; fi;
 
 if [ -n "$BUNDLE" ]; then
   [ -f "$BUNDLE" ] || die "--bundle 指向的文件不存在：$BUNDLE
-      这个包由本机跑 claw-cli-mirror-fetch.ps1 产出，必须先上传到服务器（例如 /tmp）。"
+      这个包由本机跑 agentsbb-cli-mirror-fetch.ps1 产出，必须先上传到服务器（例如 /tmp）。"
   command -v tar >/dev/null 2>&1 || die "需要 tar"
   if [ "$DRY_RUN" -eq 1 ]; then
     log "dry-run：$BUNDLE 里是这些文件——"
@@ -262,18 +268,18 @@ if [ -z "$FROM_DIR" ]; then
   if [ -z "$TAG" ]; then
     warn "拿不到最新版本号 —— 这台机器出不了网，联网模式不可用（不是包的问题）。"
     log ""
-    if ls /tmp/claw-cli-mirror-*.tar.gz >/dev/null 2>&1; then
+    if ls /tmp/agentsbb-cli-mirror-*.tar.gz >/dev/null 2>&1; then
       log "不过 /tmp 里已经有打好的包，直接喂给它就行，不用手工解包："
-      for f in /tmp/claw-cli-mirror-*.tar.gz; do
+      for f in /tmp/agentsbb-cli-mirror-*.tar.gz; do
         log "  $0 --bundle $f"
       done
       log ""
       die "把上面那条命令改成带 --bundle 重跑即可（本次未做任何改动）"
     fi
     log "当前这台机器上没有可用的安装包。正确顺序是："
-    log "  1) 本机（能上网的那台）跑 claw-cli-mirror-fetch.ps1，产出 claw-cli-mirror-<版本>.tar.gz"
+    log "  1) 本机（能上网的那台）跑 agentsbb-cli-mirror-fetch.ps1，产出 agentsbb-cli-mirror-<版本>.tar.gz"
     log "  2) 把这个包上传到服务器，例如 /tmp/"
-    log "  3) $0 --bundle /tmp/claw-cli-mirror-<版本>.tar.gz"
+    log "  3) $0 --bundle /tmp/agentsbb-cli-mirror-<版本>.tar.gz"
     die "没有可用的安装包，未做任何改动"
   fi
   log "  latest = $TAG"
@@ -364,7 +370,7 @@ if [ -z "$TAG" ]; then
   fi
   if [ -z "$TAG" ]; then
     TAG="unknown"
-    warn "版本号未知，dl/VERSION 会写成 unknown；下次请带 --tag clawmessenger-vX.Y.Z"
+    warn "版本号未知，dl/VERSION 会写成 unknown；下次请带 --tag agentsbb-vX.Y.Z"
   fi
 fi
 printf '%s\n' "$TAG" > "$STAGE/VERSION"

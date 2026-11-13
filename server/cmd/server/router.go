@@ -1640,7 +1640,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// a single-use high-entropy secret, and an optional client claim key in
 	// the body must match the one bound at session creation.
 	r.Post("/api/claw/pairing/{ticket}/claim", h.ClaimRongCloudPairing)
-	// clawmessenger pairing creation/polling for the legacy ClawMessenger web app.
+	// agentsbb pairing creation/polling for the legacy AgentsBB web app.
 	// Authenticated by the legacy Bearer token (claw_im_users.rongcloud_token),
 	// not the Multica session.
 	r.Post("/api/claw/pairing", h.ClawCreatePairing)
@@ -1657,11 +1657,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 存在后台配置里，改文案不用重新发前端包。
 	r.Get("/api/claw/onboarding-prompt", h.ClawOnboardingPrompt)
 	r.Post("/api/claw/device/nodes", h.ClawDeviceNodes)
-	// clawmessenger supervisor auto-binds its built-in ops agent on the paired
+	// agentsbb supervisor auto-binds its built-in ops agent on the paired
 	// machine via this device-credential-authenticated endpoint.
 	r.Post("/api/claw/device/bind-agents", h.ClawDeviceBindAgents)
 	r.Post("/api/claw/device/heartbeat", h.ClawDeviceHeartbeat)
-	// clawmessenger supervisor 轮询管理端下发的期望运行状态（启停）。走 HTTP 而不是
+	// agentsbb supervisor 轮询管理端下发的期望运行状态（启停）。走 HTTP 而不是
 	// IM：能真正拉起/杀掉 agent 的 supervisor 主进程不持有融云连接，且被停掉的子进程
 	// 没有任何进程能收到「启动」。详见 internal/handler/claw_device_control.go。
 	r.Post("/api/claw/device/control", h.ClawDeviceControl)
@@ -1706,8 +1706,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/claw/contact-remarks", h.ClawListContactRemarks)
 	r.Put("/api/claw/contact-remarks", h.ClawUpdateContactRemark)
 
-	// ClawMessenger (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
-	// 供 clawmessenger-web / clawmessenger-uniapp 前端直连。
+	// AgentsBB (虾说) compatibility API — 移植自旧 Python 后端的公开契约，
+	// 供 agentsbb-web / agentsbb-uniapp 前端直连。
 	r.Post("/api/register", h.ClawRegister)
 	r.Post("/api/login", h.ClawLogin)
 	// Web 扫码登录三件套（移植自旧 Python app.py:1133-1210）。公开路由：二维码
@@ -1760,7 +1760,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/quota/me", h.ClawGetMyQuota)
 	r.Get("/api/my/discussions", h.ClawListMyDiscussions)
 
-	// ClawMessenger admin (虾说后台) compatibility API — /api/admin/*
+	// AgentsBB admin (虾说后台) compatibility API — /api/admin/*
 	r.Post("/api/admin/auth/login", h.ClawAdminLogin)
 	r.Post("/api/admin/auth/refresh", h.ClawAdminRefresh)
 	r.Post("/api/admin/auth/logout", h.ClawAdminLogout)

@@ -1,55 +1,63 @@
-# Publishes the clawmessenger CLI (packages/xiachat-cli) as standalone Node SEA
+# Publishes the AgentsBB CLI (packages/xiachat-cli) as standalone Node SEA
 # executables via GitHub Releases.
 #
-# Trigger: pushing a tag named clawmessenger-v*.*.* (for example
-# clawmessenger-v0.1.0). This deliberately avoids the main release.yml trigger
-# (v*.*.*) so the CLI can ship independently from the server/web/desktop
-# release train.
+# Trigger: pushing a tag named agentsbb-v*.*.* (for example agentsbb-v0.1.0).
+# This deliberately avoids the main release.yml trigger (v*.*.*) so the CLI can
+# ship independently from the server/web/desktop release train.
+#
+# 过渡期双名单：同一份二进制同时以 agentsbb-*（新）与 clawmessenger-*（旧）两套
+# 资产名上传，SHA256SUMS 一份列全。旧名单的存在意义只有一个：让还没升级的
+# 1.3.x 客户端（自更新里写死了 clawmessenger-* 资产名）还能拉到最后几个版本，
+# 升级后它自己就会接管成 agentsbb。旧 tag 前缀 clawmessenger-v*.*.* 也仍然触发。
+# TODO(rebrand-retire): v1.6.0 随 `clawmessenger` 垫片一起删掉旧前缀触发与
+# 「Legacy asset aliases」步骤。
 #
 # The SEA build copies the build machine's node binary into the executable,
 # so cross-compilation is impossible — each target needs its own runner.
-name: clawmessenger release
+name: agentsbb release
 
 on:
   push:
     tags:
+      - "agentsbb-v*.*.*"
+      # TODO(rebrand-retire): 旧 tag 前缀，v1.6.0 删除
       - "clawmessenger-v*.*.*"
 
 permissions:
   contents: write
 
 concurrency:
-  group: clawmessenger-release-${{ github.ref }}
+  group: agentsbb-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: Build (${{ matrix.name }})
     # Guard against forks of this repository running the release pipeline.
-    if: github.repository == 'clawmessenger/claw-messenger'
+    if: github.repository == 'clawmessenger/agentsbb'
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             name: windows-x64
-            artifact: clawmessenger-windows-x64.exe
-            source: dist/clawmessenger.exe
+            artifact: agentsbb-windows-x64.exe
+            source: dist/agentsbb.exe
           - os: ubuntu-latest
             name: linux-x64
-            artifact: clawmessenger-linux-x64
-            source: dist/clawmessenger
+            artifact: agentsbb-linux-x64
+            source: dist/agentsbb
           - os: ubuntu-24.04-arm
             name: linux-arm64
-            artifact: clawmessenger-linux-arm64
-            source: dist/clawmessenger
+            artifact: agentsbb-linux-arm64
+            source: dist/agentsbb
           # darwin-x64 (Intel) dropped: GitHub retired the macos-13 Intel
           # runners, so that matrix entry queues forever. Intel Macs are not
           # supported (pre-2020 machines); modern Macs use darwin-arm64.
           - os: macos-latest
             name: darwin-arm64
-            artifact: clawmessenger-darwin-arm64
-            source: dist/clawmessenger
+            artifact: agentsbb-darwin-arm64
+            source: dist/agentsbb
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -73,28 +81,35 @@ jobs:
       # to package.json instead, every device that upgrades to 1.3.0 keeps
       # reporting 1.2.0, the post-restart check reports failed/restart_failed,
       # and the admin page shows the update as broken while it actually worked.
-      # Strip the `clawmessenger-v` prefix (tag = clawmessenger-v1.3.0).
+      # Strip the `agentsbb-v` prefix (tag = agentsbb-v1.3.0).
       # A tag that does not match the expected shape fails the job instead of
       # silently falling back to package.json — the whole point of this step is
       # that the version inside the binary is derived from the tag, never
-      # guessed. `GITHUB_REF_NAME` is `clawmessenger-v1.3.0` here (see `on.push.tags`).
+      # guessed. `GITHUB_REF_NAME` is `agentsbb-v1.3.0` here (see `on.push.tags`).
       - name: Resolve version
         id: version
         shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          version="${tag#clawmessenger-v}"
+          # 新旧两种前缀都接受（旧前缀只在过渡期触发）。
+          version="${tag#agentsbb-v}"
+          if [[ "$version" == "$tag" ]]; then
+            version="${tag#clawmessenger-v}"
+            echo "::notice::legacy tag prefix '$tag' — publishing as agentsbb $version"
+          fi
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::tag '$tag' is not clawmessenger-v<major>.<minor>.<patch>"
+            echo "::error::tag '$tag' is not agentsbb-v<major>.<minor>.<patch>"
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "building clawmessenger $version (tag $tag)"
+          echo "building agentsbb $version (tag $tag)"
 
       - name: Build SEA executable
         env:
-          CLAWMESSENGER_VERSION: ${{ steps.version.outputs.value }}
+          # build-exe.mjs 双读 AGENTSBB_VERSION ?? CLAWMESSENGER_VERSION（TODO(rebrand-retire)），
+          # 这里只注入新名。
+          AGENTSBB_VERSION: ${{ steps.version.outputs.value }}
         run: pnpm --filter @quukk/xiachat-cli build:exe
 
       # Gate 1, on the entry bundle: deterministic and side-effect free (plain
@@ -117,7 +132,7 @@ jobs:
           EXPECTED: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          bundle="packages/xiachat-cli/dist/clawmessenger.sea.cjs"
+          bundle="packages/xiachat-cli/dist/agentsbb.sea.cjs"
           if [[ ! -f "$bundle" ]]; then
             echo "::error::build:exe did not produce $bundle"
             exit 1
@@ -159,7 +174,7 @@ jobs:
       # `--version` is handled before any command action, so it cannot install
       # or mutate anything (`ensureInstalled` is best-effort and only copies the
       # binary), and `matrix.source` is the built artifact path
-      # (dist/clawmessenger.exe on Windows, dist/clawmessenger elsewhere).
+      # (dist/agentsbb.exe on Windows, dist/agentsbb elsewhere).
       #
       # 采集方式与 Gate 1 相同：重定向到文件，不用命令替换（见上面的注释）。
       - name: Verify embedded version
@@ -227,7 +242,7 @@ jobs:
   release:
     name: Create GitHub release
     needs: build
-    if: github.repository == 'clawmessenger/claw-messenger'
+    if: github.repository == 'clawmessenger/agentsbb'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -241,39 +256,69 @@ jobs:
 
       # Windows users get the background-daemon wrapper next to the exe, so the
       # agents can stay online without a foreground console window.
+      #
+      # 压缩包里同时放旧名垫片：老运维手册/脚本还在跑 `clawmessenger-daemon.cmd`
+      # （或 `.ps1`），包里没有它就会「升级后照着手册跑，文件不存在」。
+      # TODO(rebrand-retire): v1.6.0 去掉两个 clawmessenger-daemon.*。
       - name: Bundle Windows daemon scripts
         shell: bash
         run: |
           set -euo pipefail
-          zip -9 -j artifacts/clawmessenger-windows-x64-daemon-scripts.zip \
+          zip -9 -j artifacts/agentsbb-windows-x64-daemon-scripts.zip \
+            packages/xiachat-cli/scripts/win/agentsbb-daemon.ps1 \
+            packages/xiachat-cli/scripts/win/agentsbb-daemon.cmd \
             packages/xiachat-cli/scripts/win/clawmessenger-daemon.ps1 \
             packages/xiachat-cli/scripts/win/clawmessenger-daemon.cmd
-          unzip -l artifacts/clawmessenger-windows-x64-daemon-scripts.zip
+          unzip -l artifacts/agentsbb-windows-x64-daemon-scripts.zip
 
       # Linux/macOS users get the same capability: a daemon wrapper that detaches
       # from the shell (nohup/setsid) and can register a systemd service.
+      # TODO(rebrand-retire): v1.6.0 去掉 clawmessenger-daemon.sh 垫片。
       - name: Bundle Linux/macOS daemon scripts
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh
-          tar -czf artifacts/clawmessenger-linux-daemon-scripts.tar.gz \
-            -C packages/xiachat-cli/scripts/linux clawmessenger-daemon.sh
-          tar -tzvf artifacts/clawmessenger-linux-daemon-scripts.tar.gz
+          chmod +x packages/xiachat-cli/scripts/linux/agentsbb-daemon.sh \
+            packages/xiachat-cli/scripts/linux/clawmessenger-daemon.sh
+          tar -czf artifacts/agentsbb-linux-daemon-scripts.tar.gz \
+            -C packages/xiachat-cli/scripts/linux agentsbb-daemon.sh clawmessenger-daemon.sh
+          tar -tzvf artifacts/agentsbb-linux-daemon-scripts.tar.gz
 
+      # 旧名单别名：字节完全相同的第二份文件名，只为了让 1.3.x 客户端
+      # 的自更新（写死了 clawmessenger-* 资产名）还能拉到本版本。
+      # 哈希与主名单完全一致，所以 SHA256SUMS 里两套名都会出现。
+      # TODO(rebrand-retire): v1.6.0 删除整个步骤。
+      - name: Legacy asset aliases
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for f in agentsbb-*; do
+            legacy="clawmessenger-${f#agentsbb-}"
+            cp -f "$f" "$legacy"
+            echo "alias: $f -> $legacy"
+          done
+          ls -l
+
+      # 一份 SHA256SUMS 列全新旧两套名字（内容相同的两行哈希也相同）。
+      # 显式列出通配符，避免把 SHA256SUMS 自己也算进去。
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd artifacts
-          sha256sum clawmessenger-* | tee SHA256SUMS
+          sha256sum agentsbb-* clawmessenger-* | tee SHA256SUMS
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          NOTES="$(printf 'Standalone clawmessenger CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: clawmessenger-windows-x64.exe (rename to clawmessenger.exe if you like). macOS/Linux: chmod +x before first run.\n\nWindows only: clawmessenger-windows-x64-daemon-scripts.zip keeps the agents running in the background, so closing the console no longer takes them offline. Unzip next to the exe and run `clawmessenger-daemon.cmd start` (also: stop / restart / status / logs / install-startup / install / uninstall).\n\nLinux/macOS: clawmessenger-linux-daemon-scripts.tar.gz does the same -- the agents stay online after you close the shell. Untar and run `./clawmessenger-daemon.sh start`; `install-service` registers a systemd unit (boot start + crash restart). Also: stop / restart / status / logs / uninstall.\n\n'; cat artifacts/SHA256SUMS)"
+          VERSION="${TAG#agentsbb-v}"
+          if [[ "$VERSION" == "$TAG" ]]; then VERSION="${TAG#clawmessenger-v}"; fi
+          NOTES="$(printf 'Standalone AgentsBB CLI builds (Node SEA executables).\n\nDownload the binary for your platform from the assets below; see SHA256SUMS for checksums. Windows: agentsbb-windows-x64.exe. macOS/Linux: chmod +x before first run.\n\nWindows only: agentsbb-windows-x64-daemon-scripts.zip keeps the agents running in the background, so closing the console no longer takes them offline. Unzip next to the exe and run `agentsbb-daemon.cmd start` (also: stop / restart / status / logs / install-startup / install / uninstall).\n\nLinux/macOS: agentsbb-linux-daemon-scripts.tar.gz does the same -- the agents stay online after you close the shell. Untar and run `./agentsbb-daemon.sh start`; `install-service` registers a systemd unit (boot start + crash restart). Also: stop / restart / status / logs / uninstall.\n\nLegacy names: the `clawmessenger-*` assets are byte-identical copies of the `agentsbb-*` ones, kept so pre-rebrand clients can still self-update once. They are deprecated and will be removed soon; the `clawmessenger` command itself prints a warning and forwards to `agentsbb`.\n\n'; cat artifacts/SHA256SUMS)"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "clawmessenger ${TAG#clawmessenger-v}" \
+            --title "AgentsBB ${VERSION}" \
             --notes "$NOTES" \
             artifacts/*

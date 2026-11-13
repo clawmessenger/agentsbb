@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "clawmessenger": "./dist/bin.js"
+    "agentsbb": "./dist/bin.js",
+    "clawmessenger": "./dist/shim.js"
   },
   "engines": {
     "node": ">=20"

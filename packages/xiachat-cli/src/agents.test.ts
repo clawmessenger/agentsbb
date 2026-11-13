@@ -1703,7 +1703,7 @@ describe("runAgentTurn", () => {
     const prevServer = process.env.CLAWMESSENGER_OPENCODE_SERVER;
     const prevFull = process.env.CLAWMESSENGER_OPENCODE_FULL_CONFIG;
     delete process.env.CLAWMESSENGER_OPENCODE_SERVER;
-    // 别在测试里派生设备端配置（那会动 ~/.clawmessenger）。
+    // 别在测试里派生设备端配置（那会动 ~/.agentsbb）。
     process.env.CLAWMESSENGER_OPENCODE_FULL_CONFIG = "1";
     const answer = JSON.stringify({ type: "text", part: { id: "p1", type: "text", text: "老版本也能答" } });
     const fixture = createEchoAgentScript("opencode", { stdoutText: `${answer}\n` });
@@ -2003,12 +2003,12 @@ describe("deviceOpencodeConfigPath", () => {
     const home = join(tmpdir(), "cm-home");
     // 聊天轮次：老路径，升级前后完全一致（既有设备不受影响）。
     expect(deviceOpencodeConfigPath("opencode_673", home))
-      .toBe(join(home, ".clawmessenger", "opencode-device-opencode_673.json"));
+      .toBe(join(home, ".agentsbb", "opencode-device-opencode_673.json"));
     // 精简回合：独立文件 —— 共用的话，私聊/群聊的 agent 会跟着丢掉工具与人设。
     expect(deviceOpencodeConfigPath("opencode_673", home, true))
-      .toBe(join(home, ".clawmessenger", "opencode-device-opencode_673-lean.json"));
+      .toBe(join(home, ".agentsbb", "opencode-device-opencode_673-lean.json"));
     // 没有 agent 名的老调用方：整机一份，同样带后缀。
     expect(deviceOpencodeConfigPath(undefined, home, true))
-      .toBe(join(home, ".clawmessenger", "opencode-device-lean.json"));
+      .toBe(join(home, ".agentsbb", "opencode-device-lean.json"));
   });
 });

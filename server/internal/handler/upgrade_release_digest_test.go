@@ -48,7 +48,7 @@ type clawDigestFakeAsset struct {
 }
 
 // clawDigestFakeGitHub 起一个离线的假 Releases API：
-//   - `/repos/.../releases/latest` 回 tag `clawmessenger-v1.4.0` 与给定 assets，
+//   - `/repos/.../releases/latest` 回 tag `agentsbb-v1.4.0` 与给定 assets，
 //     URL 里的 `{HOST}` 会替换成这个假服务的地址（SUMS 的下载地址必须落在假服务
 //     上，否则用例会真的去下载）；
 //   - `/sums` 交给 sums 处理（nil = 该资产压根没提供，下载路径不该被请求到）；
@@ -74,7 +74,7 @@ func clawDigestFakeGitHub(t *testing.T, assets []clawDigestFakeAsset, sums http.
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"tag_name": "clawmessenger-v1.4.0",
+				"tag_name": "agentsbb-v1.4.0",
 				"assets":   payload,
 			})
 		case r.URL.Path == "/sums":
@@ -323,7 +323,7 @@ func TestClawUpgradeFetchLatestKeepsDigestWhenSumsBodyReadFails(t *testing.T) {
 // 拒绝必须发生在上层（下发那一刻 `len(sum) != 64`），但解析层不能凭空造一个
 // 摘要出来 —— 那等于放行一个无法校验的二进制。
 func TestClawUpgradeFetchLatestLeavesAssetWithoutDigestWhenBothSourcesMiss(t *testing.T) {
-	const linuxAsset = "clawmessenger-linux-x64"
+	const linuxAsset = "agentsbb-linux-x64"
 
 	cases := []struct {
 		name   string
@@ -414,7 +414,7 @@ func TestClawUpgradeParseAssetDigestAcceptsOnlySHA256With64Hex(t *testing.T) {
 // 回归面：改动前 SHA256 就是 SUMS 的内容。加入 digest 合并后，这条路径的返回值
 // 必须一个字都不变（多出来的只有「SUMS 缺的资产」）。
 func TestClawUpgradeFetchLatestKeepsSumsResultWhenDigestAgrees(t *testing.T) {
-	const linuxAsset = "clawmessenger-linux-x64"
+	const linuxAsset = "agentsbb-linux-x64"
 
 	srv, _ := clawDigestFakeGitHub(t, []clawDigestFakeAsset{
 		clawDigestWindowsAsset("sha256:" + clawDigestTestHex),
@@ -438,7 +438,7 @@ func TestClawUpgradeFetchLatestKeepsSumsResultWhenDigestAgrees(t *testing.T) {
 	if got := len(release.SHA256); got != 2 {
 		t.Fatalf("SHA256 条目数 = %d，期望 2（合并只增不减、不写空值）: %v", got, release.SHA256)
 	}
-	if release.Version != "1.4.0" || release.Tag != "clawmessenger-v1.4.0" {
+	if release.Version != "1.4.0" || release.Tag != "agentsbb-v1.4.0" {
 		t.Fatalf("版本解析被影响: version=%q tag=%q", release.Version, release.Tag)
 	}
 }
@@ -482,7 +482,7 @@ func TestClawUpgradeFetchLatestCollectsDigestForAssetWithoutDownloadURL(t *testi
 // SUMS 里只有 linux，digest 只有 windows：两个都要在，且各自是自己的值。
 // 这条同时反向验证了「只补缺」：不是「有 SUMS 就整体忽略 digest」。
 func TestClawUpgradeFetchLatestDigestFillsOnlyAssetsMissingFromSums(t *testing.T) {
-	const linuxAsset = "clawmessenger-linux-x64"
+	const linuxAsset = "agentsbb-linux-x64"
 
 	srv, _ := clawDigestFakeGitHub(t, []clawDigestFakeAsset{
 		clawDigestWindowsAsset("sha256:" + clawDigestTestHex),
@@ -536,7 +536,7 @@ func TestClawUpgradeExpectedSumReadsDigestFallbackFromCachedRelease(t *testing.T
 		t.Fatalf("非 latest 版本必须返回空摘要，got %q", got)
 	}
 	// 该版本没有摘要的资产同理。
-	if got := clawUpgradeExpectedSum(release.Version, "clawmessenger-linux-arm64"); got != "" {
+	if got := clawUpgradeExpectedSum(release.Version, "agentsbb-linux-arm64"); got != "" {
 		t.Fatalf("没有摘要的资产必须返回空，got %q", got)
 	}
 	// 冷启动（缓存还没成功过）不许 panic，也不许编一个摘要出来。
