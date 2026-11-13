@@ -4,7 +4,7 @@ package handler
 // claw-cli-mirror-sync.sh」这件事搬进后台。
 //
 // 镜像是什么：GitHub Release 里的 CLI 安装包（4 个平台二进制 + 2 个守护脚本
-// 压缩包 + SHA256SUMS），落在服务器磁盘上，经 nginx 以 /claw-web/dl/latest/
+// 压缩包 + SHA256SUMS），落在服务器磁盘上，经 nginx 以 /dl/latest/
 // 对外提供，给访问不到 GitHub 的设备当备用下载源。目录布局与同步脚本一致：
 //
 //	$CLAW_MIRROR_DIR/latest/   当前对外服务的资产（webroot 里的 dl 符号链接指向这里）
@@ -18,7 +18,7 @@ package handler
 //
 // 安全面：文件名白名单（不接受任意名字落盘）、版本号 ^\d+\.\d+\.\d+$（会被拼进
 // URL 与 JSON）、逐文件 sha256 对照 SHA256SUMS，校验不过绝不清掉现有 latest。
-// 对外 URL 基址由 CLAW_MIRROR_PUBLIC_BASE（缺省 CLAW_PUBLIC_BASE_URL + /claw-web/dl）
+// 对外 URL 基址由 CLAW_MIRROR_PUBLIC_BASE（缺省 CLAW_PUBLIC_BASE_URL + /dl）
 // 提供，写进 latest-release.json。
 
 import (
@@ -43,7 +43,7 @@ const (
 	// clawMirrorDirEnv 指定镜像根目录。未配置 = 本部署不提供镜像功能，
 	// 四个端点一起 503 —— 与下载代理的 fail-closed 同一姿态：猜路径比不做事危险。
 	clawMirrorDirEnv = "CLAW_MIRROR_DIR"
-	// clawMirrorPublicBaseEnv 是对外基址（到 /claw-web/dl 这一层，不含 /latest）。
+	// clawMirrorPublicBaseEnv 是对外基址（到 /dl 这一层，不含 /latest）。
 	clawMirrorPublicBaseEnv = "CLAW_MIRROR_PUBLIC_BASE"
 	// clawPublicBaseEnv 是站点基址的通用 env（branding 也用它），缺省拼接用。
 	clawPublicBaseEnv = "CLAW_PUBLIC_BASE_URL"
@@ -157,8 +157,8 @@ func clawMirrorDir() string {
 	return strings.TrimSpace(os.Getenv(clawMirrorDirEnv))
 }
 
-// clawMirrorPublicBase 推导对外基址（到 /claw-web/dl 层）。
-// 顺序：CLAW_MIRROR_PUBLIC_BASE → CLAW_PUBLIC_BASE_URL + /claw-web/dl。
+// clawMirrorPublicBase 推导对外基址（到 /dl 层）。
+// 顺序：CLAW_MIRROR_PUBLIC_BASE → CLAW_PUBLIC_BASE_URL + /dl。
 // 都没有时返回空串 —— latest-release.json 没有可信的对外地址就不该写，
 // 写一份指向错误域名的清单比不写更糟（安装脚本会真的去下）。
 func clawMirrorPublicBase() string {
@@ -166,7 +166,7 @@ func clawMirrorPublicBase() string {
 		return v
 	}
 	if v := strings.TrimRight(strings.TrimSpace(os.Getenv(clawPublicBaseEnv)), "/"); v != "" {
-		return v + "/claw-web/dl"
+		return v + "/dl"
 	}
 	return ""
 }

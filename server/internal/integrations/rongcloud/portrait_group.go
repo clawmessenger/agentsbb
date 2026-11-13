@@ -38,8 +38,8 @@ const (
 )
 
 // DefaultGroupPortraitBaseURL 是三张群类默认图的发布位置（web 产物的
-// public/group-avatars/，部署后即 /claw-web/group-avatars/）。
-const DefaultGroupPortraitBaseURL = "https://agents.quukk.com/claw-web/group-avatars"
+// public/group-avatars/，部署后即站点根 /group-avatars/）。
+const DefaultGroupPortraitBaseURL = "https://agentsbb.quukk.com/group-avatars"
 
 // GroupPortraitBaseEnv 覆盖三张群类默认图的基址（自建域名 / CDN）。
 const GroupPortraitBaseEnv = "CLAW_GROUP_PORTRAIT_BASE"

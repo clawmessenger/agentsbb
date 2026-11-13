@@ -32,6 +32,9 @@ export const LEGACY_SERVER_URLS: readonly string[] = [
   // 同一主机的 http 变体：DNS 已经切走，http 也只会解析失败 / 被跳到别处，
   // 迁到新域名的 https 严格更优，没有理由把它留在清单外。
   "http://clawmessenger.quukk.com",
+  // 1.3.36 短命版本的默认值（指向的是跳官网的域名，从未真正服务过本产品）。
+  // 装过那一版的设备凭据里存着这个值，必须一并迁走。
+  "https://agents.quukk.com",
 ];
 
 /** 旧域名 → 新域名的迁移计划（纯数据，便于测试与复用）。 */

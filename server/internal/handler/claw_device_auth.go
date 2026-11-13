@@ -48,10 +48,10 @@ const (
 	//
 	// 刻意**不**再用 `legacyClawWebHost + legacyClawWebPath` 拼出来（以前是这么拼的）：
 	// 上面那对常量只服务一件事 —— 识别「仍在服役的老部署」发来的请求、给它补回
-	// /claw-web 挂载点。把它们拼成兜底值会让**新部署**（agents.quukk.com，web 在
-	// 站点根）也生成 `https://agents.quukk.com/claw-web/pair?...` 这种 404 链接。
+	// /claw-web 挂载点。把它们拼成兜底值会让**新部署**（agentsbb.quukk.com，web 在
+	// 站点根）也生成 `https://agentsbb.quukk.com/claw-web/pair?...` 这种 404 链接。
 	// 兜底值只能属于一个部署，那就是我们现在发的这个。
-	defaultClawWebBaseURL = "https://agents.quukk.com"
+	defaultClawWebBaseURL = "https://agentsbb.quukk.com"
 )
 
 // devicePairRateWindow / devicePairRateMax cap anonymous session creation

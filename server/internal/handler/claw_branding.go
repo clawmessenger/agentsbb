@@ -45,7 +45,7 @@ const brandingConfigKey = "branding"
 
 // defaultBrandingLogoURL 是未配置时的 Logo 图源（与 web `public/logo.png` 同图）。
 // 运维要换域名/C DN 时改 env，不必动代码 —— 与 GroupPortraitBase 同一套思路。
-const defaultBrandingLogoURL = "https://agents.quukk.com/claw-web/logo.png"
+const defaultBrandingLogoURL = "https://agentsbb.quukk.com/logo.png"
 
 // brandingLogoEnv 覆盖内置 Logo 图源。
 const brandingLogoEnv = "CLAW_BRANDING_LOGO_URL"

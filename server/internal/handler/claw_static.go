@@ -19,7 +19,7 @@ import (
 // 使用同一张默认头像，图源与 env 优先级的唯一定义在
 // rongcloud.DefaultUserPortrait()，本文件只做转发，避免两处漂移：
 //  1. CLAW_DEFAULT_PORTRAIT_URI 环境变量（自建域名/CDN 时覆盖）
-//  2. 统一图源 newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user.png
+//  2. 统一图源 agentsbb.quukk.com/default_user.png
 //
 // （CLAW_AI_NODE_PORTRAIT_URI 已废弃删除：它会让 AI 与真人各用一张默认图。）
 //

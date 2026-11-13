@@ -1742,7 +1742,7 @@ func DefaultAgentNodeName(agent string) string {
 // 融云侧只回显它自己存的 portraitUri，图源必须唯一，否则各入口一漂移就是各端
 // 看到不同默认图。
 //
-// 2026-11-13 主域名切换：由 newsradar 老站改成 agents.quukk.com 的站点根。
+// 2026-11-13 主域名切换：由 newsradar 老站改成 agentsbb.quukk.com 的站点根。
 //
 // 这是**输出**值，不只是识别值：真人/节点注册、建群建聊天室、`backfill-friends`
 // 的目标值、以及 `GET /api/config/branding` 下发的 `user_avatar` 全都取它（web 的
@@ -1752,7 +1752,7 @@ func DefaultAgentNodeName(agent string) string {
 // ⚠️ 改这个常量时**必须同时把旧值追加进 legacyDefaultPortraitURIs**：旧值一旦离开
 // 常量位，就既不是「当前默认图」、也不在 legacy 清单、更不匹配 LegacyDefaultPortraitPath，
 // NeedsDefaultPortrait 会把它判成「用户自选头像」而永久跳过 —— backfill 再也刷不回来。
-const DefaultUserPortraitURI = "https://agents.quukk.com/default_user.png"
+const DefaultUserPortraitURI = "https://agentsbb.quukk.com/default_user.png"
 
 // LegacyDefaultPortraitPath 是旧默认头像的免鉴权静态路由。旧部署用
 // <MULTICA_PUBLIC_URL> + 该路径拼出任意 host，所以存量识别按 URL path 精确命中，

@@ -372,7 +372,7 @@ func TestNeedsDefaultPortraitMatrix(t *testing.T) {
 	}
 }
 
-// 换默认图域名（2026-11-13 newsradar → agents.quukk.com）之后，库存里那批
+// 换默认图域名（2026-11-13 newsradar → agentsbb.quukk.com）之后，库存里那批
 // **旧常量值**必须仍被认出是「我们的默认图」。
 //
 // 这是换域名唯一的正向迁移路径：旧值已经不在 DefaultUserPortraitURI 上，只能靠

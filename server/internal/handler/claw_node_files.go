@@ -27,7 +27,7 @@ import (
 //	GET  /api/claw/files/{key} 按 key 读回文件（公开、不可枚举）
 //
 // 为什么读回走 /api/claw/files/{key} 而不是复用现成的 /uploads/*：
-// 线上 nginx 只把 /claw-web/api/* 反代到本服务，/claw-web/uploads/* 命中的是
+// 线上 nginx 只把 /api/* 反代到本服务，/uploads/* 命中的是
 // 前端 SPA 的 index.html，因此存储层返回的相对 URL（/uploads/xxx）在前端根本
 // 取不到。挂在 /api 下则无论同源前缀是什么都能被前端直接引用（<img src> /
 // iframe / fetch 都不需要额外配置）。key 是 uuid7 + 严格白名单校验，不可枚举、
