@@ -23,8 +23,12 @@
 //     会留下孤儿的 agent 子进程，所以这条路径不用它）。
 //   * 自启：Linux 写 systemd unit（root → 系统级 / 普通用户 → --user + linger），
 //     macOS 写 LaunchAgent plist，Windows 写「启动」文件夹里的 .vbs（免管理员）。
+//   * Windows 崩溃自愈的第二层：计划任务每 5 分钟跑一次 `watchdog` 单次检查；
+//     schtasks 被安全策略拦掉的机器装不上任务，降级为 VBS 里的 loop 行拉起
+//     `watchdog --loop` 常驻进程（30 秒一查，见 WATCHDOG_LOOP_INTERVAL_MS）。
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -61,13 +65,56 @@ export const WATCHDOG_TASK_NAME = "agentsbb-watchdog";
 export const WATCHDOG_INTERVAL_MINUTES = 5;
 
 /**
+ * 常驻看门狗循环的检查间隔（毫秒）。
+ *
+ * `agentsbb watchdog --loop` 的节奏：进程常驻，每 30 秒确认一次 supervisor
+ * 是否存活。它是计划任务看门狗（每 5 分钟）的降级替代 —— 有些机器的安全策略
+ * 直接拦掉 `schtasks.exe`，计划任务永远装不上，唯一的兜底就是这个常驻进程。
+ * 30 秒意味着最坏下线半分钟，比计划任务的 5 分钟好一个数量级；代价是一个
+ * 长驻进程，而那正是「降级」的含义。
+ */
+export const WATCHDOG_LOOP_INTERVAL_MS = 30_000;
+
+/**
+ * 常驻看门狗的单实例锁文件名（落在 stateDir 下）。
+ *
+ * VBS 里写的 loop 行每次登录都会拉起一份 loop，手工误跑 `watchdog --loop` 也
+ * 会再起一份 —— 两份同时循环没有大害（start 自带幂等），但白烧内存还互相
+ * 写同一份日志，所以用 pid 锁文件把并发收敛到一份。
+ */
+export const WATCHDOG_LOOP_PID_FILE = "watchdog-loop.pid";
+
+/**
  * 登录自启脚本的模板版本标记。
  *
  * `install-service` 落盘的 VBS 里带这一行；**旧模板没有**。supervisor 每次启动都
  * 检查一次这个标记 —— 远程升级不会重写 VBS，只有靠这个检查才能让存量设备在
  * 「下一次启动」就拿到自愈块（审查报告 M3a）。
+ *
+ * v3 相比 v2 的增量：纳入了「常驻看门狗 loop 行」的写入与就地补丁机制（见
+ * STARTUP_VBS_WATCHDOG_LOOP_MARKER）。注意 v3 模板落盘时**不一定**含 loop 行 ——
+ * schtasks 注册成功时不需要它，只有降级路径才会把 loop 行补进去。
  */
-export const STARTUP_VBS_TEMPLATE_MARKER = "agentsbb-vbs-template: 2 (self-heal)";
+export const STARTUP_VBS_TEMPLATE_MARKER = "agentsbb-vbs-template: 3 (self-heal + watchdog-loop)";
+
+/**
+ * 上一版（v2）模板的标记。
+ *
+ * 存量设备磁盘上是它；refreshStartupScript 认得出这个形状时**不重插自愈块**
+ * （已经有了），只补 loop 行并把标记行升级到 v3。留着这个常量而不是用
+ * includes("vbs-template: 2") 之类的散字符串，是为了让「还有哪些旧版本要兼容」
+ * 只看这一处。
+ */
+export const STARTUP_VBS_TEMPLATE_MARKER_V2 = "agentsbb-vbs-template: 2 (self-heal)";
+
+/**
+ * VBS 里常驻看门狗 loop 行的独立标记。
+ *
+ * 为什么不复用模板版本标记判幂等：v3 模板落盘时可能**不含** loop 行（schtasks
+ * 注册成功的机器），也可能含（降级机器）。只有这个独立标记能准确回答
+ * 「这份 VBS 会不会拉起 loop」，install-service 的降级写入与就地补丁都用它判重。
+ */
+export const STARTUP_VBS_WATCHDOG_LOOP_MARKER = "agentsbb-vbs-watchdog-loop: 1";
 
 /**
  * VBS 里的自愈块：target 不存在就从同目录的 `.old-*` / `.new-*` 里挑最新的一个
@@ -121,11 +168,46 @@ export function startupVbsSelfHealLines(exePath: string): string[] {
  * 一起冲掉（审查报告 M3a 的「别无脑覆盖」）。
  */
 export function injectStartupVbsSelfHeal(content: string, exePath: string): string | null {
-  if (content.includes(STARTUP_VBS_TEMPLATE_MARKER)) return null;
+  // v2 模板已经有自愈块：重插会写坏脚本（两个 exePath 赋值），直接拒绝。
+  if (content.includes(STARTUP_VBS_TEMPLATE_MARKER) || content.includes(STARTUP_VBS_TEMPLATE_MARKER_V2)) {
+    return null;
+  }
   const lines = content.split(/\r?\n/);
   const runAt = lines.findIndex((line) => /^\s*sh\.Run\s/i.test(line));
   if (runAt < 0) return null; // 认不出的形状：宁可不改，也不要写坏别人的开机脚本
   const block = [`' ${STARTUP_VBS_TEMPLATE_MARKER}`, ...startupVbsSelfHealLines(exePath)];
+  return [...lines.slice(0, runAt), ...block, ...lines.slice(runAt)].join("\r\n");
+}
+
+/**
+ * 常驻看门狗 loop 的那一行 `sh.Run`。
+ *
+ * 字面量里内联完整的 exe 路径，而不是引用自愈块里的 `exePath` 变量：这份行会被
+ * 就地插进各种年代的旧模板，不能假设那份脚本里恰好定义过 `exePath`（v1 模板就
+ * 没有）—— 自包含才不挑宿主。
+ */
+export function startupVbsWatchdogLoopLine(exePath: string): string {
+  // 与 windowsStartupVbs 同一套两层引号：shell 命令行按需加引号，VBScript
+  // 字面量里的每个 `"` 写成 `""`。
+  const quote = (a: string): string => (/[\s"]/.test(a) ? `"${a}"` : a);
+  const cmdline = `${quote(exePath)} watchdog --loop`;
+  const literal = `"${cmdline.replace(/"/g, '""')}"`;
+  return `sh.Run ${literal}, 0, False`;
+}
+
+/**
+ * 把常驻看门狗 loop 行**就地**插进一份已有的登录自启脚本，返回新内容；
+ * 已经含 loop 行（幂等标记在）或认不出形状就返回 null。
+ *
+ * 插在第一条 `sh.Run` 之前：和自愈块的插入位置一致 —— 启动 supervisor 的 run 行
+ * 一定在 loop 行之后，两者登录时都会执行（loop 有单实例锁，与 run 并存无害）。
+ */
+export function injectStartupVbsWatchdogLoop(content: string, exePath: string): string | null {
+  if (content.includes(STARTUP_VBS_WATCHDOG_LOOP_MARKER)) return null;
+  const lines = content.split(/\r?\n/);
+  const runAt = lines.findIndex((line) => /^\s*sh\.Run\s/i.test(line));
+  if (runAt < 0) return null;
+  const block = [`' ${STARTUP_VBS_WATCHDOG_LOOP_MARKER}`, startupVbsWatchdogLoopLine(exePath)];
   return [...lines.slice(0, runAt), ...block, ...lines.slice(runAt)].join("\r\n");
 }
 /** 日志超过这个大小就先轮转成 supervisor.log.1，避免无限增长。 */
@@ -190,6 +272,28 @@ export interface Daemon {
    */
   watchdog(o?: DaemonStartOptions): Promise<boolean>;
   /**
+   * 常驻看门狗循环：进程不退出，每 30 秒（WATCHDOG_LOOP_INTERVAL_MS）检查一次
+   * supervisor 是否存活，不在就拉起。`agentsbb watchdog --loop` 的实现。
+   *
+   * 为什么需要它：计划任务看门狗依赖 `schtasks.exe`，而有些机器（包括开发机）
+   * 的安全策略直接拦掉它 —— 看门狗永远装不上，设备崩溃后无人拉起。这个常驻
+   * 循环是那种机器上的唯一兜底，由登录自启 VBS 里的 loop 行拉起。
+   *
+   * 单实例：stateDir 下的 watchdog-loop.pid 锁。锁里 pid 还活着且锁新鲜（mtime
+   * 在 2 个周期内）→ 第二个实例静默返回（退出码 0）；pid 已死或锁过期 → 接管
+   * （覆盖写自己的 pid）。SIGINT / SIGTERM 时清掉锁再退出；被强杀留下的陈旧锁
+   * 靠接管逻辑自愈，不需要人工清理。
+   */
+  watchdogLoop(): Promise<void>;
+  /**
+   * 常驻看门狗 loop 是否真的在位（锁文件里 pid 活着且锁新鲜）。
+   *
+   * 为什么单独给判据：降级机器上计划任务永远探测不到，serviceHealth 只能靠
+   * 「loop 进程在不在」回答「崩溃后会不会自己回来」—— 这就是那台机器的
+   * ready 判据。
+   */
+  watchdogLoopRunning(): boolean;
+  /**
    * 确保崩溃看门狗已就位（存量设备升级后自动补，不用人再点一次 install-service）。
    *
    * 只对**已经装了登录自启**的设备动手：那份 VBS 说明用户同意过「开机自己起来」，
@@ -240,6 +344,13 @@ export interface DaemonOverrides {
   selfArgv?: () => { exec: string; args: string[] };
   stdout?: Writable;
   stderr?: Writable;
+  /**
+   * watchdogLoop 的测试边界：循环最多执行多少个检查周期后正常返回（含锁清理）。
+   * 0 / 不传 = 不限（生产语义：永远循环）。
+   */
+  watchdogLoopMaxTicks?: number;
+  /** watchdogLoop 信号处理里的退出动作。测试注入成记录器，别真的退出进程。 */
+  exit?: (code: number) => void;
   /** 0 表示 root（决定 systemd 写系统级还是 --user）。 */
   uid?: number | undefined;
   /** 注入 systemd / launchd 的动作，测试里记下来断言即可。 */
@@ -486,8 +597,72 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   // 看门狗脚本放在状态目录（跟着 AGENTSBB_HOME 走），不塞进用户盘符根目录：
   // 它只是个薄壳，真正的判断在 `agentsbb watchdog` 里，升级后自动跟着新 exe 走。
   const WATCHDOG_CMD = autostartPaths.watchdogCmd ?? join(paths.stateDir, "watchdog.cmd");
+  // 常驻看门狗 loop 的单实例锁：内容是持有者的 pid，mtime 是「还活着」的心跳。
+  const WATCHDOG_LOOP_LOCK = join(paths.stateDir, WATCHDOG_LOOP_PID_FILE);
 
   const readPidFile = (): number | undefined => readSupervisorPid(paths);
+
+  // ------------------------------------------------------------- 常驻看门狗 loop
+
+  /**
+   * 读 loop 单实例锁。null = 没有锁或锁内容读不出 pid（当作没有）。
+   *
+   * pid 之外还要 mtime：pid 只能证明「这个进程号活着」，可能已经被系统复用给了
+   * 别的进程；mtime 才能证明「锁的持有者最近还在循环」。两个条件一起看。
+   */
+  const readLoopLock = (): { pid: number; mtimeMs: number } | null => {
+    try {
+      const digits = readFileSync(WATCHDOG_LOOP_LOCK, "utf8").replace(/[^0-9]/g, "");
+      if (!digits) return null;
+      const pid = Number.parseInt(digits, 10);
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      return { pid, mtimeMs: statSync(WATCHDOG_LOOP_LOCK).mtimeMs };
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * 锁是否「新鲜」：mtime 距今不超过 2 个周期。
+   *
+   * 持有者每个检查周期都重写一次锁（心跳）；死掉的持有者没人续写，最多 2 个
+   * 周期后锁就过期。2 倍而不是 1 倍，是给写盘延迟与检查耗时留余量 —— 别让
+   * 一次慢检查把还活着的同伴挤下岗。mtime 在未来（机器时钟被回调过）也算新鲜：
+   * 陈旧检测只有一个重要方向。
+   */
+  const lockIsFresh = (mtimeMs: number): boolean => now() - mtimeMs <= 2 * WATCHDOG_LOOP_INTERVAL_MS;
+
+  const writeLoopLock = (): void => {
+    mkdirSync(paths.stateDir, { recursive: true });
+    writeFileSync(WATCHDOG_LOOP_LOCK, `${process.pid}\n`, { mode: 0o600 });
+  };
+
+  const removeLoopLock = (): void => {
+    try {
+      rmSync(WATCHDOG_LOOP_LOCK, { force: true });
+    } catch {
+      // 删不掉就留给陈旧锁自愈逻辑：下次启动按 pid/mtime 判定接管。
+    }
+  };
+
+  /** loop 事件的落点（loop 没有终端，stdout 谁也看不见）。 */
+  const appendWatchdogLog = (line: string): void => {
+    try {
+      mkdirSync(paths.logDir, { recursive: true });
+      appendFileSync(join(paths.logDir, "watchdog.log"), `${new Date(now()).toISOString()} ${line}\n`);
+    } catch {
+      // 日志写不进去不影响检查本身：看门狗的第一职责是拉起，不是记日志。
+    }
+  };
+
+  /** 降级机器的判据之一：登录自启脚本里有没有 loop 行（= 下次登录会拉起 loop）。 */
+  const vbsHasWatchdogLoop = (): boolean => {
+    try {
+      return readFileSync(STARTUP_VBS, "utf8").includes(STARTUP_VBS_WATCHDOG_LOOP_MARKER);
+    } catch {
+      return false;
+    }
+  };
 
   /** pid 文件优先（Windows 上没有命令行可核对），状态文件补上详情。 */
   const findRunning = (): { pid: number; state: SupervisorState | null } | null =>
@@ -527,8 +702,16 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       const parts: string[] = [];
       if (existsSync(STARTUP_VBS)) parts.push(`Startup folder script (${STARTUP_VBS})`);
       if (existsSync(WATCHDOG_CMD)) parts.push(`watchdog every ${WATCHDOG_INTERVAL_MINUTES} min`);
+      // 降级路径（schtasks 被拦）的两种形态：loop 进程正在循环 / loop 行已写进
+      // VBS、等下次登录拉起。计划任务一栏对这类机器永远是空的，不报出来就
+      // 像是没有兜底。
+      if (watchdogLoopRunning()) {
+        parts.push("resident watchdog loop running");
+      } else if (vbsHasWatchdogLoop()) {
+        parts.push("resident watchdog loop starts at logon");
+      }
       if (parts.length === 0) return undefined;
-      if (parts.length === 1 && !existsSync(WATCHDOG_CMD)) {
+      if (parts.length === 1 && !existsSync(WATCHDOG_CMD) && !vbsHasWatchdogLoop()) {
         parts.push(`no crash watchdog (re-run \`agentsbb install-service\`)`);
       }
       return parts.join(" + ");
@@ -555,6 +738,10 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
    * Windows 上额外探一次计划任务状态，是因为文件可能写着、任务却被删了/从没建成
    * （本机现场就是这样：watchdog.cmd 在，任务不在，`schtasks` 被安全软件拦掉）。
    * 这个探测会起一个子进程，所以只在 supervisor 启动时调一次，不要塞进 10 秒轮询。
+   *
+   * 探测不到计划任务时还有一条降级出路：常驻 loop 进程（`watchdog --loop`）。
+   * 它在位 → ready；loop 行已在 VBS 里但进程没起来 → not-ready 但说明「下次登录
+   * 会拉起」；两者都无 → 才是真正的「崩溃后不会自己回来」。
    */
   const serviceHealth = (): { ready: boolean; detail: string } => {
     if (platform === "win32") {
@@ -581,6 +768,17 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
         const stdout = Buffer.isBuffer(probe.stdout) ? probe.stdout : Buffer.alloc(0);
         const stderr = Buffer.isBuffer(probe.stderr) ? probe.stderr : Buffer.alloc(0);
         const reason = firstLine(decodeCommandOutput(Buffer.concat([stdout, stderr])));
+        // 计划任务探测不到（被安全软件拦掉 / 任务被删）≠ 没有自愈：降级路径下
+        // 常驻 loop 进程就是「崩溃后 30 秒内自己回来」的那只手，它在位就算 ready。
+        if (watchdogLoopRunning()) {
+          return { ready: true, detail: "常驻看门狗进程在位（schtasks 不可用，已降级）" };
+        }
+        if (vbsHasWatchdogLoop()) {
+          return {
+            ready: false,
+            detail: "常驻看门狗未运行，将在下次登录时随自启脚本拉起（schtasks 不可用，已降级）；可重跑 agentsbb install-service 激活",
+          };
+        }
         return {
           ready: false,
           detail: `看门狗计划任务 ${WATCHDOG_TASK_NAME} 未注册（${reason || "schtasks 不可用，可能被安全软件拦截"}）`,
@@ -748,6 +946,89 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     await start(o);
     return true;
   }
+
+  /**
+   * loop 的一个检查周期：刷锁心跳 → 复用 `watchdog()` 判定并拉起 → 按结果写日志。
+   *
+   * 判定与拉起**必须**走同一个 watchdog()：两套判断迟早漂移（当年 status 与
+   * stop 的双判据就出过误停在线节点的直播事故）。watchdog() 的那行 stdout 在
+   * loop 里谁也看不见，所以拉起动作在这里补一条 watchdog.log。
+   *
+   * 存活时**绝对不写日志**：loop 每 30 秒跑一次，一天 2880 个周期，绝大概率
+   * 都是「没事」——每次都记一行，真出事那次反而翻不出来（与 watchdog() 的
+   * 静默原则一致）。
+   */
+  async function watchdogLoopTick(o: DaemonStartOptions = {}): Promise<boolean> {
+    // 心跳先于检查：锁的 mtime 就是「持有者还活着」的证据，别的实例与
+    // serviceHealth 都靠它判断。
+    try {
+      writeLoopLock();
+    } catch {
+      // 锁写不进去（磁盘满 / 权限）不致命：单实例保护失效而已，检查照做。
+    }
+    try {
+      const started = await watchdog(o);
+      if (started) {
+        appendWatchdogLog("watchdog loop: supervisor is not running, starting");
+      }
+      return started;
+    } catch (e) {
+      // start 失败只记日志继续循环：supervisor 可能因为坏配置起不来，循环
+      // 不能陪葬 —— 下个周期还会再试。
+      const detail = e instanceof Error ? e.message : String(e);
+      appendWatchdogLog(`watchdog loop: start failed: ${tailLines(detail, 3).replace(/\r?\n/g, " ")}`);
+      return false;
+    }
+  }
+
+  /**
+   * 常驻看门狗主循环。拿到单实例锁后每 30 秒跑一个 watchdogLoopTick。
+   *
+   * 用 setTimeout 链（经由 sleep）而不是 setInterval：setInterval 不管上一轮
+   * 有没有跑完都会到点触发，检查一旦变慢就会堆积出并发轮次；链式调度保证
+   * 上一轮彻底结束才排下一轮。
+   */
+  async function watchdogLoop(o: DaemonStartOptions = {}): Promise<void> {
+    mkdirSync(paths.stateDir, { recursive: true });
+    const existing = readLoopLock();
+    if (existing && existing.pid !== process.pid && isAlive(existing.pid) && lockIsFresh(existing.mtimeMs)) {
+      // 第二个实例：静默返回（退出码 0）。VBS 的 loop 行每次登录都会拉起一份，
+      // 加上手工误跑，「已经有人了」是常态不是异常 —— 别打日志别报错。
+      return;
+    }
+    // 接管：锁里 pid 已死，或锁过期（持有者被强杀、没机会清锁）→ 覆盖写。
+    writeLoopLock();
+    const maxTicks = overrides.watchdogLoopMaxTicks ?? 0;
+    const exitFn = overrides.exit ?? ((code: number) => process.exit(code));
+    const releaseAndExit = (): void => {
+      // 锁必须清掉：留着的话下一个实例只能等锁过期或按「pid 已死」接管，多绕一圈。
+      removeLoopLock();
+      exitFn(0);
+    };
+    process.on("SIGINT", releaseAndExit);
+    process.on("SIGTERM", releaseAndExit);
+    try {
+      let ticks = 0;
+      while (true) {
+        await watchdogLoopTick(o);
+        ticks += 1;
+        if (maxTicks > 0 && ticks >= maxTicks) break;
+        // setTimeout 链：上一轮彻底结束才排下一轮，检查再慢也不会堆积。
+        await sleep(WATCHDOG_LOOP_INTERVAL_MS);
+      }
+    } finally {
+      process.removeListener("SIGINT", releaseAndExit);
+      process.removeListener("SIGTERM", releaseAndExit);
+      // 正常返回（测试边界 maxTicks）也清锁：锁是「正在循环」的声明，不循环了就不该占着。
+      removeLoopLock();
+    }
+  }
+
+  /** loop 在位的判据：锁里有 pid、进程活着、锁新鲜。serviceHealth / status 都用它。 */
+  const watchdogLoopRunning = (): boolean => {
+    const lock = readLoopLock();
+    return lock !== null && lockIsFresh(lock.mtimeMs) && isAlive(lock.pid);
+  };
 
   /**
    * 确保看门狗就位。幂等、静默、可重复调用（supervisor 每次启动都会走一遍）。
@@ -1062,11 +1343,14 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   }
 
   /**
-   * 存量设备的登录自启脚本补自愈块。**就地插入**，不整份重写（保留
-   * `--model` 参数与用户手改的内容），按模板标记判幂等。
+   * 存量设备的登录自启脚本就地升级：v1 补自愈块，v1 / v2 补常驻看门狗 loop 行，
+   * v2 的标记行顺手升到 v3。**就地插入**，不整份重写（保留 `--model` 参数与
+   * 用户手改的内容）。
    *
    * 三种情况明确不写：不是 Windows、本来就没有登录脚本（普通 `run` 不该把用户
-   * 变成开机自启）、内容形状认不出来（宁可不动）。
+   * 变成开机自启）、内容形状认不出来（宁可不动）。v3 模板一律 already-current：
+   * v3 落盘时 loop 行的有无由 install-service 按当时的 schtasks 结果决定，这里
+   * 不再二次猜测。
    */
   async function refreshStartupScript(): Promise<{ updated: boolean; path: string; reason?: string }> {
     if (platform !== "win32") return { updated: false, path: STARTUP_VBS, reason: "not-windows" };
@@ -1080,12 +1364,27 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     if (content.includes(STARTUP_VBS_TEMPLATE_MARKER)) {
       return { updated: false, path: STARTUP_VBS, reason: "already-current" };
     }
-    const injected = injectStartupVbsSelfHeal(content, selfArgv().exec);
-    if (injected === null) {
-      return { updated: false, path: STARTUP_VBS, reason: "unrecognized-shape" };
+    let next = content;
+    // v2 模板已经有自愈块（injectStartupVbsSelfHeal 对 v2 会拒绝，防重插），只有
+    // 更老的 v1 / 无标记模板才需要补。
+    if (!content.includes(STARTUP_VBS_TEMPLATE_MARKER_V2)) {
+      const injected = injectStartupVbsSelfHeal(next, selfArgv().exec);
+      if (injected === null) {
+        return { updated: false, path: STARTUP_VBS, reason: "unrecognized-shape" };
+      }
+      next = injected;
     }
+    if (!next.includes(STARTUP_VBS_WATCHDOG_LOOP_MARKER)) {
+      const looped = injectStartupVbsWatchdogLoop(next, selfArgv().exec);
+      if (looped !== null) next = looped;
+    }
+    if (next === content) {
+      return { updated: false, path: STARTUP_VBS, reason: "already-current" };
+    }
+    // 标记行升级到 v3：下一次启动直接 already-current，不再重复走这条补丁路径。
+    next = next.replace(`' ${STARTUP_VBS_TEMPLATE_MARKER_V2}`, `' ${STARTUP_VBS_TEMPLATE_MARKER}`);
     try {
-      writeFileSync(STARTUP_VBS, injected, { mode: 0o644 });
+      writeFileSync(STARTUP_VBS, next, { mode: 0o644 });
     } catch {
       return { updated: false, path: STARTUP_VBS, reason: "write-failed" };
     }
@@ -1173,7 +1472,17 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     }
     if (platform === "win32") {
       mkdirSync(join(STARTUP_VBS, ".."), { recursive: true });
-      writeFileSync(STARTUP_VBS, windowsStartupVbs(o), { mode: 0o644 });
+      // 上一版降级可能已经在这份 VBS 里写过 loop 行：下面的整份重写会把它冲掉。
+      // 先记下来，装完再补回去 —— 不主动删（loop 有单实例锁，两套共存无害），
+      // 删了反而可能让机器在「下次 schtasks 又被拦」时裸奔。
+      let hadLoopLine = false;
+      try {
+        hadLoopLine = readFileSync(STARTUP_VBS, "utf8").includes(STARTUP_VBS_WATCHDOG_LOOP_MARKER);
+      } catch {
+        // 没有旧文件 / 读不了：当作没有 loop 行。
+      }
+      const vbsBody = windowsStartupVbs(o);
+      writeFileSync(STARTUP_VBS, vbsBody, { mode: 0o644 });
       out(`installed logon autostart: ${STARTUP_VBS}\n`);
 
       // 第二道：看门狗。上面那份 VBS 只在登录时跑一次，进程崩了/被结束之后
@@ -1195,16 +1504,29 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       ]);
       if (created.status === 0) {
         out(`installed watchdog task: ${WATCHDOG_TASK_NAME} (every ${WATCHDOG_INTERVAL_MINUTES} min)\n`);
+        // schtasks 成功 → 不需要 loop。但上一版降级留下的 loop 行按约定保留不动。
+        if (hadLoopLine) {
+          const looped = injectStartupVbsWatchdogLoop(vbsBody, selfArgv().exec);
+          if (looped !== null) writeFileSync(STARTUP_VBS, looped, { mode: 0o644 });
+        }
       } else {
-        // 不 fail-closed：自启已经装好了，用户至少还有「登录后自动起来」这一层。
-        // 但必须说清楚「崩溃自愈没装上」，否则设备下次崩了还是没人知道为什么。
+        // 不 fail-closed：自启已经装好了。但计划任务没装上意味着「崩溃自愈」缺失
+        // —— schtasks 被拦的机器（安全策略）手动注册也走不通，所以降级：把一行
+        // `watchdog --loop` 写进 VBS，登录时拉起常驻看门狗进程接管崩溃自愈。
+        // 独立标记行保证幂等：重跑 install-service 不会插出第二行。
         const detail = `${created.stdout ?? ""}${created.stderr ?? ""}`.trim();
         err(`could not register the watchdog task "${WATCHDOG_TASK_NAME}"`);
         if (detail) err(`: ${tailLines(detail, 5)}`);
         err("\n");
-        err("  logon autostart IS installed, but a crashed supervisor will NOT come back on its own.\n");
-        err("  register it by hand (no admin rights needed):\n");
-        err(`    schtasks /Create /F /SC MINUTE /MO ${WATCHDOG_INTERVAL_MINUTES} /TN ${WATCHDOG_TASK_NAME} /TR "\\"${WATCHDOG_CMD}\\""\n`);
+        const looped = injectStartupVbsWatchdogLoop(vbsBody, selfArgv().exec);
+        if (looped !== null) {
+          writeFileSync(STARTUP_VBS, looped, { mode: 0o644 });
+          out("schtasks 不可用，已降级为常驻看门狗进程（随登录自启拉起）\n");
+          out("  the resident loop checks every 30s and starts the supervisor if it is gone.\n");
+        } else {
+          // 认不出刚写好的模板（不该发生，防御）：至少把后果说清楚。
+          err("  logon autostart IS installed, but a crashed supervisor will NOT come back on its own.\n");
+        }
       }
 
       out("  it runs `agentsbb run` hidden at every logon (no admin rights needed).\n");
@@ -1309,6 +1631,15 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       removed.push(`logon autostart (${STARTUP_VBS})`);
     }
     if (platform === "win32") {
+      // 降级的常驻 loop 进程还在循环的话先收掉：它是独立进程（没有 agent 子树），
+      // Windows 上 SIGKILL（= TerminateProcess）对它没有孤儿问题，与 supervisor
+      // 必须走 taskkill /T 的情况不同。
+      const loopLock = readLoopLock();
+      if (loopLock && isAlive(loopLock.pid)) {
+        safeSignal(loopLock.pid, "SIGKILL");
+        removed.push("resident watchdog loop");
+      }
+      removeLoopLock();
       // 先删任务再删脚本：顺序反过来会留下一个每 5 分钟报一次「文件不存在」的
       // 计划任务，比不装还难查。
       const delTask = runCommand("schtasks", ["/Delete", "/F", "/TN", WATCHDOG_TASK_NAME]);
@@ -1332,7 +1663,7 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
 
   return {
     start, stop, restart, status, logs, installService, uninstall, refreshStartupScript, watchdog, ensureWatchdog,
-    serviceHealth,
+    serviceHealth, watchdogLoop, watchdogLoopRunning,
   };
 }
 

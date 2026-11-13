@@ -282,6 +282,9 @@ function fakeDaemon(overrides: Partial<Daemon> = {}): { daemon: Daemon; calls: s
     logs: (o) => { calls.push(`logs:${o?.lines ?? 40}`); },
     // 看门狗：计划任务每 5 分钟调一次，绝大多数时候返回 false（什么都没做）。
     watchdog: async (o) => { calls.push(`watchdog:${JSON.stringify(o ?? {})}`); return true; },
+    // 常驻看门狗循环：只在 `watchdog --loop`（schtasks 被拦的降级兜底）时进入。
+    watchdogLoop: async () => { calls.push("watchdog-loop"); },
+    watchdogLoopRunning: () => false,
     // 存量设备升级时自动补看门狗：默认「什么都不用做」（非 Windows 的常态）。
     ensureWatchdog: async () => { calls.push("ensure-watchdog"); return { created: false, reason: "not-windows" }; },
     installService: async (o) => { calls.push(`install-service:${JSON.stringify(o ?? {})}`); },
@@ -406,6 +409,18 @@ describe("agentsbb background commands", () => {
     });
     await program.parseAsync(["node", "agentsbb", "watchdog"]);
     expect(calls).toEqual(["watchdog:{}"]);
+  });
+
+  it("watchdog --loop enters the resident loop instead of the one-shot check", async () => {
+    const { daemon, calls } = fakeDaemon();
+    const program = buildProgram({
+      keystore: tempKeystore(),
+      apiFactory: () => { throw new Error("should not be called"); },
+      stdout: process.stdout,
+      daemon,
+    });
+    await program.parseAsync(["node", "clawmessenger", "watchdog", "--loop"]);
+    expect(calls).toEqual(["watchdog-loop"]);
   });
 
   it("the `daemon` namespace dispatches every action", async () => {
