@@ -1741,7 +1741,18 @@ func DefaultAgentNodeName(agent string) string {
 // 群、讨论组与聊天室成员共用同一张图（web 端 public/default_user.png 是同源副本）。
 // 融云侧只回显它自己存的 portraitUri，图源必须唯一，否则各入口一漂移就是各端
 // 看到不同默认图。
-const DefaultUserPortraitURI = "https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user.png"
+//
+// 2026-11-13 主域名切换：由 newsradar 老站改成 agents.quukk.com 的站点根。
+//
+// 这是**输出**值，不只是识别值：真人/节点注册、建群建聊天室、`backfill-friends`
+// 的目标值、以及 `GET /api/config/branding` 下发的 `user_avatar` 全都取它（web 的
+// `defaultAvatarUrl()` 也是"配置值优先"，所以这个值直接决定浏览器请求哪台机器）。
+// 因此它必须属于本站。
+//
+// ⚠️ 改这个常量时**必须同时把旧值追加进 legacyDefaultPortraitURIs**：旧值一旦离开
+// 常量位，就既不是「当前默认图」、也不在 legacy 清单、更不匹配 LegacyDefaultPortraitPath，
+// NeedsDefaultPortrait 会把它判成「用户自选头像」而永久跳过 —— backfill 再也刷不回来。
+const DefaultUserPortraitURI = "https://agents.quukk.com/default_user.png"
 
 // LegacyDefaultPortraitPath 是旧默认头像的免鉴权静态路由。旧部署用
 // <MULTICA_PUBLIC_URL> + 该路径拼出任意 host，所以存量识别按 URL path 精确命中，
@@ -1751,9 +1762,16 @@ const LegacyDefaultPortraitPath = "/api/static/claw/avatar-default.png"
 
 // legacyDefaultPortraitURIs 是历史上的默认头像取值，仅在存量识别（backfill）时
 // 使用，绝不作为新写入值。
+//
+// **换图源 / 换域名后，旧的 DefaultUserPortraitURI 值必须登记在这里**：
+// NeedsDefaultPortrait 靠这张清单认出「这是我们的旧默认图、可以覆盖」，漏了就会
+// 把存量判成用户自选头像，`-sync-portraits` 永远跳过它们（换域名之后线上最普遍的
+// 那批 404 头像就是这么来的）。
 var legacyDefaultPortraitURIs = []string{
 	"https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/openclaw.png",
 	"https://newsradar.dreamdt.cn/im-test/api/static/claw/avatar-default.png",
+	// 2026-11-13 域名切换前的统一默认图（当时 DefaultUserPortraitURI 的值）。
+	"https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user.png",
 }
 
 // LegacyDefaultPortraitURIs 返回历史默认头像取值的副本（存量识别用，只读）。
@@ -1822,10 +1840,13 @@ func NeedsDefaultPortrait(portrait string) bool {
 	if trimmed == DefaultUserPortrait() {
 		return false // 已经是统一默认图：幂等跳过
 	}
-	// 编译期常量本身也算历史取值：线上一旦把默认图换到新域名（CLAW_DEFAULT_
-	// PORTRAIT_URI 或后台 branding），存量行里那个旧 URL 就既不是「当前默认图」，
-	// 也不在 legacy 清单里（清单只收过 openclaw.png 和 im-test 那条），于是被判成
-	// 「用户自选头像」永久跳过 —— 换域名之后这是最普遍的一类残留，头像会一直 404。
+	// 编译期常量本身也当历史取值认：运行时值可以被 env（CLAW_DEFAULT_PORTRAIT_URI）
+	// 或后台 branding override 换掉，那时库里的「上一次常量值」既不是当前运行时
+	// 默认图、也不在 legacy 清单（清单只收显式登记的迁移值），按其余条件都命不中，
+	// 会被判成「用户自选头像」永久跳过 —— 换图源之后它们永远不更新，头像一直是 404。
+	//
+	// 注意：这条兜不住「常量本身被改掉」的情况（换域名就是这样）。旧常量值离开常量位
+	// 之后必须登记进 legacyDefaultPortraitURIs，见该变量的注释。
 	//
 	// 顺序不能提前：上一行必须在 DefaultUserPortrait() 仍等于该常量时先返回 false，
 	// 否则幂等复跑会把每一行都判成待改。

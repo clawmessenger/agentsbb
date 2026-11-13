@@ -372,22 +372,87 @@ func TestNeedsDefaultPortraitMatrix(t *testing.T) {
 	}
 }
 
-// 换掉默认图域名之后，存量行里那个「编译期常量」必须仍被认出是旧默认图。
+// 换默认图域名（2026-11-13 newsradar → agents.quukk.com）之后，库存里那批
+// **旧常量值**必须仍被认出是「我们的默认图」。
 //
-// 否则这批行既不是「当前默认图」、也不在 legacy 清单里，会被当成用户自选头像
-// 永久跳过 —— 换域名之后它们就是线上最普遍的那批 404 头像。
-func TestNeedsDefaultPortraitRecognizesCanonicalAfterRebrand(t *testing.T) {
+// 这是换域名唯一的正向迁移路径：旧值已经不在 DefaultUserPortraitURI 上，只能靠
+// legacyDefaultPortraitURIs 认；漏登记的话它们会被当成用户自选头像永久跳过，
+// `backfill -sync-portraits` 再也刷不回来（线上最普遍的那批 404 头像）。
+func TestNeedsDefaultPortraitRecognizesPreRebrandCanonical(t *testing.T) {
 	portraitTestClearEnv(t)
-	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "https://agents.quukk.com/default_user.png")
+	// 后台 override 是全局态，可能被同包其它用例设过 —— 显式清掉，保证结论只由本用例决定。
+	SetBrandingOverrides(BrandingOverrides{})
+	t.Cleanup(func() { SetBrandingOverrides(BrandingOverrides{}) })
+
+	// 换域名之前的统一默认图（就是当时 DefaultUserPortraitURI 的值）。
+	const preRebrandDefaultPortraitURI = "https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user.png"
+
+	if DefaultUserPortraitURI == preRebrandDefaultPortraitURI {
+		t.Fatalf("precondition: the canonical url should have moved to the new domain")
+	}
+	if !NeedsDefaultPortrait(preRebrandDefaultPortraitURI) {
+		t.Fatalf("pre-rebrand canonical %q must stay recognized as a legacy default, "+
+			"otherwise the backfill silently skips every existing row", preRebrandDefaultPortraitURI)
+	}
+	if !NeedsDefaultPortrait("  " + preRebrandDefaultPortraitURI + "  ") {
+		t.Fatalf("the pre-rebrand canonical with surrounding spaces must also be recognized")
+	}
+	// 当前默认图仍然幂等跳过。
+	if NeedsDefaultPortrait(DefaultUserPortrait()) {
+		t.Fatalf("the live default %q must still be skipped (idempotent rerun)", DefaultUserPortrait())
+	}
+	// 相近但不同的地址不许误判 —— 存量补齐绝不能覆盖用户头像。
+	for _, custom := range []string{
+		"https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user_v2.png",
+		"https://cdn.example.com/uploads/u1/default_user.png",
+	} {
+		if NeedsDefaultPortrait(custom) {
+			t.Fatalf("custom portrait %q must never be treated as a default", custom)
+		}
+	}
+}
+
+// 运行时值被 env / 后台 override 换掉时，**常量值本身**仍算待补。
+//
+// 否则库里的「上一次常量值」会被判成用户自选头像，换图源之后永久跳过。
+func TestNeedsDefaultPortraitRecognizesCanonicalWhenRuntimeValueDiffers(t *testing.T) {
+	portraitTestClearEnv(t)
+	SetBrandingOverrides(BrandingOverrides{})
+	t.Cleanup(func() { SetBrandingOverrides(BrandingOverrides{}) })
+	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "https://cdn.example.com/all.png")
 
 	if got := DefaultUserPortrait(); got == DefaultUserPortraitURI {
-		t.Fatalf("precondition: default portrait should have moved off the canonical url")
+		t.Fatalf("precondition: the runtime value should have moved off the canonical url")
 	}
 	if !NeedsDefaultPortrait(DefaultUserPortraitURI) {
-		t.Fatalf("canonical %q must stay recognized as a legacy default after rebrand", DefaultUserPortraitURI)
+		t.Fatalf("canonical %q must stay recognized while the runtime value is overridden", DefaultUserPortraitURI)
 	}
 	if NeedsDefaultPortrait(DefaultUserPortrait()) {
 		t.Fatalf("the live default %q must still be skipped (idempotent rerun)", DefaultUserPortrait())
+	}
+}
+
+// legacyDefaultPortraitURIs 里必须留着「换域名前的旧常量值」：这条清单是旧值唯一
+// 的归属地，删掉它等于让存量头像从此不可迁移。
+func TestLegacyDefaultPortraitURIsKeepsPreRebrandCanonical(t *testing.T) {
+	const preRebrandDefaultPortraitURI = "https://newsradar.dreamdt.cn/newschat/static/imgs/rongyun/default_user.png"
+
+	found := false
+	for _, uri := range LegacyDefaultPortraitURIs() {
+		if uri == preRebrandDefaultPortraitURI {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("LegacyDefaultPortraitURIs() must contain the pre-rebrand canonical %q, got %v",
+			preRebrandDefaultPortraitURI, LegacyDefaultPortraitURIs())
+	}
+	// 当前常量值绝不能被登记成 legacy：那会让「已经是新图」的行被判成待补。
+	for _, uri := range LegacyDefaultPortraitURIs() {
+		if uri == DefaultUserPortraitURI {
+			t.Fatalf("LegacyDefaultPortraitURIs() must not contain the live canonical %q", uri)
+		}
 	}
 }
 
