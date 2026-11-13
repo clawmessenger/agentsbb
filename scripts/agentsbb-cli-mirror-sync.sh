@@ -40,7 +40,7 @@
 
 set -euo pipefail
 
-REPO="clawmessenger/claw-messenger"
+REPO="quukk/agentsbb"
 # TODO(rebrand-retire): AGENTSBB_MIRROR_GH_BASE 是新名；CLAWMESSENGER_MIRROR_GH_BASE
 # 过渡期仍可读，v1.6.0 垫片退役时删掉后半段。
 GH_BASE="${AGENTSBB_MIRROR_GH_BASE:-${CLAWMESSENGER_MIRROR_GH_BASE:-https://github.com}}"

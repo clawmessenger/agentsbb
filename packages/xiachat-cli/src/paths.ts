@@ -83,7 +83,15 @@ export function ensureStateHome(
   copyFn: CopyFn = cpSync,
 ): MigrationResult {
   const home = stateHome(env, homedirFn);
-  if (existsSync(home)) return { home, migrated: false, fellBackToLegacy: false };
+  // 判据是 marker，**不是**「目录存在」。新目录可能被更早的一次运行提前建出来
+  // （哪怕只写了一个 machine_id、一个日志目录），此时目录在、数据却几乎全空。
+  // 拿目录存在当判据，迁移就被永久跳过：credentials.json、processed-uids（消息
+  // 去重）、agent-sessions 全部留在旧目录，现场表现是「升级后突然未登录」，
+  // 而且 machine_id 会被重新生成 —— 设备在服务端成了另一台机器。
+  // 目录在但没 marker 时照常走下面的 merge-copy：force:false 不覆盖，只补缺。
+  if (existsSync(join(home, MIGRATION_MARKER))) {
+    return { home, migrated: false, fellBackToLegacy: false };
+  }
   const fallback = (): MigrationResult => {
     mkdirSync(home, { recursive: true });
     return { home, migrated: false, fellBackToLegacy: false };

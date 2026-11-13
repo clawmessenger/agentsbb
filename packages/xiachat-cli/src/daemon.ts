@@ -572,8 +572,14 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
   const runCommand =
     overrides.runCommand ??
     ((file: string, args: string[]) => {
-      const r = spawnSyncFn(file, args, { encoding: "utf8" });
-      return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+      // 必须拿 buffer 再解码：中文 Windows 上 schtasks / tasklist / sc 的输出
+      // 走 ANSI 代码页（GBK），按 utf8 直接解会把中文报错打成 U+FFFD，且碎过
+      // 之后无法还原。decodeCommandOutput 先试严格 utf8 再试 gbk，Linux/macOS
+      // 的 utf8 输出同样无损，所以这条路径全平台通用。
+      const r = spawnSyncFn(file, args, { encoding: "buffer" });
+      const stdout = r.stdout ? decodeCommandOutput(r.stdout) : "";
+      const stderr = r.stderr ? decodeCommandOutput(r.stderr) : "";
+      return { status: r.status, stdout, stderr };
     });
 
   const autostartPaths = overrides.autostartPaths ?? {};

@@ -97,6 +97,33 @@ describe("paths: state dir migration", () => {
     expect(readFileSync(join(second.home, "a.json"), "utf8")).toBe("newer");
   });
 
+  it("backfills a state dir that an earlier run created before the migration finished", () => {
+    // 现场事故（2026-11-13，dev 机）：新版 CLI 某次运行先把 ~/.agentsbb 建了出来
+    // （只写了 machine_id），旧的判据是「目录存在 → 视为已迁移」，于是迁移被永久
+    // 跳过 —— credentials.json 留在旧目录，设备显示未登录、身份也换了。这条用例
+    // 把「目录在但没 marker 时必须补齐」钉死。
+    const target = join(home, "user", HOME_DIR);
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "machine_id"), "1683186989", "utf8");
+    mkdirSync(legacyHome, { recursive: true });
+    writeFileSync(join(legacyHome, "credentials.json"), '{"nodeId":"node_1"}', "utf8");
+    writeFileSync(join(legacyHome, "machine_id"), "3300776275", "utf8");
+
+    const result = ensureStateHome({}, () => join(home, "user"));
+
+    expect(result.migrated).toBe(true);
+    expect(result.fellBackToLegacy).toBe(false);
+    expect(result.home).toBe(target);
+    // 缺的凭据必须补进来（否则设备永远登不上）。
+    expect(existsSync(join(target, "credentials.json"))).toBe(true);
+    // 新目录里已有的文件不被旧值覆盖：force:false 只补缺，不倒退。
+    expect(readFileSync(join(target, "machine_id"), "utf8")).toBe("1683186989");
+    // marker 落地之后不再重复复制。
+    expect(existsSync(join(target, MIGRATION_MARKER))).toBe(true);
+    const again = ensureStateHome({}, () => join(home, "user"));
+    expect(again.migrated).toBe(false);
+  });
+
   it("falls back to the legacy dir when the copy fails, so the device keeps working", () => {
     mkdirSync(legacyHome, { recursive: true });
     writeFileSync(join(legacyHome, "credentials.json"), "{}", "utf8");

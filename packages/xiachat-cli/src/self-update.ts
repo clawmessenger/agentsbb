@@ -32,8 +32,14 @@ import {
 } from "node:fs";
 import * as path from "node:path";
 
-/** GitHub repo that publishes the CLI releases. */
-export const RELEASES_REPO = "clawmessenger/claw-messenger";
+/**
+ * GitHub repo that publishes the CLI releases.
+ *
+ * 从 `clawmessenger/claw-messenger` 迁到 `quukk/agentsbb`（org → 个人账号）。
+ * 旧 slug 仍由 GitHub 的改名/转移重定向兜底，所以 1.3.34 以前的老客户端
+ * 不会因为这次改名而断了自动更新。
+ */
+export const RELEASES_REPO = "quukk/agentsbb";
 
 const STAGED_SUFFIX = ".new-";
 const BACKUP_SUFFIX = ".old-";

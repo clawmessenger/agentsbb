@@ -34,7 +34,7 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     # Guard against forks of this repository running the release pipeline.
-    if: github.repository == 'clawmessenger/claw-messenger'
+    if: github.repository == 'quukk/agentsbb'
     strategy:
       fail-fast: false
       matrix:
@@ -242,7 +242,7 @@ jobs:
   release:
     name: Create GitHub release
     needs: build
-    if: github.repository == 'clawmessenger/claw-messenger'
+    if: github.repository == 'quukk/agentsbb'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

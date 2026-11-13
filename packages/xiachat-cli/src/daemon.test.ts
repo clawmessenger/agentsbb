@@ -879,6 +879,31 @@ describe("Windows 看门狗", () => {
     expect(body.startsWith("@echo off")).toBe(true);
   });
 
+  it("默认 runCommand 把 schtasks 的 GBK 报错解成中文（现场是 `错误: 拒绝访问。`）", async () => {
+    // 这条走的是**默认** runCommand（不注入 runCommand，只注入底层 spawnSync），
+    // 守的是「runCommand 必须拿 buffer 再交给 decodeCommandOutput」：中文 Windows
+    // 上 schtasks 的 stderr 是 GBK，按 utf8 硬解会变成一串 U+FFFD，用户在现场看到
+    // 的就是 `����: �ܾ����ʣ�`，排障时等于没有信息。
+    const gbk = Buffer.from([0xb4, 0xed, 0xce, 0xf3, 0x3a, 0x20, 0xbe, 0xdc, 0xbe, 0xf8, 0xb7, 0xc3, 0xce, 0xca]);
+    const spawnSyncFake = ((file: string) => {
+      if (file === "schtasks") {
+        return { status: 1, stdout: Buffer.alloc(0), stderr: gbk, pid: 0 };
+      }
+      return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), pid: 0 };
+    }) as unknown as typeof import("node:child_process").spawnSync;
+    // harness 默认注入了一个 runCommand 替身（会吞掉 schtasks 的成败），这里
+    // 显式置空，逼 createDaemon 用**默认**实现 —— 被测的正是它。
+    const { h, vbs } = winHarness({ spawnSync: spawnSyncFake, runCommand: undefined });
+
+    await h.daemon.installService();
+
+    const errText = h.errors.join("");
+    expect(errText).toContain("错误: 拒绝访问");
+    expect(errText).not.toContain("\uFFFD");
+    // 解码失败不能影响降级本身：loop 行照样写进去。
+    expect(readFileSync(vbs, "utf8")).toContain("agentsbb-vbs-watchdog-loop: 1");
+  });
+
   it("计划任务注册失败时：降级为常驻看门狗，把 loop 行写进 VBS", async () => {
     const { h, vbs, cmd } = winHarness({
       runCommand: (file, args) => {

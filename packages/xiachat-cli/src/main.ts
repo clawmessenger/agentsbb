@@ -1309,7 +1309,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .action(async () => {
       const creds = opts.keystore.load();
       if (!creds) {
-        opts.stdout.write("not registered\n");
+        // 单独一个 "not registered" 会被读成「服务没装上」——用户在现场就是这么
+        // 理解的，然后去重跑 install-service。这里直接把下一步动作写出来。
+        opts.stdout.write("not registered; run agentsbb register or pair first\n");
       } else {
         opts.stdout.write(`node: ${creds.nodeId}\nserver: ${creds.serverUrl}\ntoken: ${creds.token ? "present" : "missing"}\n`);
       }
