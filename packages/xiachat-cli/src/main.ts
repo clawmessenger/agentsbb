@@ -1732,12 +1732,20 @@ export function buildProgram(opts: BuildProgramOpts): Command {
    *
    * 单独做成子命令（而不是把判断写进 .cmd）是为了升级后自动跟着新版走 ——
    * 登录自启那份 VBS 就因为只在 install-service 时落盘，远程升级永远改不动它。
+   *
+   * --loop 是降级形态：schtasks 被安全策略拦掉的机器装不上计划任务，改由登录
+   * 自启 VBS 拉起这个常驻进程，每 30 秒自己检查一次（见 daemon.watchdogLoop）。
    */
   daemonOpts(
     program
       .command("watchdog")
-      .description("Start the supervisor only if it is not running (called by the Windows scheduled task)"),
-  ).action(async (cmdOpts: { model?: string; workdir?: string }) => {
+      .description("Start the supervisor only if it is not running (called by the Windows scheduled task)")
+      .option("--loop", "resident mode: keep running and re-check every 30s (fallback when schtasks is blocked)"),
+  ).action(async (cmdOpts: { model?: string; workdir?: string; loop?: boolean }) => {
+    if (cmdOpts.loop) {
+      await daemon.watchdogLoop();
+      return;
+    }
     await daemon.watchdog(cmdOpts);
   });
 
@@ -1764,7 +1772,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .option("--workdir <dir>", "working directory for agent turns (default: your home directory)")
     .option("--lines <n>", "lines to show for `daemon logs`", "40")
     .option("--all-agents", "整机重启：连同本机其他智能体一起重启（仅用户明确要求时使用）")
-    .action(async (action: string, cmdOpts: { model?: string; workdir?: string; lines: string; allAgents?: boolean }) => {
+    .option("--loop", "watchdog 专用：常驻模式（schtasks 不可用时的降级兜底）")
+    .action(async (action: string, cmdOpts: { model?: string; workdir?: string; lines: string; allAgents?: boolean; loop?: boolean }) => {
       // --lines 只在 logs 有意义，别把它混进 start / restart / install-service 的选项里。
       const passthrough = { model: cmdOpts.model, workdir: cmdOpts.workdir };
       switch (action) {
@@ -1803,7 +1812,11 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           return;
         }
         case "watchdog":
-          await daemon.watchdog(passthrough);
+          if (cmdOpts.loop) {
+            await daemon.watchdogLoop();
+          } else {
+            await daemon.watchdog(passthrough);
+          }
           return;
         case "install-service":
           await daemon.installService(passthrough);
