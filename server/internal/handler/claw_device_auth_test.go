@@ -363,21 +363,21 @@ func TestClawWebBaseURL(t *testing.T) {
 	}{
 		{
 			name:   "explicit base wins and drops the trailing slash",
-			base:   "https://clawmessenger.quukk.com/",
+			base:   "https://agents.quukk.com/",
 			target: "http://127.0.0.1:58081/api/claw/pairing/device",
-			want:   "https://clawmessenger.quukk.com",
+			want:   "https://agents.quukk.com",
 		},
 		{
 			name:   "root deployment follows the request host",
-			target: "https://clawmessenger.quukk.com/api/claw/pairing/device",
-			want:   "https://clawmessenger.quukk.com",
+			target: "https://agents.quukk.com/api/claw/pairing/device",
+			want:   "https://agents.quukk.com",
 		},
 		{
 			name:     "forwarded host beats the upstream hop",
 			target:   "http://10.0.0.5:58081/api/claw/pairing/device",
-			fwdHost:  "clawmessenger.quukk.com",
+			fwdHost:  "agents.quukk.com",
 			fwdProto: "https",
-			want:     "https://clawmessenger.quukk.com",
+			want:     "https://agents.quukk.com",
 		},
 		{
 			name:   "legacy host keeps its web mount",

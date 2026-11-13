@@ -33,7 +33,7 @@
 #   --dir      /data/im/shrimp-says-test/claw-mirror        安装包存放处（webroot 同级，不在其内）
 #   --webroot  /data/im/shrimp-says-test/claw-web-product   nginx 上 /claw-web/ 的 alias 目标
 #   --link     dl                                          webroot 里的链接名 → <webroot>/dl
-#   对外 URL： https://newsradar.dreamdt.cn/claw-web/dl/<asset>
+#   对外 URL： https://agents.quukk.com/dl/<asset>
 #   （nginx 给 /claw-web/ 与 /claw-web/assets/ 各配了 alias；dl/ 走前者，无需改 nginx）
 #
 # 可用环境变量：AGENTSBB_MIRROR_GH_BASE（默认 https://github.com）

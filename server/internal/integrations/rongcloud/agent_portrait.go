@@ -14,7 +14,7 @@ import (
 // 为什么是 PNG 而不是仓库里的 SVG：融云客户端只按 URL 存字符串，实际渲染在
 // 各家客户端和 WebView 里，SVG 的支持面不可控（iOS 原生、安卓旧内核都可能
 // 不认），PNG 是唯一安全的交集。
-const AgentPortraitBaseURL = "https://newsradar.dreamdt.cn/claw-web/agent-avatars"
+const AgentPortraitBaseURL = "https://agents.quukk.com/claw-web/agent-avatars"
 
 // AgentPortraitBaseEnv 允许自建 / 测试环境覆盖头像目录（无尾斜杠）。
 const AgentPortraitBaseEnv = "CLAW_AGENT_PORTRAIT_BASE"

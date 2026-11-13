@@ -119,6 +119,7 @@ function dirnameOf(p: string): string {
 
 // 发布版默认指向线上生产环境（站点根，不是子路径：API 由调用方拼 /api/...）。
 // 别的环境一律由调用方显式传 --server，不要在这里加分支。
-// TODO(rebrand-retire): 域名切换是独立 DNS 事务；clawmessenger.quukk.com 仍是
-// 唯一已知线上值，DNS 切换到 agentsbb 域名后改此默认值（部署说明 T05 跟踪）。
-export const DEFAULT_SERVER_URL = "https://clawmessenger.quukk.com";
+// TODO(rebrand-retire): 域名已由 clawmessenger.quukk.com 切到 agents.quukk.com
+// （服务端目录 /var/www/agentsbb，站点 URL 路径结构不变）。旧域名已下线，
+// 因此这里直接写死新域名，不要回退。
+export const DEFAULT_SERVER_URL = "https://agents.quukk.com";

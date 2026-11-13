@@ -378,7 +378,7 @@ func TestNeedsDefaultPortraitMatrix(t *testing.T) {
 // 永久跳过 —— 换域名之后它们就是线上最普遍的那批 404 头像。
 func TestNeedsDefaultPortraitRecognizesCanonicalAfterRebrand(t *testing.T) {
 	portraitTestClearEnv(t)
-	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "https://clawmessenger.quukk.com/default_user.png")
+	t.Setenv("CLAW_DEFAULT_PORTRAIT_URI", "https://agents.quukk.com/default_user.png")
 
 	if got := DefaultUserPortrait(); got == DefaultUserPortraitURI {
 		t.Fatalf("precondition: default portrait should have moved off the canonical url")

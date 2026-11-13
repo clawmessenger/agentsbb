@@ -223,7 +223,7 @@ $lines.Add('  ② 一条命令激活：解包、读包内清单、校验、切�
 $lines.Add("     agentsbb-cli-mirror-sync --bundle /tmp/$bundleName")
 $lines.Add('  ③ 自检')
 $lines.Add("     agentsbb-cli-mirror-sync --verify-only")
-$lines.Add('     curl -s https://newsradar.dreamdt.cn/claw-web/dl/VERSION; echo')
+$lines.Add('     curl -s https://agents.quukk.com/dl/VERSION; echo')
 $lines.Add('')
 $lines.Add('（路径即线上实际布局；资产集合在 MANIFEST 里、版本号在 VERSION 里，都不用再传参）')
 Write-Host ($lines -join "`n")

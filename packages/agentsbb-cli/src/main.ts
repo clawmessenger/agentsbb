@@ -5,7 +5,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, write
 import { createServer as createNetServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Keystore, type StoredCredentials } from "./keystore.js";
+import { Keystore, migrateServerUrl, type StoredCredentials } from "./keystore.js";
 import { envCompat } from "./env-compat.js";
 import {
   XiachatApi,
@@ -948,7 +948,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       // 走 keystore；两者都能过服务端的设备凭据校验。
       // TODO(rebrand-retire): 双读过渡，旧名 AGENTSBB_AGENT_CREDS 移除于 v1.6+
       const envCreds = process.env.AGENTSBB_AGENT_CREDS ?? process.env.AGENTSBB_AGENT_CREDS;
-      const creds = (envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined) ?? opts.keystore.load();
+      // 环境凭据**不经过** Keystore.load（supervisor 派生时直接塞进 env），
+      // 所以旧主域名的归一化要在这里再做一次，否则子进程会拿旧域名去连。
+      const creds = (envCreds ? migrateServerUrl(JSON.parse(envCreds) as StoredCredentials) : undefined)
+        ?? opts.keystore.load();
       if (!creds) {
         opts.stdout.write("not registered; run agentsbb pair first\n");
         process.exitCode = 1;
@@ -1030,7 +1033,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       // because each child overwrites nothing in the shared keystore.
       // TODO(rebrand-retire): 双读过渡，旧名 AGENTSBB_AGENT_CREDS 移除于 v1.6+
       const envCreds = process.env.AGENTSBB_AGENT_CREDS ?? process.env.AGENTSBB_AGENT_CREDS;
-      const parsedEnvCreds = envCreds ? (JSON.parse(envCreds) as StoredCredentials) : undefined;
+      // 同 agent 命令：env 凭据是旁路，旧的 `serverUrl` 在这里就地归一化（不落盘）。
+      const parsedEnvCreds = envCreds ? migrateServerUrl(JSON.parse(envCreds) as StoredCredentials) : undefined;
       const creds = parsedEnvCreds ?? opts.keystore.load();
       if (!creds) throw new Error("no credentials; run agentsbb register or pair first");
       const api = opts.apiFactory(creds.serverUrl);
