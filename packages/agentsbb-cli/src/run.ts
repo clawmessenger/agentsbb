@@ -419,6 +419,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // Warm-up runs in the background so it never delays message dispatch.
   const catalogLoader = createModelCatalogLoader({
     agentName: opts.agentName,
+    // ACP 目录发现要直接 spawn 二进制（JSON-RPC 双向），runCommand 的一次性
+    // stdout 语义不够用，所以把路径单独交给 loader。
+    execPath: opts.agentExecPath,
     runCommand: (argv, timeoutMs, maxOutputBytes, stopWhen) =>
       runAgentCommand({
         execPath: opts.agentExecPath,

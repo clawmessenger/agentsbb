@@ -210,14 +210,19 @@ describe("buildAgentArgs", () => {
 
   // ── B 类十家 argv 形态（2026-11-04 批量接入）──────────────────────────────
   // cursor-agent：官方 headless 形态 `-p <prompt> --output-format stream-json`
-  // （cursor.com/docs/cli/headless）。不注入 --model：抓包 init 的 model 是
-  // "Auto"，模型走 cursor 账户配置。
-  it("cursor-agent 走 -p + stream-json，不注入 --model", () => {
+  // （cursor.com/docs/cli/headless）。模型选择走 `--model <裸 id>`
+  // （cursor.go:1045），目录里的 `cursor/<id>` 路由由 buildModelArgs 剥回裸 id。
+  it("cursor-agent 走 -p + stream-json，--model 收剥了前缀的裸 id", () => {
     expect(buildAgentArgs("cursor-agent", "hi")).toEqual([
       "-p", "hi", "--output-format", "stream-json",
     ]);
     expect(buildAgentArgs("cursor-agent", "hi", "quukk/glm-5.2")).toEqual([
       "-p", "hi", "--output-format", "stream-json",
+      "--model", "glm-5.2",
+    ]);
+    expect(buildAgentArgs("cursor-agent", "hi", "auto")).toEqual([
+      "-p", "hi", "--output-format", "stream-json",
+      "--model", "auto",
     ]);
     expect(buildAgentArgs("cursor-agent", "a".repeat(8001))).toEqual([]);
   });
@@ -304,14 +309,19 @@ describe("buildAgentArgs", () => {
 
   // B 类第二批（2026-11-10 全量真机接入）：每家的 headless 入口都经实机
   // `--help` 核对过，钉住 argv 形状防止回归成「裸 CLI = TUI」的老坑。
-  it("deveco 走 run 一次性入口（不再进 TUI 喷进度条）", () => {
+  it("deveco 走 run 一次性入口（不再进 TUI 喷进度条），--model 整段路由", () => {
     expect(buildAgentArgs("deveco", "hi")).toEqual(["run", "hi"]);
-    expect(buildModelArgs("deveco", "quukk/glm-5.2")).toEqual([]);
+    // opencode 血统的 `run --model provider/model`；Go 同款注入（deveco.go:105）。
+    expect(buildModelArgs("deveco", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
+    expect(buildAgentArgs("deveco", "hi", "quukk/glm-5.2")).toEqual([
+      "run", "hi", "--model", "quukk/glm-5.2",
+    ]);
   });
 
-  it("codearts 走 run 一次性入口（否则 TUI 启动横幅「正在启动中…」被当正文）", () => {
+  it("codearts 走 run 一次性入口（否则 TUI 启动横幅「正在启动中…」被当正文），--model 整段路由", () => {
     expect(buildAgentArgs("codearts", "hi")).toEqual(["run", "hi"]);
-    expect(buildModelArgs("codearts", "quukk/glm-5.2")).toEqual([]);
+    // 对齐 codearts.go:86 的注入位置。
+    expect(buildModelArgs("codearts", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
   });
 
   it("mcode 走 exec + text（不再撞 interactive mode requires a TTY）", () => {
@@ -420,8 +430,7 @@ describe("splitModelRoute / buildModelArgs", () => {
   // 它在设备端没有 argv 策略，但 `--model` 是真实支持的参数）。
   it("only renders model flags for agents that actually accept them", () => {
     // 无策略 → 不注入
-    expect(buildModelArgs("kiro-cli", "m1")).toEqual([]);
-    expect(buildModelArgs("cursor-agent", "m1")).toEqual([]);
+    expect(buildModelArgs("mcode", "m1")).toEqual([]);
     // 有策略 → 按各家形状注入
     expect(buildModelArgs("codex", "p/m")).toEqual(["-c", "model_provider=p", "-m", "m"]);
     expect(buildModelArgs("opencode", "p/m")).toEqual(["--model", "p/m"]);
@@ -442,8 +451,8 @@ describe("splitModelRoute / buildModelArgs", () => {
   // 不认路由的（cursor）不注入，认整段的（pi/omp/kimi）整段透传，
   // 模型在 stdin 协议帧里的（dsh）argv 返回空。
   it("B 类新 CLI 的模型注入面逐家钉住（不猜参数名）", () => {
-    // cursor-agent：模型跟随 cursor 账户配置（抓包 init model="Auto"）
-    expect(buildModelArgs("cursor-agent", "p/m")).toEqual([]);
+    // cursor-agent：--model 收裸 id（cursor.go:1045），虚拟 provider 前缀剥掉
+    expect(buildModelArgs("cursor-agent", "p/m")).toEqual(["--model", "m"]);
     // traecli / qodercli / qoderclicn：官方参数表没有模型旗标，不注入
     expect(buildModelArgs("traecli", "p/m")).toEqual([]);
     expect(buildModelArgs("qodercli", "p/m")).toEqual([]);

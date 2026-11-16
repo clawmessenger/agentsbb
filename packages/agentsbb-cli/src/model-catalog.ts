@@ -4,6 +4,12 @@ import {
   type OutputStopPredicate,
 } from "./agents.js";
 import { agentModelCapability } from "./agent-model-capabilities.js";
+import { acpProviderFor } from "./agent-acp-providers.js";
+import {
+  ACP_DISCOVERY_TIMEOUT_MS,
+  discoverAcpModelCatalog,
+  type AcpDiscoverySpec,
+} from "./acp-discovery.js";
 import { isModelRoute } from "./agent-default-model.js";
 import {
   probeProviderModels,
@@ -99,6 +105,18 @@ export interface ModelListSpec {
 const AGENT_MODEL_LIST: Readonly<Record<string, ModelListSpec>> = {
   opencode: { argv: ["models"], timeoutMs: 30_000, maxOutputBytes: 256 * 1024 },
   openclaw: { argv: ["models", "list", "--json"], timeoutMs: 60_000, maxOutputBytes: 1024 * 1024 },
+  // codearts：`codearts models --verbose` 与 opencode 同源输出（provider/model
+  // 行 + JSON 元数据），解析器复用 parseOpenCodeModels 的通用文本路。
+  // 依据：server/pkg/agent/codearts.go:765 discoverCodeArtsModels —— 它先试
+  // `models --verbose`，为空再退回 `models`。设备端把两级合并成一条：先 verbose，
+  // 失败/空则由 loader 的静态兜底接住。
+  codearts: { argv: ["models", "--verbose"], timeoutMs: 20_000, maxOutputBytes: 512 * 1024 },
+  // deveco：`deveco models`，每行首个 token 是 `provider/model`
+  // （server/pkg/agent/deveco_models.go:20 discoverDevecoModels）。
+  deveco: { argv: ["models"], timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
+  // cursor-agent：`--list-models`，输出 `Available models` 头 + `<id> - <label>`
+  // 行（server/pkg/agent/models.go:2604 discoverCursorModels / parseCursorModels）。
+  "cursor-agent": { argv: ["--list-models"], timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
   dsh: {
     argv: ["--profile", "multica", "--list-models"],
     timeoutMs: 10_000,
@@ -232,6 +250,9 @@ export function parseModelListText(stdout: string): DiscussionModelCatalog {
     let lineRoute: string | null = null;
     for (const token of line.split(/[\s,|]+/)) {
       if (!ROUTE_RE.test(token)) continue;
+      // 全大写的 token 是表头（deveco 的 `PROVIDER/MODEL`），不是模型
+      // —— 与 Go 的 parseDevecoModels 用同一条判据（deveco_models.go:68）。
+      if (token === token.toUpperCase() && token !== token.toLowerCase()) continue;
       routes.push(token);
       lineRoute = token;
     }
@@ -514,6 +535,35 @@ export function parsePiModelsList(stdout: string): DiscussionModelCatalog {
   return catalogFromRoutes(routes, null);
 }
 
+// `cursor-agent --list-models` -> `Available models` header + `<id> - <label>`
+// rows, optionally tagged `(current, default)` / `(default)`
+// (server/pkg/agent/models.go:2624-2700 parseCursorModels). Items carry no
+// provider, so ids are grouped under the synthetic `cursor` provider — the same
+// one Go's cursorStaticModels uses — and buildModelArgs strips it before
+// injection (cursor-agent's `--model` wants the bare id).
+export function parseCursorModelsList(stdout: string): DiscussionModelCatalog {
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  let defaultModel: string | null = null;
+  for (const rawLine of stripAnsiCodes(stdout).split(/\r?\n/).slice(0, MAX_LINES_SCANNED)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // Rows are `<id> - <label>`; the header has no separator and is skipped by
+    // the index check below.
+    const sep = line.indexOf(" - ");
+    if (sep <= 0) continue;
+    const id = line.slice(0, sep).trim();
+    const label = line.slice(sep + 3).trim();
+    if (!id || /\s/.test(id)) continue;
+    const route = `cursor/${id}`;
+    if (!ROUTE_RE.test(route) || routes.includes(route)) continue;
+    routes.push(route);
+    if (label) names.set(route, label.slice(0, 500));
+    if (defaultModel === null && /\bdefault\b/i.test(label)) defaultModel = route;
+  }
+  return catalogFromRoutes(routes, defaultModel, names);
+}
+
 export function parseModelCatalogOutput(
   agentName: string | undefined,
   stdout: string,
@@ -522,6 +572,7 @@ export function parseModelCatalogOutput(
     const json = parseOpenclawModelListJson(stdout);
     if (json && json.providers.length > 0) return json;
   }
+  if (agentName === "cursor-agent") return parseCursorModelsList(stdout);
   // dsh / agy / pi / grok / kimi 的输出形态与「文本里找 provider/model 路由」的
   // 通用解析器不兼容（JSONL 帧 / 无 provider 的裸 id / 冒号分隔 / 连字符 id /
   // JSON 信封），各自走专属解析器。
@@ -651,6 +702,16 @@ export function buildAgentDefaultModelResponse(
 
 export interface ModelCatalogLoaderOpts {
   agentName?: string;
+  /**
+   * agent 二进制路径。ACP 目录探测要自己 spawn（JSON-RPC 双向），复用不了
+   * runCommand 的一次性 stdout 语义，所以单独收一个。
+   */
+  execPath?: string;
+  /**
+   * 跑一次 ACP 握手拿目录。缺省是 discoverAcpModelCatalog（真进程）；
+   * 测试注入桩，避免起真 CLI。
+   */
+  discoverAcp?: (execPath: string, spec: AcpDiscoverySpec) => Promise<DiscussionModelCatalog>;
   /**
    * Runs one agent subcommand. `stopWhen`（可选，第 4 参）来自 ModelListSpec：
    * 命令打完帧不肯退出时（dsh）靠它早退，实现可以忽略它。
@@ -847,6 +908,36 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
             ? `model catalog: ${label} failed (${describe(err)}); keeping ${declaredAdded} declared model(s)`
             : `model catalog: ${label} failed: ${describe(err)}`,
         );
+      }
+    }
+
+    // ACP 通道：上游 Go exe 里十几家 agent 的目录只从 ACP 握手里来
+    // （initialize → session/new 的 models.availableModels / configOptions）。
+    // 设备端以前没有任何 ACP 客户端，于是 kiro / qoder / traecli / dim /
+    // reasonix / copilot 在面板上一律空态。这里一次接上，参数表见
+    // agent-acp-providers.ts。
+    //
+    // 只在「CLI 路缺席」或「CLI 路一无所获」时跑：有 cli 目录时 ACP 只是同一份
+    // 清单的第二次进程启动，白花 15s；而 CLI 超时/失败时 ACP 往往是唯一答案。
+    // 闸门是 capability.catalogSource === "acp"：没登记的 agent 不去 spawn，
+    // 免得对着不认 ACP 的二进制瞎试。
+    if (capability.catalogSource === "acp") {
+      const acpProvider = acpProviderFor(opts.agentName);
+      const cliProduced = grouped.size > 0;
+      if (acpProvider && !cliProduced) {
+        const runAcp = opts.discoverAcp
+          ?? ((execPath: string, spec2: AcpDiscoverySpec) =>
+            discoverAcpModelCatalog({ execPath, spec: spec2, logger: opts.logger }));
+        try {
+          const fromAcp = await runAcp(opts.execPath ?? opts.agentName ?? "", acpProvider.spec);
+          mergeCatalogGroups(grouped, fromAcp);
+          if (!defaultModel) defaultModel = fromAcp.defaultModel;
+          opts.logger?.(
+            `model catalog: ${acpProvider.label} ACP -> ${fromAcp.providers.length} provider(s)`,
+          );
+        } catch (err) {
+          opts.logger?.(`model catalog: ${acpProvider.label} ACP failed: ${describe(err)}`);
+        }
       }
     }
 

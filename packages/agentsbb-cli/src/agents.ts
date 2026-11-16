@@ -241,10 +241,12 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   if (name === "hermes") {
     return route ? ["-m", route.model, "--provider", route.provider] : ["-m", model];
   }
-  // cursor-agent：抓包（testdata/cursor-agent-2026.07.20-stream-json.jsonl:1）
-  // 里 init 的 model 是 "Auto"，模型选择走 cursor 账户自己的配置；我们不认的
-  // 路由塞给它只会让它在启动时退出。不注入，模型跟随账户默认。
-  if (name === "cursor-agent") return [];
+  // cursor-agent：`cursor-agent --model <id>` 收**裸 id**（cursor.go:1045），
+  // 目录里用虚拟 provider `cursor` 分组（parseCursorModelsList），注入前剥掉。
+  // 旧代码"不注入、跟随账户默认"的结论已被 Go 实现推翻。
+  if (name === "cursor-agent") {
+    return route ? ["--model", route.model] : ["--model", model];
+  }
   // traecli / qodercli / qoderclicn：官方 CLI 文档的参数表没有可注入的模型
   // 选择参数（traecli 的模型由服务端配置；qoder 的模型走它自己的账号体系），
   // 设备端不猜参数名。没有证据就不注入。
@@ -274,9 +276,9 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // -m 要的是 `anthropic/claude-sonnet-4-5` 形的它家路由。没有证据就不注入，
   // 模型跟随各家默认配置。
   if (
-    name === "deveco" || name === "mcode" || name === "qwenpaw"
+    name === "mcode" || name === "qwenpaw"
     || name === "dim" || name === "reasonix"
-    || name === "zeroclaw" || name === "codearts"
+    || name === "zeroclaw"
   ) return [];
   return ["--model", model];
 }
@@ -497,11 +499,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 同款消费方式），正文在 `assistant` 消息与末尾 `result`。不加
   // --stream-partial-output：抓包证明不带它思考增量也逐条上报，正文的
   // assistant/result 全文语义更稳（partial 模式会引入需要去重的增量正文块）。
-  // 不注入 --model：抓包显示 init 事件 model 为 "Auto"，cursor-agent 的模型
-  // 选择走它自己的账户配置，我们的 provider/model 路由它不认。
-  "cursor-agent": (prompt) => [
+  // 模型选择：`--model <裸 id>`（cursor.go:1045）。目录里 curl 的 `cursor/<id>`
+  // 路由由 buildModelArgs 剥回裸 id —— 与 Go 的 ResolvedModel 落库形状一致。
+  "cursor-agent": (prompt, model) => [
     "-p", prompt,
     "--output-format", "stream-json",
+    ...buildModelArgs("cursor-agent", model),
   ],
   // codebuddy（Claude Code fork）：argv 形状完整对齐上游 daemon
   // （server/pkg/agent/codebuddy.go:38-61）：`-p` 非交互 + stream-json 双向 +
@@ -650,8 +653,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 是官方一次性入口（deveco run --help：不进 TUI，跑完退出）；默认 --format
   // default 输出格式化正文。裸 `deveco` 是交互 TUI —— 2026-11-10 现场：TUI
   // 在无 console 的 spawn 下喷 80 万字节进度条后被掐，整个回合 agent_failed。
-  deveco: (prompt) => [
+  deveco: (prompt, model) => [
     "run", prompt,
+    // 模型选择：opencode 血统的 `run --model provider/model`，Go 侧同款
+    // （deveco.go:105 `args = append(args, "--model", opts.Model)`）。
+    ...buildModelArgs("deveco", model),
   ],
   // codearts（华为 CodeArts Doer，同 opencode 血统）：`codearts run [message..]`
   // 是一次性入口（run --help：run codearts with a message），默认 --format
@@ -660,8 +666,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 里落地成 `| * 正在启动中...`），看起来「有回复」其实一个字都没答。
   // ⚠️ 与 TUI 登录态无关：headless 还要华为云 CODEARTS_CLI_AK/SK 环境变量，
   // 缺了它会以纯文本报「认证失败」，这条错误现在会如实当正文回给用户。
-  codearts: (prompt) => [
+  codearts: (prompt, model) => [
     "run", prompt,
+    // 模型选择：同 opencode 血统的 `run --model provider/model`，对齐
+    // codearts.go:86 的注入位置。
+    ...buildModelArgs("codearts", model),
   ],
   // mcode（Minimax Code）：`mcode exec [prompt]` 官方自述「Run one prompt
   // without starting the TUI」；不带 --output-format 时默认 text。裸 `mcode`

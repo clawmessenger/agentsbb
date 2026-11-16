@@ -1140,8 +1140,12 @@ describe("createModelCatalogLoader with static fallback catalogs", () => {
 
   // 能力闸门的负向测试：injection 'none' 的 agent 即使将来有人往
   // STATIC_CATALOGS 里塞了清单，也不许漏出来；也没有任何列举命令可跑。
+  //
+  // 注意这三位与「catalogSource: acp」的 agent（traecli/kiro/qoder/dim/
+  // reasonix）不是一类：那些能通过 ACP 握手拿到真实目录，只有这三位既没有
+  // 目录来源、也没有注入通道。
   it("never serves a catalog for agents that cannot inject a model", async () => {
-    for (const agentName of ["qwenpaw", "mcode", "zeroclaw", "deveco", "traecli"]) {
+    for (const agentName of ["qwenpaw", "mcode", "zeroclaw"]) {
       const runCommand = vi.fn();
       const loader = createModelCatalogLoader({
         agentName,
@@ -1279,5 +1283,132 @@ describe("AGENT_MODEL_CAPABILITIES", () => {
         expect(routes.has(catalog.defaultModel)).toBe(true);
       }
     }
+  });
+});
+
+// ACP 通道（2026-11-16 批量对齐上游 Go exe）：kiro / qoder / traecli / dim /
+// reasonix / copilot / grok / hermes 的目录只从 ACP 握手里来
+// （server/pkg/agent/models.go discoverACPModels）。设备端以前没有 ACP 客户端，
+// 这批 agent 在面板上一律空态。
+describe("createModelCatalogLoader ACP channel", () => {
+  const noConfig = () => null;
+
+  const acpCatalog = {
+    defaultModel: "quukk/glm-5.2",
+    providers: [
+      {
+        id: "quukk",
+        name: "quukk",
+        models: [{ id: "glm-5.2", name: "GLM 5.2" }],
+      },
+    ],
+  };
+
+  it("serves traecli from the ACP handshake when it has no CLI listing", async () => {
+    const discoverAcp = vi.fn(async (_execPath: string, _spec: unknown) => acpCatalog);
+    const runCommand = vi.fn();
+    const loader = createModelCatalogLoader({
+      agentName: "traecli",
+      execPath: "/fake/traecli",
+      discoverAcp,
+      runCommand,
+      readConfig: noConfig,
+    });
+
+    const catalog = await loader.load();
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(discoverAcp).toHaveBeenCalledTimes(1);
+    expect(discoverAcp.mock.calls[0][0]).toBe("/fake/traecli");
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["quukk"]);
+    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("keeps the catalog intact when the ACP handshake fails", async () => {
+    const discoverAcp = vi.fn(async () => {
+      throw new Error("not logged in");
+    });
+    const logs: string[] = [];
+    const loader = createModelCatalogLoader({
+      agentName: "kiro-cli",
+      execPath: "/fake/kiro-cli",
+      discoverAcp,
+      runCommand: vi.fn(),
+      readConfig: noConfig,
+      logger: (message) => logs.push(message),
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers).toEqual([]);
+    expect(logs.join("\n")).toMatch(/ACP failed: not logged in/);
+  });
+
+  it("does not spawn ACP for agents that have no acp entry", async () => {
+    const discoverAcp = vi.fn(async (_execPath: string, _spec: unknown) => acpCatalog);
+    const loader = createModelCatalogLoader({
+      agentName: "mcode",
+      execPath: "/fake/mcode",
+      discoverAcp,
+      runCommand: vi.fn(),
+      readConfig: noConfig,
+    });
+
+    await loader.load();
+    expect(discoverAcp).not.toHaveBeenCalled();
+  });
+});
+
+// CLI 列举批量对齐（2026-11-16）：这三家上游 Go exe 早就能列出目录，设备端
+// 的 AGENT_MODEL_LIST 一直是空的 —— 面板因此只显示"手动填写"。
+describe("createModelCatalogLoader codearts/deveco/cursor-agent listing", () => {
+  const noConfig = () => null;
+
+  it("runs codearts models --verbose and parses provider/model rows", async () => {
+    const runCommand = vi.fn(async (_argv: string[]) => "quukk/glm-5.2\nquukk/deepseek-v4-pro\n");
+    const loader = createModelCatalogLoader({
+      agentName: "codearts",
+      runCommand,
+      readConfig: noConfig,
+    });
+
+    const catalog = await loader.load();
+    expect(runCommand.mock.calls[0][0]).toEqual(["models", "--verbose"]);
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["quukk"]);
+    expect(catalog.providers[0].models.map((model) => model.id))
+      .toEqual(["deepseek-v4-pro", "glm-5.2"]);
+  });
+
+  it("runs deveco models and parses provider/model rows", async () => {
+    const runCommand = vi.fn(async (_argv: string[]) => "PROVIDER/MODEL\nhiai/gpt-5.2  (default)\n");
+    const loader = createModelCatalogLoader({
+      agentName: "deveco",
+      runCommand,
+      readConfig: noConfig,
+    });
+
+    const catalog = await loader.load();
+    expect(runCommand.mock.calls[0][0]).toEqual(["models"]);
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["hiai"]);
+  });
+
+  it("runs cursor-agent --list-models and groups bare ids under cursor", async () => {
+    const runCommand = vi.fn(async (_argv: string[]) => [
+      "Available models",
+      "",
+      "auto - Auto",
+      "composer-2-fast - Composer 2 Fast (current, default)",
+      "",
+    ].join("\n"));
+    const loader = createModelCatalogLoader({
+      agentName: "cursor-agent",
+      runCommand,
+      readConfig: noConfig,
+    });
+
+    const catalog = await loader.load();
+    expect(runCommand.mock.calls[0][0]).toEqual(["--list-models"]);
+    expect(catalog.providers.map((provider) => provider.id)).toEqual(["cursor"]);
+    expect(catalog.providers[0].models.map((model) => model.id))
+      .toEqual(["auto", "composer-2-fast"]);
+    expect(catalog.defaultModel).toBe("cursor/composer-2-fast");
   });
 });
