@@ -1978,6 +1978,65 @@ describe("runAgentTurn", () => {
     }
   });
 
+  // 现场（2026-11-16，claude 2.1.325 + 网关）：选了一个网关没配渠道的模型，claude
+  // 打了 result 帧 `is_error:true`，`result` 里是 `API Error: 503 … 无可用渠道`。
+  // 旧实现把 result 帧一律当**权威全文**，于是这行报错会在退出码 0 时当成正文发给
+  // 用户（终态还是 completed）—— 比报失败更糟。这条钉住两件事：不推正文、判失败。
+  it("运行时自报失败（result is_error）即使退出码 0 也不把报错当正文", async () => {
+    const reason = "API Error: 503 分组 default 下模型 claude-opus-5-5 无可用渠道（distributor）";
+    const stdout = [
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "正在处理" }] },
+      }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: true, api_error_status: 503, result: reason }),
+      "",
+    ].join("\n");
+    const fixture = createStdoutFailureAgent("claude", stdout, 0);
+    try {
+      let chunks = "";
+      const error = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "claude",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onChunk: (c) => { chunks += c; },
+      }).then(() => null, (err: Error) => err);
+
+      expect(error).toBeInstanceOf(Error);
+      // 已产出的正文照样发过（气泡里那半句不能凭空消失），但报错文本一个字都不许上屏。
+      expect(chunks).toBe("正在处理");
+      // 失败码要能让前端说「换一个模型」。
+      expect((error as { code?: string }).code).toBe("model_unavailable");
+      expect((error as Error).message).toContain("无可用渠道");
+      // 已经交付出去的半句要随失败带回去（终帧显示）。
+      expect((error as { partialText?: string }).partialText).toBe("正在处理");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // 同一现场的退出码非零分支：原因必须排在 stderr 之前。stderr 那 2KB 里可能是
+  // 一整段与本轮无关的证书告警（现场就是），只拼 stderr 会把真原因挤掉。
+  it("退出码非零且运行时自报原因时，原因排在 stderr 前面", async () => {
+    const reason = "API Error: 503 分组 default 下模型 claude-opus-5-5 无可用渠道（distributor）";
+    const stdout = `${JSON.stringify({ type: "result", is_error: true, result: reason })}\n`;
+    const fixture = createStdoutFailureAgent("claude", stdout, 1);
+    try {
+      const error = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "claude",
+        prompt: "hi",
+        timeoutMs: 30_000,
+      }).then(() => null, (err: Error) => err);
+      const message = (error as Error).message;
+      expect(message.indexOf("无可用渠道")).toBeGreaterThan(0);
+      expect(classifyTurnError(message)).toBe("model_unavailable");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   // openclaw 的 stdout 是 `agent --local --json` 的完整信封（含输入提示词全文
   // 与执行 trace）。一旦把原始增量当正文回调出去，web 的打字气泡里就会出现
   // 一整坨 JSON；而终帧与兜底广播给的是 extractOpenclawReply 提取后的正文，

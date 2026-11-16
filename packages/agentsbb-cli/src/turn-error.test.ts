@@ -36,8 +36,22 @@ describe("classifyTurnError", () => {
 
   it("鉴权与超时各归各码", () => {
     expect(classifyTurnError("401 Unauthorized: Invalid API key")).toBe("model_auth_failed");
-    expect(classifyTurnError("{\"error\":{\"message\":\"no such model glm-9\"}}")).toBe("model_auth_failed");
+    // 「模型不存在」不是鉴权问题（改 key 没用），归 model_unavailable。
+    expect(classifyTurnError("{\"error\":{\"message\":\"no such model glm-9\"}}")).toBe("model_unavailable");
     expect(classifyTurnError("agent turn timeout after 300000ms")).toBe("turn_timeout");
+  });
+
+  // 现场（2026-11-16，claude 2.1.325 + 网关 llmapi.quukk.com）：活目录里列出了
+  // claude-opus-5-5（CLI 自带清单带出来的），选中让网关转发时分组里没有它的渠道。
+  // 当时归到 agent_failed，前端只说「这一轮没跑起来」，用户不知道是模型的事。
+  it("上游没有该模型的可用渠道（503 / 无可用渠道）不归鉴权、也不归额度", () => {
+    const cases = [
+      "API Error: 503 分组 default 下模型 claude-opus-5-5 无可用渠道（distributor） (request id: 2026…)",
+      "HTTP 503 Service Unavailable",
+      "{\"error\":{\"message\":\"model not found: claude-opus-5-5\"}}",
+      "no available providers for this model",
+    ];
+    for (const raw of cases) expect(classifyTurnError(raw)).toBe("model_unavailable");
   });
 
   it("纯限流（429 但不含额度语义）", () => {
@@ -79,6 +93,7 @@ describe("classifyTurnError", () => {
       classifyTurnError("insufficient balance"),
       classifyTurnError("401"),
       classifyTurnError("429 too many requests"),
+      classifyTurnError("503 无可用渠道"),
       classifyTurnError("agent turn timeout after 1ms"),
       classifyTurnError("boom"),
     ];

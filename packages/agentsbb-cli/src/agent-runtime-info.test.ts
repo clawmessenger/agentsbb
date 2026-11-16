@@ -221,7 +221,7 @@ describe("AgentCliInfoProbe", () => {
     // TTL 还有几个小时 —— 后台整整一下午显示一个已不存在的版本。缓存条目的
     // cliPath 在磁盘上不存在时，snapshot 不得返回它，refresh 也不得回带。
     const path = tmpPath();
-    let now = 1_000;
+    const now = 1_000;
     const deadPath = "/opt/bin/opencode-dead";
     const livePath = "/opt/bin/opencode";
     const exists = new Set<string>(); // 死路径已从磁盘消失（livePath 由 discover 直接给出，不需要存在性）
@@ -269,7 +269,7 @@ describe("AgentCliInfoProbe", () => {
 
   it("探测空手而归且回带的旧条目二进制已被卸载时不回带（防幽灵版本复活）", async () => {
     const path = tmpPath();
-    let now = 1_000;
+    const now = 1_000;
     let deadGone = false; // 探到 0.48.0 之后二进制被卸载
     const probe = new AgentCliInfoProbe({
       path,

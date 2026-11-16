@@ -36,7 +36,7 @@ import {
   parseServePassword,
   runServerSession,
 } from "./opencode-server.js";
-import { TurnIncompleteError } from "./turn-error.js";
+import { classifyTurnError, TurnIncompleteError } from "./turn-error.js";
 import { windowsCandidateDirs } from "./win-dirs.js";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
@@ -1369,6 +1369,13 @@ export interface StreamJsonDelta {
   partId?: string;
   /** true = 本次给出的是该 part 的完整文本，调用方需自行换算增量。 */
   replace?: boolean;
+  /**
+   * 运行时自己判定「这一轮失败了」时给出的原因原文（claude 形 result 帧的
+   * `is_error:true` + `result`）。**不能当正文**：那段文字是 `API Error: 503 …`，
+   * 发上屏等于把上游报错当成模型的回答（用户会以为 agent 就这么答的）。
+   * 调用方收到它只记账、不推正文，收尾时据此判失败。
+   */
+  errorText?: string;
 }
 
 /**
@@ -1495,6 +1502,15 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
   // result 是**权威全文**（整轮正文）。cursor-agent / traecli 家族没有 text
   // delta 流，这是正文上屏的来源之一；claude/qwen/codebuddy 的 delta 已逐字
   // 上屏，重复由消费端的快照换算吸收（isTextSnapshotLine 判定，见消费端）。
+  // 运行时自报失败：claude 的 result 帧在 `is_error:true` 时，`result` 里放的是
+  // 上游错误原文（`API Error: 503 分组 default 下模型 X 无可用渠道`）。它**不是**
+  // 回答，必须走失败通道 —— 否则进程退出码为 0 时这行会当成正文发给用户。
+  if (event.type === "result" && event.is_error === true) {
+    const reason = typeof event.result === "string" ? event.result
+      : typeof event.error === "string" ? event.error
+      : "";
+    return { errorText: reason || `agent reported an error (${String(event.subtype ?? "unknown subtype")})` };
+  }
   if (event.type === "result" && typeof event.result === "string" && event.result) {
     return { text: event.result };
   }
@@ -2385,6 +2401,11 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
     let lastToolId: string | null = null;
     /** 最后一个工具步骤之后是否还产出过正文（收尾判据，见 close 处理）。 */
     let textAfterLastTool = false;
+    /**
+     * 运行时自报的失败原因（claude result 帧 `is_error:true` 的原文）。非空即代表
+     * 这一轮**没有回答**：进程退出码可能是 0，正文可能一句都没有，都必须判失败。
+     */
+    let apiErrorText = "";
     const pushText = (delta: string): void => {
       if (!delta) return;
       streamedText += delta;
@@ -2484,6 +2505,11 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       }
       const delta = parseStreamJsonLine(flushed);
       if (!delta) return;
+      // 运行时自报失败：只记账，不推正文（那段是上游报错，不是回答）。
+      if (delta.errorText !== undefined) {
+        apiErrorText = delta.errorText.slice(0, 4000);
+        return;
+      }
       if (delta.replace && delta.partId) {
         if (delta.reasoning !== undefined) emitPart("reasoning", delta.partId, delta.reasoning);
         if (delta.text !== undefined) emitPart("text", delta.partId, delta.text);
@@ -2579,8 +2605,21 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
             // 收尾：异常退出/事件流缺失都不会有 content_block_stop，悬着的
             // 「进行中」步骤必须在这里结掉，否则气泡里永远转圈。
             if (activity && activity.finish()) emitActivity();
+            // 运行时自己说了「这一轮失败」（claude result 帧 is_error:true）。
+            // 必须在取正文之前拦住：退出码可能仍是 0，`result` 里那行
+            // `API Error: 503 …` 一旦当正文发上屏，用户看到的就是「agent 用报错
+            // 回答了我」，而终态还是 completed —— 比报失败更糟。
+            // 已产出的正文照样带出去（TurnIncompleteError.partialText），
+            // 失败码交给 classifyTurnError 按原因串归类。
+            if (apiErrorText) {
+              reject(new TurnIncompleteError(
+                classifyTurnError(apiErrorText),
+                streamedText.trim(),
+                apiErrorText,
+              ));
+              return;
+            }
             // 这一轮是不是「撞在失败的工具上就没下文了」。
-            //
             // 现场（2026-10-20 10:54 运维助手）：opencode 跑到第 7 步 bash 报错，
             // 进程 exit 0，之后再没吐过一个字 —— 气泡里只剩「…拉取模型列表：」
             // 这半句前言，而我们把 exit 0 当成了「答完了」。opencode 自己的会话库
@@ -2683,8 +2722,14 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
           // classifyTurnError 认出 login / unknown option，也不会让错误串膨胀
           // （几 MB 的 stdout 不能整个塞进去）。
           const tail = stdout.length > 800 ? stdout.slice(-800) : stdout;
+          // 运行时自报的原因优先：它比 stderr 尾巴和 stdout 尾巴都准。现场
+          // （2026-11-16，claude 2.1.325 选了一个网关没有渠道的模型）stderr 里
+          // 是一整段证书告警，真正的「无可用渠道」只在 result 帧里 —— 不优先它，
+          // 用户和日志都只会看到那句与原因无关的证书提示。
           reject(new Error(
-            `agent exited with code ${code}: ${stderr}${tail ? `\n[stdout tail]\n${tail}` : ""}`,
+            `agent exited with code ${code}: `
+              + `${apiErrorText ? `${apiErrorText}\n` : ""}${stderr}`
+              + `${tail ? `\n[stdout tail]\n${tail}` : ""}`,
           ));
         }
       });

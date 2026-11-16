@@ -27,6 +27,9 @@ export type TurnErrorCode =
   | "model_auth_failed"
   /** 被限流（429 且不是额度耗尽）：稍后重试即可。 */
   | "model_rate_limited"
+  /** 上游没有这个模型的可用服务：网关没给它配渠道，或服务方临时过载（503）。
+   *  动作是**换模型**（或稍后重试），换 key、充值都没用。 */
+  | "model_unavailable"
   /** 本轮跑超时被我们自己掐掉。 */
   | "turn_timeout"
   /** 会话队列满（1 在执行 + 1 排队），这条消息被直接丢弃。
@@ -61,6 +64,25 @@ const BALANCE_PATTERNS: readonly RegExp[] = [
   /payment required/i,
 ];
 
+// 「这个模型上游没有可用服务」。两种现场：网关没给该模型配渠道（one-api 系
+// 的 `分组 default 下模型 X 无可用渠道`），或服务方临时过载（`503` /
+// `service unavailable`）。动作都是**换模型或稍后重试** —— 与鉴权失败（换 key）、
+// 额度耗尽（等重置）必须分开，否则用户照着文案去改 key 只会白折腾。
+// 2026-11-16 现场：claude 2.1.325 的活目录列出了 `claude-opus-5-5`（CLI 自带清单
+// 里有），但网关分组没有它的渠道，选中即 503 —— 而当时归类落到 agent_failed，
+// 前端只说「这一轮没跑起来」。这类「目录里能选、选了就失败」的情况必须自己说出来。
+const UNAVAILABLE_PATTERNS: readonly RegExp[] = [
+  /无可用渠道/,
+  /no available channel/i,
+  /no available provider(?:s)?/i,
+  /\bno such model\b/i,
+  /model not found/i,
+  /model (?:_not_available|unavailable)/i,
+  /api error: ?503/i,
+  /service unavailable/i,
+  /\b503\b.*\b(?:upstream|gateway|distributor)\b/i,
+];
+
 const AUTH_PATTERNS: readonly RegExp[] = [
   /invalid api key/i,
   /incorrect api key/i,
@@ -68,8 +90,8 @@ const AUTH_PATTERNS: readonly RegExp[] = [
   /unauthorized/i,
   /\b401\b/,
   /authentication(?:_error| failed| error)/i,
-  /no such model/i,
-  /model not found/i,
+  // `no such model` / `model not found` 原本在这里，现归 UNAVAILABLE：那是
+  // 「这个模型不存在」，动作是换模型；让用户去换 key 是错的动作。
   // 「需要登录 / 未登录」：kimi 的 `Tip: send /login to use Kimi for Code`、
   // Claude Code 的 `Please run /login` / `Invalid API key · Please run /login`。
   // 归到已有的 model_auth_failed：web 已发布文案（「去设备端换 key」），不需要
@@ -111,6 +133,7 @@ export function classifyTurnError(raw: string): TurnErrorCode {
   if (/agent turn aborted/i.test(text)) return "agent_failed";
   if (matchesAny(text, QUOTA_PATTERNS)) return "model_quota_exhausted";
   if (matchesAny(text, BALANCE_PATTERNS)) return "model_balance_exhausted";
+  if (matchesAny(text, UNAVAILABLE_PATTERNS)) return "model_unavailable";
   if (matchesAny(text, AUTH_PATTERNS)) return "model_auth_failed";
   if (matchesAny(text, TIMEOUT_PATTERNS)) return "turn_timeout";
   if (matchesAny(text, RATE_LIMIT_PATTERNS)) return "model_rate_limited";
@@ -127,6 +150,7 @@ export function describeTurnError(code: TurnErrorCode): string {
     case "model_balance_exhausted": return "模型账户余额不足";
     case "model_auth_failed": return "模型鉴权失败（key 无效/无权限）";
     case "model_rate_limited": return "模型请求被限流";
+    case "model_unavailable": return "该模型在上游没有可用的服务渠道（未开通或临时过载）";
     case "turn_timeout": return "本轮执行超时";
     case "agent_busy": return "上一个任务还在执行，本条消息被丢弃";
     case "output_truncated": return "设备端输出超出上限被截断，本轮没有答完";
