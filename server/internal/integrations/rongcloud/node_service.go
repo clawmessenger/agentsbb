@@ -176,11 +176,29 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 	// 读到的一定是离线。运维是随设备常驻的能力，不能因为一拍空窗就报离线，
 	// 否则用户每次重启服务都会看到「运维助手离线」。
 	hostAlive := s.IsOnline(node.ID)
-	chosen := pickOpsNode(nodes, node.MachineID, node.RongcloudUserID, agentRCs, s.perAgentOpsEnabled.Load())
+	chosen := pickOpsNode(nodes, node.MachineID, node.RongcloudUserID, s.perAgentOpsEnabled.Load())
 	if chosen == nil {
 		return "", false, false, nil
 	}
 	return chosen.RongcloudUserID, s.IsOnline(chosen.ID) || hostAlive, true, nil
+}
+
+// isMachineLevelOpsRC 判定一个 ops 账号是不是这台机器的「机器级」运维账号。
+//
+// 只认两种名字，且 machine key 必须精确匹配：
+//   - "ops_<machineKey>"          新方案
+//   - "rc_node_<machineKey>_ops"  旧方案
+//
+// 不能用 classifyOpsRCUser 的「去掉 _ops 是否命中同机 agent」来判：agent 被
+// 注销/删除后它留下的 ops 行（如 antigravity_3300776275_ops）就不再命中任何
+// agent，会被误当成机器级 —— 而那正是 token 已失效的僵尸账号，选中它设备就
+// 连不上融云（2026-11-16 现场：新起 ops 子进程 60s 一次 31004 崩溃重启）。
+func isMachineLevelOpsRC(rcUserID, machineID string) bool {
+	key := machineIdentityKey(machineID)
+	if key == "" {
+		return false
+	}
+	return rcUserID == "ops_"+key || rcUserID == "rc_node_"+key+"_ops"
 }
 
 // pickOpsNode 在机器的 ops 节点里挑出运维入口（纯函数，便于单测）。
@@ -190,21 +208,21 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 // NodeService.perAgentOpsEnabled），存量行可能还在库里但**没有进程应答**，
 // 指向它会让用户看到「运维助手离线」；机器级 ops 才是每机唯一在跑的那个。
 //
-// 机器级 ops 的在野命名有两种（"ops_<key>" / 旧 "rc_node_<key>_ops"），都以
-// 去掉 "_ops" 后能否命中同机 agent 来判别（见 classifyOpsRCUser）。
-func pickOpsNode(nodes []db.RongcloudNode, machineID, agentRC string, agentRCs map[string]bool, perAgentEnabled bool) *db.RongcloudNode {
+// 机器级按名字精确匹配（isMachineLevelOpsRC），不按「是否被同机 agent 引用」
+// 推断 —— 后者会把已注销 agent 留下的僵尸 ops 行当成机器级（见该函数注释）。
+func pickOpsNode(nodes []db.RongcloudNode, machineID, agentRC string, perAgentEnabled bool) *db.RongcloudNode {
 	wantPerAgentRC := perAgentOpsRCUserID(agentRC)
 	var machineLevel, perAgent *db.RongcloudNode
 	for _, n := range nodes {
 		if n.MachineID != machineID || n.AiType.String != OpsAgentType {
 			continue
 		}
-		if n.RongcloudUserID == wantPerAgentRC {
+		if perAgentEnabled && n.RongcloudUserID == wantPerAgentRC {
 			copied := n
 			perAgent = &copied
 			continue
 		}
-		if _, isPerAgent := classifyOpsRCUser(n.RongcloudUserID, agentRCs); !isPerAgent {
+		if isMachineLevelOpsRC(n.RongcloudUserID, machineID) {
 			copied := n
 			machineLevel = &copied
 		}
@@ -215,10 +233,7 @@ func pickOpsNode(nodes []db.RongcloudNode, machineID, agentRC string, agentRCs m
 		}
 		return machineLevel
 	}
-	if machineLevel != nil {
-		return machineLevel
-	}
-	return perAgent
+	return machineLevel
 }
 
 func pgText(s string) pgtype.Text {
@@ -876,9 +891,9 @@ func (s *NodeService) ListUserFriends(ctx context.Context, rongCloudUserID strin
 // 值得钉住的是这条映射（谁的 agent 在什么开关下该消失），不是 I/O。
 //
 // 判定**完全**交给加入侧的 decideAgentJoin —— 这里只做两件它不做的事：
-//   1. 把投影（只有已认领的行）翻成 perms；未认领的不进 map，于是被它当成
-//      真人放行，正好等于加入侧「未认领放行」的口径。
-//   2. 把 (allowed, rejected) 的两拨拆成「要不要标记」的集合。
+//  1. 把投影（只有已认领的行）翻成 perms；未认领的不进 map，于是被它当成
+//     真人放行，正好等于加入侧「未认领放行」的口径。
+//  2. 把 (allowed, rejected) 的两拨拆成「要不要标记」的集合。
 //
 // viewerRCID 是当前登录账号的融云 id（= claw_im_users.user_id）。空串时直接返回
 // 空集：这时 decideAgentJoin 会按「拿不到发起人」不做主人豁免，照常按开关判，
@@ -2345,7 +2360,7 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 	// 另一个账号在应答。开关打开（回退旧行为）时不过滤，全部照发。
 	var chosenOpsRC string
 	if !s.perAgentOpsEnabled.Load() {
-		if chosen := pickOpsNode(nodes, machineID, "", agentRCs, false); chosen != nil {
+		if chosen := pickOpsNode(nodes, machineID, "", false); chosen != nil {
 			chosenOpsRC = chosen.RongcloudUserID
 		}
 	}
