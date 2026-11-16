@@ -32,13 +32,10 @@ import (
 
 const (
 	// clawUpgradeReleasesRepo 与发布流水线（.github/workflows/agentsbb-release.yml）
-	// 同源：Release 就发布在这个仓库。历史值是 `clawmessenger/claw-messenger`
-	// （见 clawUpgradeLegacyRepo），GitHub 侧做了 301 跳转，但 gh 镜像前缀不
-	// 一定跟随跳转，API 请求也多一跳 —— 所以这里直接用新名。
+	// 同源：Release 就发布在这个仓库。历史值是 `clawmessenger/claw-messenger`，
+	// GitHub 侧做了 301 跳转，但 gh 镜像前缀不一定跟随跳转，API 请求也多一跳 ——
+	// 所以这里直接用新名。任何 API / 下载请求都不再打老仓库。
 	clawUpgradeReleasesRepo = "clawmessenger/agentsbb"
-	// clawUpgradeLegacyRepo 是改名前的仓库。保留它只为了注释与排查历史 URL，
-	// 任何 API / 下载请求都**不再**打老仓库。
-	clawUpgradeLegacyRepo = "clawmessenger/claw-messenger"
 	// clawUpgradeTagPrefix 是发布 tag 的新前缀（`agentsbb-v1.4.0`）。
 	clawUpgradeTagPrefix = "agentsbb-v"
 	// clawUpgradeLegacyTagPrefix 是改名前的 tag 前缀。过渡期仍然接受：

@@ -10,10 +10,12 @@ package handler
 // `rongcloud_system_config` 里的配置项，后台「系统配置」页的通用键值就能改，
 // **每次拉取/查询开始时读一次 DB** —— 不做进程级缓存，改完即时生效，不需重启。
 //
-// ⚠️ 代理只接受 `http://` / `https://` / `socks5://` 的端口端点。机场**订阅
-// 地址**（`https://sub.xxx/.../subscribe?token=...`）是节点列表，不是代理端口，
-// 本服务**不做订阅解析** —— 填订阅地址只会被当作非法值忽略（并留一条 Warn），
-// 正确做法是先在服务器上跑一个本地内核（如 mihomo）把订阅变成 7890 这类端口。
+// ⚠️ 代理只接受 `http://` / `https://` / `socks5://` 开头的端点（没写 scheme 的
+// `127.0.0.1:7890` 会被判非法并忽略）。注意机场**订阅地址**
+// （`https://sub.xxx/.../subscribe?token=...`）**不做**内容嗅探：它的 scheme 合法，
+// 所以会通过校验，但它是节点列表而不是代理端口，真正拨号时才会失败。本服务
+// **不做订阅解析** —— 正确做法是先在服务器上跑一个本地内核（如 mihomo）把订阅
+// 变成 7890 这类本地端口，再把那个端口填进来。
 //
 // 读取优先级（每个键独立）：
 //
@@ -103,9 +105,10 @@ func (h *Handler) clawUpgradeNetSettings(ctx context.Context) clawUpgradeNetSett
 		if p := clawUpgradeNormalizeProxy(v); p != "" {
 			settings.Proxy = p
 		} else {
-			// 最常见的踩坑就是把机场订阅地址填进来。订阅是节点列表不是代理端口，
-			// 这里点名说明，运维一眼就知道该去搭本地内核。
-			slog.Warn("claw upgrade: 后台配置的代理非法，已忽略（只接受 http:// https:// socks5:// 开头的端口端点；机场订阅地址是节点列表，不是代理，请先用 mihomo 等本地内核转成本地端口）",
+			// 这条 Warn 只在「没写合法 scheme」时触发（典型是把 `127.0.0.1:7890`
+			// 直接填进来）。机场订阅地址是另一类坑，它的 scheme 合法、会通过
+			// 校验，失败发生在拨号那一刻 —— 见 clawUpgradeNormalizeProxy 的说明。
+			slog.Warn("claw upgrade: 后台配置的代理非法，已忽略（只接受 http:// https:// socks5:// 开头的代理端点，例如 http://127.0.0.1:7890）",
 				"config_key", clawUpgradeProxyConfigKey, "value", v)
 		}
 	}
@@ -165,7 +168,12 @@ func clawUpgradeNormalizeBase(value, fallback string) string {
 }
 
 // clawUpgradeNormalizeProxy 校验代理地址：只接受 http:// https:// socks5://
-// 开头的端口端点。空串 = 直连（合法）。机场订阅地址会被判非法。
+// 开头的端点。空串 = 直连（合法）。
+//
+// 这一层**只看 scheme**，不看端点内容：机场订阅地址（`https://sub.xxx/...`）
+// 同样以 https:// 开头，因此会通过校验 —— 它不是代理端口，失败发生在拨号那一刻。
+// 刻意不做内容嗅探（那需要真的发一次请求），边界写在这里是为了让运维知道
+// 「填进去没报错」不等于「填对了」。
 func clawUpgradeNormalizeProxy(value string) string {
 	p := strings.TrimSpace(value)
 	if p == "" {
