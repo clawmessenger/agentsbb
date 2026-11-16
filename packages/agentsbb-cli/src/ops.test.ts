@@ -213,6 +213,10 @@ describe("setupOpsWorkdir", () => {
       expect(md).toContain("不执行任何操作");
       expect(md).toContain("--all-agents");
       expect(md).toContain("批量");
+      // 共享段（意图理解/路径）两种模式复用。机器级下「本账号」指代不明，
+      // 容易被理解成「全机都是我的账号」，必须改成本轮对象的口径。
+      expect(md).not.toContain("只汇报本账号");
+      expect(md).toContain("只汇报本轮指定的这一个智能体");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
