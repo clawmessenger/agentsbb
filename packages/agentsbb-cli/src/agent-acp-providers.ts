@@ -1,4 +1,5 @@
 import type { AcpDiscoverySpec } from "./acp-discovery.js";
+import type { AcpTurnSpec } from "./acp-turn.js";
 
 // ACP 目录发现的启动规格表 —— 加一家 agent 只加一行。
 //
@@ -20,6 +21,15 @@ import type { AcpDiscoverySpec } from "./acp-discovery.js";
 
 export interface AgentAcpProvider {
   spec: AcpDiscoverySpec;
+  /**
+   * 该 agent 的**回合**是否也走 ACP（模型靠 session/set_model 生效）。
+   *
+   * 只有「模型注入除了 ACP 没有第二条路」的 agent 才填：填了它，runAgentTurn
+   * 就改用 acp-turn.ts 跑真实回合，模型选择才真的生效。catalogOnly（copilot /
+   * grok / hermes / kimi）不填 —— 它们的回合走各自的 headless 通道，模型靠
+   * `--model` / `-m` 注入，改走 ACP 只是平白多一层协议。
+   */
+  turn?: AcpTurnSpec;
   /** 面板与该表以外的说明用；日志里出现时就靠它定位哪家 agent 失败。 */
   label: string;
 }
@@ -38,22 +48,40 @@ export const AGENT_ACP_PROVIDERS: Readonly<Record<string, AgentAcpProvider>> = {
   "kiro-cli": {
     label: "Kiro CLI",
     spec: { args: ["acp"], providerFallback: "kiro" },
+    // kiro.go:265 续接走 session/load；模型走 session/set_model（kiro.go:325）。
+    turn: { args: ["acp"], providerFallback: "kiro", resume: "load", label: "Kiro CLI" },
   },
   qodercli: {
     label: "Qoder CLI",
     spec: { args: ["--yolo", "--acp"], providerFallback: "qoder" },
+    // qoder.go:256 续接走 session/resume（不是标准 load）。
+    turn: { args: ["--yolo", "--acp"], providerFallback: "qoder", resume: "resume", label: "Qoder CLI" },
   },
   qoderclicn: {
     label: "Qoder CN CLI",
     spec: { args: ["--yolo", "--acp"], providerFallback: "qoder" },
+    turn: { args: ["--yolo", "--acp"], providerFallback: "qoder", resume: "resume", label: "Qoder CN CLI" },
   },
   traecli: {
     label: "TRAE CLI",
     spec: { args: ["acp", "serve", "--yolo"], providerFallback: "trae" },
+    turn: { args: ["acp", "serve", "--yolo"], providerFallback: "trae", resume: "load", label: "TRAE CLI" },
   },
   dim: {
     label: "Dim Code",
     spec: { args: ["acp"], providerFallback: "dim" },
+    turn: {
+      args: ["acp"],
+      providerFallback: "dim",
+      resume: "load",
+      // dim.go:520-541：ACP server 建会话时钉的是只读预设，不抬到 full-access
+      // 的话每一轮写文件/起进程都会被静默拒绝。
+      setConfig: [
+        { id: "permission", value: "full-access" },
+        { id: "mode", value: "agent" },
+      ],
+      label: "Dim Code",
+    },
   },
   hermes: {
     label: "Hermes",
@@ -69,6 +97,13 @@ export const AGENT_ACP_PROVIDERS: Readonly<Record<string, AgentAcpProvider>> = {
     spec: {
       args: [...REASONIX_ACP_ARGS],
       providerFallback: "reasonix",
+    },
+    // reasonix.go:288 续接走 session/resume；模型 set_model 原样透传（:352）。
+    turn: {
+      args: [...REASONIX_ACP_ARGS],
+      providerFallback: "reasonix",
+      resume: "resume",
+      label: "Reasonix",
     },
   },
   copilot: {
@@ -88,4 +123,10 @@ export const AGENT_ACP_PROVIDERS: Readonly<Record<string, AgentAcpProvider>> = {
 export function acpProviderFor(agentName: string | undefined): AgentAcpProvider | null {
   if (!agentName) return null;
   return AGENT_ACP_PROVIDERS[agentName] ?? null;
+}
+
+/** 该 agent 的回合是否走 ACP（即模型注入只有 session/set_model 一条路）。 */
+export function acpTurnSpecFor(agentName: string | undefined): AcpTurnSpec | null {
+  if (!agentName) return null;
+  return AGENT_ACP_PROVIDERS[agentName]?.turn ?? null;
 }

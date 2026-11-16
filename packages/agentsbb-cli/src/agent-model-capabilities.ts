@@ -10,11 +10,16 @@
 //       'acp'        跑一次 ACP 握手拿 session/new 里的 models（acp-discovery.ts，
 //                    启动参数表 agent-acp-providers.ts；对齐上游 Go exe 的
 //                    discoverACPModels）
+//       'control'    跑一次控制协议请求拿活目录（claude 的 list_models，
+//                    claude-catalog.ts；对齐 claude_models.go）—— 它顶替静态表，
+//                    因为静态表可能含眼前这个 CLI 跑不了的模型
 //       'config'     读 agent 自己的配置文件 / probe 端点（model-providers.ts）
 //       'static'     设备端内置的静态兜底目录（model-static-catalogs.ts）
 //       'none'       不提供目录（面板显示解释文案，不是报错）
 //   * modelInjection —— savedDefaultModel 如何作用到下一轮 CLI 调用：
 //       'argv'        buildModelArgs 拼进命令行
+//       'acp'         回合本身走 ACP：session/set_model 切换（acp-turn.ts，
+//                     参数表 agent-acp-providers.ts 的 turn 字段）
 //       'stdin-frame' 随 stdin 协议帧携带（目前只有 dsh 的 execute 帧）
 //       'env'         子进程环境变量（codebuddy 的 CODEBUDDY_MODEL）
 //       'none'        无法可靠注入 —— 这类 agent **绝不给目录**（设计 D：
@@ -24,8 +29,8 @@
 // agents.ts 的注入分支）。新加 agent 时必须先在这里登记，再动 AGENT_MODEL_LIST /
 // buildModelArgs / model-static-catalogs.ts。
 
-export type CatalogSource = "cli" | "acp" | "config" | "static" | "none";
-export type ModelInjection = "argv" | "stdin-frame" | "env" | "none";
+export type CatalogSource = "cli" | "acp" | "control" | "config" | "static" | "none";
+export type ModelInjection = "argv" | "acp" | "stdin-frame" | "env" | "none";
 
 export interface AgentModelCapability {
   /** 目录来源（可多路并集时写主要来源；并集细节见 model-catalog.ts）。 */
@@ -35,12 +40,12 @@ export interface AgentModelCapability {
 }
 
 export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapability>> = {
-  // claude：Go 有 stream-json 控制协议目录（claude_models.go:215），但设备端
-  // 复刻整套控制协议成本不成比例；静态表来自 models.go:586-599
-  // claudeStaticModels。注入：`--model` 收裸模型 id（claude_models.go:340-344
-  // —— daemon 落库并传给 --model 的是 catalog 的裸 ResolvedModel），provider
-  // 前缀只是给前端分组的 anthropic（agents.ts buildModelArgs claude 分支剥掉）。
-  claude: { catalogSource: "static", modelInjection: "argv" },
+  // claude：活目录来自控制协议的 `list_models`（claude_models.go:1-60：claude
+  // 没有 --list-models，但 stream-json 控制通道会答这条请求，答案是**本机这个
+  // 二进制对当前账号**能跑的清单）。探测失败才回落静态表（models.go:586-599）。
+  // 注入：`--model` 收裸模型 id（claude_models.go:340-344），provider 前缀只是
+  // 给前端分组的 anthropic（agents.ts buildModelArgs claude 分支剥掉）。
+  claude: { catalogSource: "control", modelInjection: "argv" },
 
   // codex：目录走 ~/.codex/config.toml 的端点 probe（parseCodexConfig）；Go 的
   // debug models 输出裸 slug 且不全部可跑（model-providers.ts:17-19），不做静态。
@@ -105,11 +110,9 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   kimi: { catalogSource: "cli", modelInjection: "argv" },
 
   // reasonix：`reasonix acp`（参数见 reasonix.go:33 reasonixACPLaunchArgs）的
-  // session/new 回报目录（models.go:1855）。注入侧 Go 走 ACP session/set_model，
-  // 设备端目前是 headless 一次性调用（agents.ts reasonix 策略），没有 set_model
-  // 通道 —— 因此只登记目录来源，注入仍为 none（面板给出清单但不保证生效，
-  // 这是当前能力边界，不是遗漏）。
-  reasonix: { catalogSource: "acp", modelInjection: "none" },
+  // session/new 回报目录（models.go:1855）。注入：回合本身走 ACP，
+  // session/set_model 原样传 modelId（reasonix.go:352）。
+  reasonix: { catalogSource: "acp", modelInjection: "acp" },
 
   // dsh：`dsh --profile multica --list-models` 输出版本化 JSONL 的 models 帧
   // （dsh.go:436-479 discoverDshModels；profile 常量 dsh.go:19，设备端启动参数
@@ -118,9 +121,8 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   dsh: { catalogSource: "cli", modelInjection: "stdin-frame" },
 
   // kiro-cli：`kiro-cli acp` 的 session/new 回报目录（models.go:1868 +
-  // agent-acp-providers.ts）。注入侧 Go 走 ACP session/set_model（kiro.go:327），
-  // 设备端 headless 调用没有该通道，故注入 none。
-  "kiro-cli": { catalogSource: "acp", modelInjection: "none" },
+  // agent-acp-providers.ts）。注入：回合走 ACP，session/set_model（kiro.go:327）。
+  "kiro-cli": { catalogSource: "acp", modelInjection: "acp" },
 
   // agy（Antigravity）：`agy models` 本地枚举（models.go:2407-2425，MUL-3125）；
   // 输出是「id\tlabel」行、条目无 provider 字段（models.go:2427-2452），设备端
@@ -128,15 +130,13 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   agy: { catalogSource: "cli", modelInjection: "argv" },
 
   // qodercli / qoderclicn：`--yolo --acp` 的 session/new 回报目录
-  // （models.go:1915）。注入侧 Go 走 ACP session/set_model（qoder.go:310），
-  // 设备端无该通道，故 none。
-  qodercli: { catalogSource: "acp", modelInjection: "none" },
-  qoderclicn: { catalogSource: "acp", modelInjection: "none" },
+  // （models.go:1915）。注入：回合走 ACP，session/set_model（qoder.go:310）。
+  qodercli: { catalogSource: "acp", modelInjection: "acp" },
+  qoderclicn: { catalogSource: "acp", modelInjection: "acp" },
 
   // traecli：`traecli acp serve --yolo` 的 session/new 回报目录
-  // （models.go:667）。注入侧 Go 走 session/set_model（traecli.go:323），
-  // 设备端无该通道，故 none。
-  traecli: { catalogSource: "acp", modelInjection: "none" },
+  // （models.go:667）。注入：回合走 ACP，session/set_model（traecli.go:323）。
+  traecli: { catalogSource: "acp", modelInjection: "acp" },
 
   // grok：`grok models`（2026-11 真机实测，exit 0，人类可读文本）给出目录：
   // 连字符 id（`quukk-glm-5.2`）+ 裸 id（`grok-4.7`），头部 `Default model:` 行
@@ -158,9 +158,9 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   zeroclaw: { catalogSource: "none", modelInjection: "none" },
 
   // dim：`dim acp` 的 session/new 回报 models.availableModels
-  // （models.go:2988；需 OAuth 登录，失败回落手动填写）。注入侧 Go 走
-  // session/set_model（dim.go:544），设备端无该通道，故 none。
-  dim: { catalogSource: "acp", modelInjection: "none" },
+  // （models.go:2988；需 OAuth 登录，失败回落手动填写）。注入：回合走 ACP，
+  // set_config_option 抬权限 + session/set_model（dim.go:520-544）。
+  dim: { catalogSource: "acp", modelInjection: "acp" },
 };
 
 // 未知 agent 名一律按「无目录、无注入」保守处理：宁缺毋滥，绝不猜参数。

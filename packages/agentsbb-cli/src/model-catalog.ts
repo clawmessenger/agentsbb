@@ -18,6 +18,7 @@ import {
   type ProviderEndpoint,
 } from "./model-providers.js";
 import { staticModelCatalogFor } from "./model-static-catalogs.js";
+import { discoverClaudeCatalog } from "./claude-catalog.js";
 
 // Protocol v2 model-catalog responder for the web's 设备管理 → 默认模型 panel.
 //
@@ -713,6 +714,12 @@ export interface ModelCatalogLoaderOpts {
    */
   discoverAcp?: (execPath: string, spec: AcpDiscoverySpec) => Promise<DiscussionModelCatalog>;
   /**
+   * 跑一次 claude 的控制协议探测拿活目录（`list_models`）。缺省是真进程；
+   * 测试注入桩，避免起真 CLI。见 claude-catalog.ts。
+   */
+  discoverClaude?: (opts: { execPath: string; logger?: (message: string) => void })
+  => Promise<DiscussionModelCatalog | null>;
+  /**
    * Runs one agent subcommand. `stopWhen`（可选，第 4 参）来自 ModelListSpec：
    * 命令打完帧不肯退出时（dsh）靠它早退，实现可以忽略它。
    */
@@ -870,7 +877,29 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
     // 后面的 CLI / 端点 probe 只做并集追加，永远不会把它挤掉：面板因此在
     // 「配置缺失 + CLI 失败 + probe 不通」三路全断时仍有最小可用目录。
     const capability = agentModelCapability(opts.agentName);
-    const staticCatalog = capability.modelInjection === "none"
+    // claude 的活目录（控制协议 list_models）：它**顶替**静态表而不是并集 ——
+    // 静态表里可能有眼前这个 CLI 跑不了的模型（上游新模型 / 旧 CLI 的 400），
+    // 两者并集等于把「选了必失败」的条目再放回面板。发现失败才用静态表。
+    let liveClaude = false;
+    if (capability.catalogSource === "control" && opts.execPath) {
+      const discoverClaude = opts.discoverClaude
+        ?? ((probeOpts: { execPath: string; logger?: (message: string) => void }) =>
+          discoverClaudeCatalog(probeOpts));
+      try {
+        const live = await discoverClaude({
+          execPath: opts.execPath,
+          ...(opts.logger ? { logger: opts.logger } : {}),
+        });
+        if (live && live.providers.length > 0) {
+          mergeCatalogGroups(grouped, live);
+          if (!defaultModel) defaultModel = live.defaultModel;
+          liveClaude = true;
+        }
+      } catch (err) {
+        opts.logger?.(`model catalog: ${opts.agentName} live discovery failed: ${describe(err)}`);
+      }
+    }
+    const staticCatalog = capability.modelInjection === "none" || liveClaude
       ? null
       : staticModelCatalogFor(opts.agentName, {
         hasProviderConfig: (config?.endpoints.length ?? 0) > 0,

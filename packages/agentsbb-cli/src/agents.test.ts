@@ -35,6 +35,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyTurnError } from "./turn-error.js";
 import { AGENT_MODEL_CAPABILITIES } from "./agent-model-capabilities.js";
+import { acpTurnSpecFor } from "./agent-acp-providers.js";
 
 // 本文件测的是 run --format json 那条路径的解析（part 去重、缓冲截断、半句判据）。
 // opencode 默认已改走 serve + SSE（真增量），这里统一关掉，让假脚本能按 run 的
@@ -542,6 +543,15 @@ describe("splitModelRoute / buildModelArgs", () => {
       } else if (capability.modelInjection === "stdin-frame") {
         // dsh：模型随 stdin 的 execute 帧走，argv 里没有 --model
         expect(argv, `${agentName} carries the model on stdin`).toEqual([]);
+      } else if (capability.modelInjection === "acp") {
+        // ACP 类 agent：模型靠 session/set_model 切换，argv 里不该有模型参数
+        // （它们不认 --model，塞进去只会更早退出）。协议侧的断言在
+        // acp-turn.test.ts，这里只钉住「argv 干净 + 确实有 ACP turn 规格」。
+        expect(argv, `${agentName} must not pass a model on argv`).toEqual([]);
+        expect(
+          acpTurnSpecFor(agentName),
+          `${agentName} claims acp injection but has no ACP turn spec`,
+        ).not.toBeNull();
       } else if (capability.modelInjection === "env") {
         // codebuddy：只留 --port 0，模型走 CODEBUDDY_MODEL
         expect(argv.join(" "), `${agentName} must not pass the route on argv`)
@@ -1482,7 +1492,9 @@ describe("runAgentTurn", () => {
     expect(parseStreamJsonLine('{"type":"assistant"}')).toBeNull();
   });
 
-  it("traecli：exec --json 端到端（宽松思考 + 正文提取）", async () => {
+  // 这一组钉的是 **headless 回退路**（ACP 起不来时走的就是它），所以显式
+  // disableAcp：默认路由已经是 ACP（见 agent-acp-providers.ts 的 turn 字段）。
+  it("traecli：exec --json 端到端（宽松思考 + 正文提取，ACP 回退路）", async () => {
     // exec JSONL 真实事件流骨架（官方文档自述 --json 输出事件流；thought
     // 字段按宽松匹配兜住——装机实测后收窄字段名）。
     const traecliTurnStdout = [
@@ -1500,6 +1512,7 @@ describe("runAgentTurn", () => {
         agentName: "traecli",
         prompt: "hi",
         timeoutMs: 30_000,
+        disableAcp: true,
         onReasoningChunk: (c) => { reasoning.push(c); },
         onChunk: (c) => { chunks.push(c); },
       });
@@ -1511,7 +1524,7 @@ describe("runAgentTurn", () => {
     }
   });
 
-  it("qodercli：stream-json 端到端（claude 同形骨架 + 宽松思考）", async () => {
+  it("qodercli：stream-json 端到端（claude 同形骨架 + 宽松思考，ACP 回退路）", async () => {
     const qoderTurnStdout = [
       '{"type":"system","subtype":"init","session_id":"q1","model":"qoder-model"}',
       '{"type":"assistant","reasoning":"想想再答"}',
@@ -1527,6 +1540,7 @@ describe("runAgentTurn", () => {
         agentName: "qodercli",
         prompt: "hi",
         timeoutMs: 30_000,
+        disableAcp: true,
         onReasoningChunk: (c) => { reasoning.push(c); },
         onChunk: (c) => { chunks.push(c); },
       });
@@ -1546,6 +1560,7 @@ describe("runAgentTurn", () => {
         agentName: "qoderclicn",
         prompt: "hi",
         timeoutMs: 30_000,
+        disableAcp: true,
       });
       const args = fixture.recordedArgs();
       expect(args).toContain("-p");

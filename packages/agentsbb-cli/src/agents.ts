@@ -12,6 +12,8 @@ import {
   createActivityTracker,
 } from "./agent-activity.js";
 import { ensureCodexBehaviorPrompt, ensureCodexOutputStyle, ensureCodexFastStart, ensureQwenFastStart } from "./agent-instructions.js";
+import { acpTurnSpecFor } from "./agent-acp-providers.js";
+import { AcpStartupError, runAcpTurn } from "./acp-turn.js";
 import {
   fsGateExempt,
   fsRestriction,
@@ -125,6 +127,9 @@ export interface RunAgentTurnOpts {
   // 内部用：serve 模式起不来时退回 run --format json，递归进来时置 true，
   // 避免二次分流。外部调用方不该传。
   disableServerMode?: boolean;
+  // 内部用：ACP 回合起不来时退回 headless 一次性调用，递归进来时置 true。
+  // 外部调用方不该传。
+  disableAcp?: boolean;
   // 依赖注入：v2 探测用的 fetch（测试里换掉，避免真实网络）。默认全局 fetch。
   v2ProbeFetch?: typeof fetch;
   /**
@@ -838,7 +843,7 @@ export function buildSpawnInvocation(
 
 // On Windows, child.kill() only terminates the immediate wrapper process;
 // the agent lives in a descendant. taskkill /T tears down the whole tree.
-function killProcessTree(child: { pid?: number; kill: () => void }): void {
+export function killProcessTree(child: { pid?: number; kill: () => void }): void {
   if (process.platform === "win32" && child.pid !== undefined) {
     try {
       spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
@@ -2234,6 +2239,45 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   // 设过则不动）。实测每轮 result 事件因此晚 15~45s —— 见 agent-instructions.ts。
   if (opts.agentName === "qwen") {
     ensureQwenFastStart();
+  }
+
+  // ACP 回合通道：模型注入有两条路，argv（`--model X`）与 ACP
+  // （`session/set_model`）。kiro-cli / qodercli / qoderclicn / traecli / dim /
+  // reasonix 只认后者 —— 设备端过去没有这条通道，这几家在面板上「能选不生效」。
+  // 参数表见 agent-acp-providers.ts 的 turn 字段（逐条对齐 Go 的 *_backend）。
+  //
+  // 只在**开跑前**失败时回退 headless：进程起不来 / initialize 被拒 / session
+  // 建不出 —— 那几种情况下回退是纯赚（内容照样拿得到），而 prompt 已经发出去
+  // 之后再回退等于让 agent 把同一件事做两遍。
+  const acpSpec = opts.disableAcp ? null : acpTurnSpecFor(opts.agentName);
+  if (acpSpec) {
+    // ACP 没有指令层注入点（Go 的 dim/kiro 也是拼进 userText：
+    // dim.go:596-600）。私聊的行为规范只能这样带进去。
+    const promptText = opts.behaviorPrompt
+      ? `${opts.behaviorPrompt}\n\n---\n\n${opts.prompt}`
+      : opts.prompt;
+    return runAcpTurn({
+      execPath: opts.execPath,
+      spec: acpSpec,
+      prompt: promptText,
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      timeoutMs,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+      ...(fsRestricted ? { fsRestricted: true } : {}),
+      ...(opts.onChunk ? { onChunk: opts.onChunk } : {}),
+      ...(opts.onReasoningChunk ? { onReasoningChunk: opts.onReasoningChunk } : {}),
+      ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
+      ...(opts.onSessionId ? { onSessionId: opts.onSessionId } : {}),
+      logger: (message) => console.warn(message),
+    }).catch((err: unknown) => {
+      if (!(err instanceof AcpStartupError) || opts.disableAcp) throw err;
+      // 起不来就退回 headless：内容仍然拿得到，只是模型选择对这家 agent
+      // 不生效（与改造前一致），绝不因为 ACP 让一轮失败。
+      console.warn(`${acpSpec.label} ACP 不可用，回退 headless：${err.message}`);
+      return runAgentTurn({ ...opts, disableAcp: true });
+    });
   }
 
   // opencode：默认走 serve + SSE（真 token 级增量）。只有 argv 策略成立时
