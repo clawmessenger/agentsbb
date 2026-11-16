@@ -883,6 +883,8 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
       );
     }
 
+    // CLI 列举是否真的产出了条目 —— ACP 通道据此决定还要不要另起一次握手。
+    let cliProduced = false;
     if (spec) {
       const label = `${opts.agentName} ${spec.argv.join(" ")}`;
       const cliTimeoutMs = hasDeclared
@@ -901,6 +903,7 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
         // 清单缩成 CLI 那份子集。静态兜底（上面已并入）同理不被挤掉。
         mergeCatalogGroups(grouped, fromCli);
         if (!defaultModel) defaultModel = fromCli.defaultModel;
+        cliProduced = fromCli.providers.length > 0;
         opts.logger?.(`model catalog: ${label} -> ${fromCli.providers.length} provider(s)`);
       } catch (err) {
         opts.logger?.(
@@ -917,17 +920,17 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
     // reasonix / copilot 在面板上一律空态。这里一次接上，参数表见
     // agent-acp-providers.ts。
     //
-    // 只在「CLI 路缺席」或「CLI 路一无所获」时跑：有 cli 目录时 ACP 只是同一份
-    // 清单的第二次进程启动，白花 15s；而 CLI 超时/失败时 ACP 往往是唯一答案。
+    // 只在「本 agent 的 CLI/配置都没给出目录」时跑：已经有清单时 ACP 只是同一份
+    // 答案的第二次进程启动，白花 15s；而 CLI 超时/失败时 ACP 往往才是唯一答案
+    // （hermes 就是典型：它的 config.yaml 只写了端点，完整清单在 session/new）。
     // 闸门是 capability.catalogSource === "acp"：没登记的 agent 不去 spawn，
     // 免得对着不认 ACP 的二进制瞎试。
-    if (capability.catalogSource === "acp") {
+    if (capability.catalogSource === "acp" && declaredAdded === 0 && !cliProduced) {
       const acpProvider = acpProviderFor(opts.agentName);
-      const cliProduced = grouped.size > 0;
-      if (acpProvider && !cliProduced) {
+      if (acpProvider) {
         const runAcp = opts.discoverAcp
-          ?? ((execPath: string, spec2: AcpDiscoverySpec) =>
-            discoverAcpModelCatalog({ execPath, spec: spec2, logger: opts.logger }));
+          ?? ((execPath: string, spec: AcpDiscoverySpec) =>
+            discoverAcpModelCatalog({ execPath, spec, logger: opts.logger }));
         try {
           const fromAcp = await runAcp(opts.execPath ?? opts.agentName ?? "", acpProvider.spec);
           mergeCatalogGroups(grouped, fromAcp);
