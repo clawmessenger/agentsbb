@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { writeFileSync } from "node:fs";
 import {
   AgentCliInfoProbe,
   agentCliCommand,
@@ -133,7 +134,7 @@ describe("AgentCliInfoProbe", () => {
 
   it("首次快照为空；refresh 后带上探测结果并落盘", async () => {
     const path = tmpPath();
-    let now = 1_000;
+    const now = 1_000;
     const probe = new AgentCliInfoProbe({
       path,
       now: () => now,
@@ -230,8 +231,6 @@ function joinTmp(name: string): string {
 
 function writeBadCache(path: string): void {
   // 直接写坏 JSON：模拟升级中断/磁盘写一半
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { writeFileSync } = require("node:fs") as typeof import("node:fs");
   writeFileSync(path, "{ not json", "utf8");
 }
 

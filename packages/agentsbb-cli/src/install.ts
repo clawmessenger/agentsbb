@@ -70,8 +70,12 @@ export const LEGACY_EXE_NAMES = new Set(["clawmessenger", "clawmessenger.exe"]);
 /** basename(execPath) 旧名判定（大小写不敏感，Windows 语义）。 */
 export function isLegacyExeName(execPath: string, platform: string = process.platform): boolean {
   if (!execPath) return false;
-  const base = path.basename(execPath, platform === "win32" ? ".exe" : undefined);
-  const withExt = path.basename(execPath);
+  // basename 实现必须跟着**参数里的** platform 走：环境 `path` 在 Linux/macOS
+  // 上是 posix、不认 `\`，拿它判 Windows 形态的路径会把整串当 basename 漏判
+  // （CI 上 win32 用例挂过，本地 Windows 跑不出来就是平台差）。
+  const p = platform === "win32" ? path.win32 : path.posix;
+  const base = p.basename(execPath, platform === "win32" ? ".exe" : undefined);
+  const withExt = p.basename(execPath);
   return LEGACY_EXE_NAMES.has(base.toLowerCase()) || LEGACY_EXE_NAMES.has(withExt.toLowerCase());
 }
 
