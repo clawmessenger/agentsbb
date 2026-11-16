@@ -138,6 +138,7 @@ describe("AgentCliInfoProbe", () => {
     const probe = new AgentCliInfoProbe({
       path,
       now: () => now,
+      fileExists: () => true,
       discover: async () => [{ name: "codex", path: "/opt/bin/codex" }],
       runVersion: async () => "codex-cli 0.48.0",
       log: () => {},
@@ -164,6 +165,7 @@ describe("AgentCliInfoProbe", () => {
       path,
       now: () => now,
       ttlMs: 1_000,
+      fileExists: () => true,
       discover: async () => [
         { name: "codex", path: "/opt/bin/codex" },
         { name: "opencode", path: "/opt/bin/opencode" },
@@ -195,6 +197,7 @@ describe("AgentCliInfoProbe", () => {
     const probe = new AgentCliInfoProbe({
       path,
       ttlMs: 0,
+      fileExists: () => true,
       discover: async () => [{ name: "codex", path: "/opt/bin/codex" }],
       runVersion: async () => {
         if (fail) throw new Error("timeout");
@@ -211,6 +214,81 @@ describe("AgentCliInfoProbe", () => {
     await flush();
     // 探到的是「路径有、版本空」——空版本不得覆盖已知版本
     expect(probe.snapshot().get("codex")?.cliVersion).toBe("0.48.0");
+  });
+
+  it("缓存指向的二进制已被卸载：不显示幽灵版本，且 TTL 内也触发重探", async () => {
+    // 2026-11-16 现场：缓存记着 npm 兜底装的 opencode 1.19.5，随后该包被卸载，
+    // TTL 还有几个小时 —— 后台整整一下午显示一个已不存在的版本。缓存条目的
+    // cliPath 在磁盘上不存在时，snapshot 不得返回它，refresh 也不得回带。
+    const path = tmpPath();
+    let now = 1_000;
+    const deadPath = "/opt/bin/opencode-dead";
+    const livePath = "/opt/bin/opencode";
+    const exists = new Set<string>(); // 死路径已从磁盘消失（livePath 由 discover 直接给出，不需要存在性）
+    // 预置一份「指向已卸载二进制」的缓存（TTL 内）
+    writeFileSync(
+      path,
+      JSON.stringify({ version: 1, probedAt: now, agents: { opencode: { cliPath: deadPath, cliVersion: "1.19.5" } } }),
+      "utf8",
+    );
+    const probe = new AgentCliInfoProbe({
+      path,
+      now: () => now,
+      ttlMs: 1_000_000,
+      fileExists: (p) => exists.has(p),
+      discover: async () => [{ name: "opencode", path: livePath }],
+      runVersion: async (p) => (p === livePath ? "2.1.4" : "1.19.5"),
+      log: () => {},
+    });
+
+    // snapshot：死路径条目不返回（页面看不到幽灵版本）
+    expect(probe.snapshot().size).toBe(0);
+
+    // refresh：TTL 完全没过，但死路径 = 视为缺失，立即重探
+    let runVersionCalls = 0;
+    const runVersionSpy = async (p: string) => {
+      runVersionCalls += 1;
+      return p === livePath ? "2.1.4" : "1.19.5";
+    };
+    const probe2 = new AgentCliInfoProbe({
+      path,
+      now: () => now,
+      ttlMs: 1_000_000,
+      fileExists: (p) => exists.has(p),
+      discover: async () => [{ name: "opencode", path: livePath }],
+      runVersion: runVersionSpy,
+      log: () => {},
+    });
+    probe2.refresh(["opencode"]);
+    await flush();
+    expect(runVersionCalls).toBe(1);
+    exists.add(livePath); // 探测落盘后 livePath 也应真实存在（模拟安装完成）
+    const snap = probe2.snapshot();
+    expect(snap.get("opencode")).toEqual({ agent: "opencode", cliPath: livePath, cliVersion: "2.1.4" });
+  });
+
+  it("探测空手而归且回带的旧条目二进制已被卸载时不回带（防幽灵版本复活）", async () => {
+    const path = tmpPath();
+    let now = 1_000;
+    let deadGone = false; // 探到 0.48.0 之后二进制被卸载
+    const probe = new AgentCliInfoProbe({
+      path,
+      now: () => now,
+      ttlMs: 0, // 每次都重探
+      fileExists: () => !deadGone,
+      discover: async () => (deadGone ? [] : [{ name: "codex", path: "/opt/bin/codex" }]),
+      runVersion: async () => "0.48.0",
+      log: () => {},
+    });
+    probe.refresh(["codex"]);
+    await flush();
+    expect(probe.snapshot().get("codex")?.cliVersion).toBe("0.48.0");
+
+    // 二进制卸载 + 探测空手而归：旧版本不得复活
+    deadGone = true;
+    probe.refresh(["codex"], { force: true });
+    await flush();
+    expect(probe.snapshot().get("codex")).toBeUndefined();
   });
 
   it("损坏的缓存文件当成没探过（不抛）", () => {

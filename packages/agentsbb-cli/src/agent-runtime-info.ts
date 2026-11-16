@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { stateHome } from "./paths.js";
@@ -205,6 +205,7 @@ export class AgentCliInfoProbe {
   private readonly timeoutMs: number;
   private readonly discover?: ProbeAgentCliInfoOpts["discover"];
   private readonly runVersion?: ProbeAgentCliInfoOpts["runVersion"];
+  private readonly fileExists: (path: string) => boolean;
   private readonly now: () => number;
   private readonly log: (message: string) => void;
 
@@ -219,6 +220,8 @@ export class AgentCliInfoProbe {
     now?: () => number;
     discover?: ProbeAgentCliInfoOpts["discover"];
     runVersion?: ProbeAgentCliInfoOpts["runVersion"];
+    /** 依赖注入：测试里换成永远 true / 按路径判断的桩。 */
+    fileExists?: (path: string) => boolean;
     log?: (message: string) => void;
   } = {}) {
     this.path = opts.path ?? defaultAgentCliInfoPath(opts.home);
@@ -226,6 +229,7 @@ export class AgentCliInfoProbe {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_VERSION_TIMEOUT_MS;
     this.discover = opts.discover;
     this.runVersion = opts.runVersion;
+    this.fileExists = opts.fileExists ?? ((p) => existsSync(p));
     this.now = opts.now ?? (() => Date.now());
     this.log = opts.log ?? ((message) => console.error(message));
     this.cache = readAgentCliInfoCache(this.path);
@@ -236,6 +240,10 @@ export class AgentCliInfoProbe {
     const out = new Map<string, AgentCliInfo>();
     for (const [agent, entry] of Object.entries(this.cache?.agents ?? {})) {
       if (!entry.cliVersion) continue;
+      // 2026-11-16 现场：缓存指向运维兜底 npm 装的 opencode 1.19.5，该包随后被
+      // 卸载，但 TTL 还有几个小时 —— 后台整整一下午显示一个已不存在的版本。
+      // 指向已删除二进制的条目是谎言，不对外返回；refresh 侧会把它当缺失重探。
+      if (entry.cliPath && !this.fileExists(entry.cliPath)) continue;
       out.set(agent, {
         agent,
         cliPath: entry.cliPath ?? "",
@@ -259,7 +267,9 @@ export class AgentCliInfoProbe {
     const wanted = [...new Set(agents.map((agent) => agent.trim()).filter(Boolean))];
     if (wanted.length === 0 || this.probing) return;
     const cached = this.cache?.agents ?? {};
-    const missing = wanted.filter((agent) => !cached[agent]?.cliVersion);
+    // 缓存条目指向的二进制已被卸载 = 这条缓存作废，即便 TTL 没到也要重探。
+    const isDead = (entry?: { cliPath?: string }) => !!entry?.cliPath && !this.fileExists(entry.cliPath);
+    const missing = wanted.filter((agent) => !cached[agent]?.cliVersion || isDead(cached[agent]));
     if (!opts.force && missing.length === 0 && this.fresh()) return;
 
     this.probing = true;
@@ -273,18 +283,24 @@ export class AgentCliInfoProbe {
         const probedAt = this.now();
         // 逐键合并而不是整体覆盖：这次空手而归（`--version` 超时、PATH 抖动）
         // 的 agent 必须保留上一次探到的版本，否则页面上的版本号会在有/无之间闪。
+        // 但「上一次」的二进制已经被卸载时除外 —— 路径不存在，版本号就是幽灵
+        // 数据（npm 旧版卸载后后台一直显示 1.19.5 就是这么来的），不能回带。
+        const prevUsable = (prev?: { cliPath?: string; cliVersion?: string }) =>
+          !!prev?.cliVersion && (!prev.cliPath || this.fileExists(prev.cliPath));
         const mergedAgents: Record<string, { cliPath?: string; cliVersion?: string }> = {};
         for (const info of infos) {
           const prev = this.cache?.agents[info.agent];
+          const canCarry = prevUsable(prev);
           mergedAgents[info.agent] = {
-            cliPath: info.cliPath || prev?.cliPath || "",
-            cliVersion: info.cliVersion || prev?.cliVersion || "",
+            cliPath: info.cliPath || (canCarry ? prev?.cliPath ?? "" : ""),
+            cliVersion: info.cliVersion || (canCarry ? prev?.cliVersion ?? "" : ""),
           };
         }
         // 本轮没探测到的键（比如临时从 PATH 上消失）也保留旧值：agent 还在绑定时
-        // 页面宁可显示「上次看到的版本」也不要突然变成「-」。
+        // 页面宁可显示「上次看到的版本」也不要突然变成「-」。同样地，二进制已
+        // 被卸载的条目不保留。
         for (const [agent, prev] of Object.entries(this.cache?.agents ?? {})) {
-          if (!(agent in mergedAgents)) mergedAgents[agent] = prev;
+          if (!(agent in mergedAgents) && prevUsable(prev)) mergedAgents[agent] = prev;
         }
         const merged: AgentCliInfoCache = { version: 1, probedAt, agents: mergedAgents };
         this.cache = merged;
