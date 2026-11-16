@@ -2364,6 +2364,16 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 			chosenOpsRC = chosen.RongcloudUserID
 		}
 	}
+	// 被挑中的那一个运维节点如果拿不到凭据，必须留下痕迹：此前这里是静默
+	// continue，线上表现成「运维进程根本没起来」，日志里一个字都没有
+	// （2026-11-16 排查耗掉半小时）。token/secret 解不开是换过 secretbox key
+	// 的典型症状，只有日志能看出来。
+	logSkip := func(rc, why string) {
+		if rc == chosenOpsRC {
+			s.logger.Warn("rongcloud: chosen ops node has no usable credential",
+				"agent_rc", rc, "reason", why)
+		}
+	}
 	for _, n := range nodes {
 		if n.ID == machineNode.ID {
 			continue // the machine node itself is not an agent target
@@ -2376,26 +2386,32 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 		}
 		rcUser, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID)
 		if err != nil || !rcUser.TokenEncrypted.Valid || s.box == nil {
+			logSkip(n.RongcloudUserID, "rongcloud user row or token missing")
 			continue
 		}
 		tokenSealed, err := base64.StdEncoding.DecodeString(rcUser.TokenEncrypted.String)
 		if err != nil {
+			logSkip(n.RongcloudUserID, "token is not base64")
 			continue
 		}
 		token, err := s.box.Open(tokenSealed)
 		if err != nil {
+			logSkip(n.RongcloudUserID, "token cannot be decrypted")
 			continue
 		}
 		device, err := s.queries.GetRongCloudDeviceByNodeID(ctx, n.ID)
 		if err != nil || !device.CredentialID.Valid || !device.CredentialSecretEncrypted.Valid {
+			logSkip(n.RongcloudUserID, "device credential missing")
 			continue
 		}
 		secretSealed, err := base64.StdEncoding.DecodeString(device.CredentialSecretEncrypted.String)
 		if err != nil {
+			logSkip(n.RongcloudUserID, "device secret is not base64")
 			continue
 		}
 		deviceSecret, err := s.box.Open(secretSealed)
 		if err != nil {
+			logSkip(n.RongcloudUserID, "device secret cannot be decrypted")
 			continue
 		}
 		cred := MachineAgentCredential{
