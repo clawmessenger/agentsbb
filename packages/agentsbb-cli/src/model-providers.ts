@@ -486,6 +486,15 @@ export function stripJsonComments(text: string): string {
 //                  "models": { "glm-5.2": {…}, "k3": {…} } } } }
 //
 // 注意 key 的大小写：baseURL / apiKey 是驼峰，别写成 baseUrl。
+//
+// 2026-11-16 现场教训（小久，opencode 2.1.4）：opencode 有**两代配置格式** ——
+//   V1（opencode 1.x）：`provider`（单数）+ `npm` + `options`（baseURL/apiKey）
+//   V2（opencode 2.x）：`providers`（复数）+ `package` + `settings`
+// 两个键在官方 config schema 里并存，但**运行时只认自己那一代**：V1 引擎读到
+// `providers` 段会打 WARN「Omitted native setting that cannot be represented
+// in V1」后整段丢弃；V2 引擎则保留旧 `provider` 的迁移逻辑。解析器两代都收，
+// 同 id 并存时 V2 条目整体优先（与上游 v2 规范化行为一致），保证不管设备装的是
+// 哪一代 opencode，目录都不会丢供应商。
 export function parseOpencodeConfig(text: string): AgentConfig {
   let parsed: unknown;
   try {
@@ -504,9 +513,36 @@ export function parseOpencodeConfig(text: string): AgentConfig {
   const endpoints: ProviderEndpoint[] = [];
   const declaredModels: Record<string, string[]> = {};
 
-  const providers = record.provider;
-  if (typeof providers === "object" && providers !== null && !Array.isArray(providers)) {
-    for (const [rawId, value] of Object.entries(providers as Record<string, unknown>)) {
+  // 把一个 provider 条目收进 endpoints / declaredModels。settingsOrOptions 是
+  // 两代格式的端点配置（V1 options / V2 settings，字段同名 baseURL/apiKey）。
+  const collect = (
+    id: string,
+    provider: Record<string, unknown>,
+    settingsOrOptions: Record<string, unknown>,
+  ): void => {
+    const name = asString(provider.name);
+    const baseUrl = asString(
+      settingsOrOptions.baseURL ?? settingsOrOptions.baseUrl ?? settingsOrOptions.base_url,
+    );
+    const apiKey = asString(settingsOrOptions.apiKey ?? settingsOrOptions.api_key);
+    if (baseUrl) {
+      endpoints.push({ id, ...(name ? { name } : {}), baseUrl, ...(apiKey ? { apiKey } : {}) });
+    }
+    const models = provider.models;
+    if (typeof models !== "object" || models === null || Array.isArray(models)) return;
+    const slugs: string[] = [];
+    for (const rawSlug of Object.keys(models as Record<string, unknown>)) {
+      const slug = asString(rawSlug);
+      if (!slug || slugs.includes(slug)) continue;
+      slugs.push(slug);
+    }
+    if (slugs.length > 0) declaredModels[id] = slugs;
+  };
+
+  // V1：`provider.<id>.options`。
+  const v1 = record.provider;
+  if (typeof v1 === "object" && v1 !== null && !Array.isArray(v1)) {
+    for (const [rawId, value] of Object.entries(v1 as Record<string, unknown>)) {
       // provider 的 key 就是 id（`provider.<id>.name` 只是展示名）。
       const id = asString(rawId);
       if (!id) continue;
@@ -515,21 +551,28 @@ export function parseOpencodeConfig(text: string): AgentConfig {
       const options = (typeof provider.options === "object" && provider.options !== null
         ? provider.options
         : {}) as Record<string, unknown>;
-      const name = asString(provider.name);
-      const baseUrl = asString(options.baseURL ?? options.baseUrl ?? options.base_url);
-      const apiKey = asString(options.apiKey ?? options.api_key);
-      if (baseUrl) {
-        endpoints.push({ id, ...(name ? { name } : {}), baseUrl, ...(apiKey ? { apiKey } : {}) });
+      collect(id, provider, options);
+    }
+  }
+
+  // V2：`providers.<id>.settings`。同 id 时整体覆盖 V1 条目（endpoints 先删后
+  // 加；declaredModels 直接覆盖）。
+  const v2 = record.providers;
+  if (typeof v2 === "object" && v2 !== null && !Array.isArray(v2)) {
+    for (const [rawId, value] of Object.entries(v2 as Record<string, unknown>)) {
+      const id = asString(rawId);
+      if (!id) continue;
+      if (typeof value !== "object" || value === null) continue;
+      const provider = value as Record<string, unknown>;
+      const settings = (typeof provider.settings === "object" && provider.settings !== null
+        ? provider.settings
+        : {}) as Record<string, unknown>;
+      // V2 优先：同 id 的 V1 条目先挤掉再收 V2 的（declaredModels 的覆盖在
+      // collect 里天然成立）。
+      for (let i = endpoints.length - 1; i >= 0; i--) {
+        if (endpoints[i].id === id) endpoints.splice(i, 1);
       }
-      const models = provider.models;
-      if (typeof models !== "object" || models === null || Array.isArray(models)) continue;
-      const slugs: string[] = [];
-      for (const rawSlug of Object.keys(models as Record<string, unknown>)) {
-        const slug = asString(rawSlug);
-        if (!slug || slugs.includes(slug)) continue;
-        slugs.push(slug);
-      }
-      if (slugs.length > 0) declaredModels[id] = slugs;
+      collect(id, provider, settings);
     }
   }
 

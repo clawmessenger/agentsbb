@@ -1,6 +1,9 @@
 // @vitest-environment node
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -12,6 +15,7 @@ import {
   runServerSession,
   toRequestModel,
 } from "./opencode-server.js";
+import { isOpencodeV2Api, runAgentTurn } from "./agents.js";
 
 const servers: Server[] = [];
 
@@ -362,4 +366,165 @@ describe("isServeStartupFailure", () => {
     expect(isServeStartupFailure(new Error("agent turn timeout after 1000ms"))).toBe(false);
     expect(isServeStartupFailure(new Error("POST /session/ses_x/message -> HTTP 401: bad key"))).toBe(false);
   });
+});
+
+describe("isOpencodeV2Api", () => {
+  const stubFetch = (status: number, throwErr = false): typeof fetch =>
+    (async () => {
+      if (throwErr) throw new Error("network down");
+      return { status } as Response;
+    }) as typeof fetch;
+
+  it("401 = /api/event 存在且要密码 → 是 2.x", async () => {
+    const seen: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      return { status: 401 } as Response;
+    }) as typeof fetch;
+    await expect(isOpencodeV2Api("http://127.0.0.1:59999", 1000, fetchImpl)).resolves.toBe(true);
+    expect(seen[0]).toContain("/api/event");
+  });
+
+  it("404（1.x 没有 /api 路由）与网络失败都不是 2.x", async () => {
+    await expect(isOpencodeV2Api("http://127.0.0.1:1", 1000, stubFetch(404))).resolves.toBe(false);
+    await expect(isOpencodeV2Api("http://127.0.0.1:1", 1000, stubFetch(500, true))).resolves.toBe(false);
+  });
+});
+
+/**
+ * 假「opencode」脚本：立刻打 listening 行，可选延迟打 password 行，然后常驻。
+ * URL 从 FAKE_SERVE_URL 环境变量取（父进程注入，指向测试自己起的假 v2 服务器）。
+ */
+function createFakeServeScript(opts: { passwordDelayMs: number; exitAfterMs?: number }): {
+  agentPath: string;
+  cleanup: () => void;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-serve-test-"));
+  const isWin = process.platform === "win32";
+  const cjsPath = join(dir, "fake-serve.cjs");
+  writeFileSync(cjsPath, [
+    `const url = process.env.FAKE_SERVE_URL;`,
+    `process.stdout.write('opencode server listening on ' + url + '\\n');`,
+    opts.passwordDelayMs > 0
+      ? `setTimeout(() => process.stdout.write('server password fakepw1234567890\\n'), ${opts.passwordDelayMs});`
+      : `/* no password: 1.x */`,
+    opts.exitAfterMs
+      ? `setTimeout(() => process.exit(0), ${opts.exitAfterMs});`
+      : `setInterval(() => {}, 1000);`,
+  ].join("\n"));
+  const scriptPath = join(dir, isWin ? "opencode.cmd" : "opencode");
+  if (isWin) {
+    writeFileSync(scriptPath, `@echo off\r\nnode "${cjsPath}"\r\n`);
+  } else {
+    writeFileSync(scriptPath, `#!/bin/sh\nexec node "${cjsPath}"\n`);
+    chmodSync(scriptPath, 0o755);
+  }
+  return { agentPath: scriptPath, cleanup: () => {} };
+}
+
+describe("runOpenCodeServerTurn 的协议选择", () => {
+  it("宽限期过期但 serve 是 2.x 时继续等密码行，绝不按 1.x 驱动 2.x serve", async () => {
+    // 跳过派生配置：本组用例只测协议选择，而派生会写**真实 home** 的
+    // opencode-device-opencode.json —— 与 agent-permissions.test 并行跑时会
+    // 互相覆盖（2026-11-16 实测：全量跑时权限用例读到被本组覆盖的文件）。
+    const prevFull = process.env.AGENTSBB_OPENCODE_FULL_CONFIG;
+    process.env.AGENTSBB_OPENCODE_FULL_CONFIG = "1";
+    // 2026-11-16 现场：多 serve 并发冷启动，密码行晚到 >1.2s。老逻辑按 1.x 走，
+    // 2.x 的 V1 兼容层丢掉整个 providers → Model not found 500。修复后这里
+    // 必须探到 2.x 并等密码，最终走 /api/session。
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      if (req.url === "/api/event") {
+        // 探测（无鉴权）与 SSE 建连都打这里：一律 401，探测据此判定 2.x。
+        res.writeHead(401);
+        res.end();
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/session") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { id: "ses_fake" } }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const prev = process.env.CLAWMESSENGER_OPENCODE_SERVER;
+    process.env.CLAWMESSENGER_OPENCODE_SERVER = "1";
+    process.env.FAKE_SERVE_URL = `http://127.0.0.1:${port}`;
+    const fixture = createFakeServeScript({ passwordDelayMs: 1600 });
+    try {
+      // 假服务器的会话/事件流不完整，这一轮大概率失败——但无论成败，关键断言
+      // 是协议选对了：v2 的 /api/session 被打到、1.x 的 /session 没被碰到。
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "hi",
+        model: "opencode/big-pickle",
+        timeoutMs: 15_000,
+      }).catch(() => {});
+      expect(hits.some((h) => h.startsWith("POST /api/session"))).toBe(true);
+      expect(hits.some((h) => h.startsWith("POST /session"))).toBe(false);
+    } finally {
+      fixture.cleanup();
+      if (prevFull === undefined) delete process.env.AGENTSBB_OPENCODE_FULL_CONFIG;
+      else process.env.AGENTSBB_OPENCODE_FULL_CONFIG = prevFull;
+      process.env.CLAWMESSENGER_OPENCODE_SERVER = prev;
+      delete process.env.FAKE_SERVE_URL;
+    }
+  }, 30_000);
+
+  it("真的 1.x serve（/api/event 404、无密码行）宽限期一过就按 1.x 走", async () => {
+    const prevFull = process.env.AGENTSBB_OPENCODE_FULL_CONFIG;
+    process.env.AGENTSBB_OPENCODE_FULL_CONFIG = "1";
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      if (req.url === "/api/event") {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      if (req.method === "POST" && req.url === "/session") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "ses_1x" }));
+        return;
+      }
+      if (req.url === "/event") {
+        // 1.x 的事件流：立刻关掉，让 1.x 路径快速失败/降级，测试不用等满超时。
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const prev = process.env.CLAWMESSENGER_OPENCODE_SERVER;
+    process.env.CLAWMESSENGER_OPENCODE_SERVER = "1";
+    process.env.FAKE_SERVE_URL = `http://127.0.0.1:${port}`;
+    const fixture = createFakeServeScript({ passwordDelayMs: 0, exitAfterMs: 3000 });
+    try {
+      await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "opencode",
+        prompt: "hi",
+        model: "opencode/big-pickle",
+        timeoutMs: 15_000,
+      }).catch(() => {});
+      expect(hits.some((h) => h.startsWith("POST /session"))).toBe(true);
+      expect(hits.some((h) => h.startsWith("POST /api/session"))).toBe(false);
+    } finally {
+      fixture.cleanup();
+      if (prevFull === undefined) delete process.env.AGENTSBB_OPENCODE_FULL_CONFIG;
+      else process.env.AGENTSBB_OPENCODE_FULL_CONFIG = prevFull;
+      process.env.CLAWMESSENGER_OPENCODE_SERVER = prev;
+      delete process.env.FAKE_SERVE_URL;
+    }
+  }, 30_000);
 });

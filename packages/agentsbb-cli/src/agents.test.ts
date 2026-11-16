@@ -30,7 +30,7 @@ import {
   trimIncompleteUtf8Tail,
 } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyTurnError } from "./turn-error.js";
@@ -862,6 +862,44 @@ describe("discoverAgents", () => {
 
   it("returns [] for an empty extraPath", async () => {
     expect(await discoverAgents({ extraPath: "" })).toEqual([]);
+  });
+
+  it("appends windows candidate dirs when scanning the real PATH (win32)", async () => {
+    if (process.platform !== "win32") return;
+    // 现场复现：计划任务拉起的 supervisor，进程 PATH 只有一个空目录；opencode
+    // 2.x 装在官方安装器落点（经 NVM_SYMLINK 之外的候选目录命中）。真实 PATH
+    // 扫描必须补上候选目录，否则用户级安装整个探不到。
+    const fixture = createEchoAgentScript("opencode");
+    const realPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const realPath = process.env.PATH;
+    const realUserProfile = process.env.USERPROFILE;
+    const realAppData = process.env.APPDATA;
+    try {
+      // 候选目录走 NVM_SYMLINK 注入（windowsCandidateDirs 的第 4 优先级）。
+      // USERPROFILE/APPDATA 必须指向空目录：真机的 ~/.opencode/bin、npm 全局
+      // 目录里真的有 opencode，会抢在 fixture 之前命中。
+      const empty = join(fixture.dir, "..", "empty-for-test");
+      mkdirSync(empty, { recursive: true });
+      process.env.USERPROFILE = empty;
+      process.env.APPDATA = empty;
+      process.env.NVM_SYMLINK = fixture.dir;
+      process.env.PATH = "C:\\definitely-not-a-real-dir-for-tests";
+      const found = await discoverAgents({});
+      const oc = found.find((a) => a.name === "opencode");
+      expect(oc).toBeDefined();
+      expect(oc!.path.startsWith(fixture.dir)).toBe(true);
+    } finally {
+      if (realPath === undefined) delete process.env.PATH;
+      else process.env.PATH = realPath;
+      if (realUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = realUserProfile;
+      if (realAppData === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = realAppData;
+      delete process.env.NVM_SYMLINK;
+      if (realPlatform) Object.defineProperty(process, "platform", realPlatform);
+      fixture.cleanup();
+    }
   });
 });
 

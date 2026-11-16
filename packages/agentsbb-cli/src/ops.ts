@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { delimiter, join } from "node:path";
 import { buildSpawnInvocation, discoverAgents, type AgentInfo } from "./agents.js";
 import { stateHome } from "./paths.js";
+import { windowsCandidateDirs } from "./win-dirs.js";
 
 // Built-in agent name bound on every agentsbb device. Distinct from the
 // "opencode" CLI name: the server sees an agent node named "ops", while
@@ -33,30 +34,9 @@ function findOpencode(agents: AgentInfo[]): AgentInfo | undefined {
 }
 
 // Windows：以计划任务 / 开机脚本拉起的 supervisor 常拿不到用户级 PATH。
-// 2026-11-16 现场（小久）：注册表 PATH 里 `%NVM_HOME%`/`%NVM_SYMLINK%` 以
-// REG_SZ 字面量形式写死、进程环境从未展开 —— npm 与 npm 全局安装的 opencode
-// 在进程眼里"不存在"，ops 子进程于是永远走到 npm 安装分支、再被
-// spawn npm ENOENT 打死，无限重启。这些目录按常见度补进探测与解析的候选；
-// 多列几个无害，命中与否取决于机器。
-export function windowsCandidateDirs(env: NodeJS.ProcessEnv = process.env): string[] {
-  if (process.platform !== "win32") return [];
-  const dirs: string[] = [];
-  const push = (dir?: string | null) => {
-    const trimmed = dir?.trim();
-    if (trimmed && !dirs.includes(trimmed)) dirs.push(trimmed);
-  };
-  // opencode 官方安装器的默认落点（%USERPROFILE%\.opencode\bin）必须排在 npm
-  // 全局目录**之前**：npm 包 opencode-ai 的版本长期滞后于官方安装器（2026-11-16
-  // 现场：npm 1.19.x vs 官方 2.1.4），兜底装出的旧版会长期遮蔽机器上已有的
-  // 新版 —— 两者并存时，宁可探到官方版。
-  push(env.USERPROFILE ? join(env.USERPROFILE, ".opencode", "bin") : null);
-  push(env.APPDATA ? join(env.APPDATA, "npm") : null); // npm 全局 bin（npm i -g 的落点）
-  push("C:\\Program Files\\nodejs"); // 官方安装器默认目录
-  push(env.NVM_SYMLINK); // nvm-windows 的当前 node 目录
-  push("C:\\nvm4w\\nodejs"); // nvm-windows 自定义符号链接的常见落点
-  push(env.NVM_HOME);
-  return dirs;
-}
+// 候选目录清单下沉在 win-dirs.ts（agents.ts 的 discoverAgents 也要用，放这里
+// 会成环）；本模块 re-export 保持原 API 不变。
+export { windowsCandidateDirs };
 
 /** 进程 PATH + 候选目录拼成的探测用 PATH（posix 与进程 PATH 等价）。 */
 function discoveryPath(env: NodeJS.ProcessEnv = process.env): string {

@@ -35,6 +35,7 @@ import {
   runServerSession,
 } from "./opencode-server.js";
 import { TurnIncompleteError } from "./turn-error.js";
+import { windowsCandidateDirs } from "./win-dirs.js";
 
 // Mirrors knownAgentCLIs in server/internal/integrations/rongcloud/
 // discussion_bridge.go — keep both lists in sync.
@@ -124,6 +125,8 @@ export interface RunAgentTurnOpts {
   // 内部用：serve 模式起不来时退回 run --format json，递归进来时置 true，
   // 避免二次分流。外部调用方不该传。
   disableServerMode?: boolean;
+  // 依赖注入：v2 探测用的 fetch（测试里换掉，避免真实网络）。默认全局 fetch。
+  v2ProbeFetch?: typeof fetch;
   /**
    * 精简回合：换掉 opencode `build` agent 的系统提示、关掉全部工具，只给
    * 「问一句、拿一段 JSON」的短回合用（当前只有角色推荐）。
@@ -1108,9 +1111,18 @@ export async function discoverAgents(opts: { extraPath?: string }): Promise<Agen
   // When extraPath is provided (even empty) we scan ONLY there (tests and
   // explicit overrides must not pick up a real claude on the dev machine);
   // when absent we scan the real PATH.
-  const dirs = opts.extraPath !== undefined
+  let dirs = opts.extraPath !== undefined
     ? opts.extraPath.split(delimiter).filter(Boolean)
     : (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  // 真实 PATH 扫描时附加 Windows 候选目录（win-dirs.ts）：计划任务拉起的
+  // supervisor 进程 PATH 可能残缺（%NVM_HOME% 字面量未展开 / 缺用户 PATH），
+  // 不补的话 opencode 2.x（~/.opencode/bin）这类用户级安装整个探不到。
+  // ops.ts 的探测路径已自带候选，这里去重即可。
+  if (opts.extraPath === undefined && process.platform === "win32") {
+    for (const dir of windowsCandidateDirs()) {
+      if (!dirs.includes(dir)) dirs = [...dirs, dir];
+    }
+  }
 
   const found: AgentInfo[] = [];
   for (const name of KNOWN_AGENT_CLIS) {
@@ -1803,7 +1815,36 @@ const SERVE_STARTUP_TIMEOUT_MS = 25_000;
 // 落地」（实测一轮 12,620 事件、101 秒才一次蹦出），而且是**静默**退化：功能还
 // 能用，用户只会觉得「1.3.5 变慢了」。1200ms 是这轮取舍的结果 —— 1.x 每轮白等
 // 这点时间，换 2.x 稳定命中真流式。
+//
+// 1200ms 过期后**不能直接按 1.x 处理**（见 runOpenCodeServerTurn 里的 v2 探测）：
+// 2026-11-16 现场，多个 serve 并发冷启动时密码行晚到超过 1.2s，CLI 按 1.x 协议
+// 驱动 2.x serve —— 2.x 的 V1 兼容层会把配置里的 `providers` 整个丢掉（「cannot
+// be represented in V1」），对话默认模型 quukk/glm-5.2 于是 Model not found、
+// 整轮 HTTP 500。所以宽限期过期只触发一次 v2 探测：确认是 2.x 就继续等密码行。
 const SERVE_PASSWORD_GRACE_MS = 1200;
+
+/**
+ * 探测 `baseUrl` 背后是不是 opencode 2.x（`/api/*` 协议）。
+ *
+ * 2.x 的 `/api/event` 未带鉴权时返回 401（端点存在）；1.x serve 没有这批路由，
+ * 返回 404 或 Web UI 的 HTML。网络失败一律按「不是 2.x」处理 —— 判不出来就维持
+ * 老行为（宽限期一到按 1.x 走），绝不因为探测把一轮卡死。
+ */
+export async function isOpencodeV2Api(
+  baseUrl: string,
+  timeoutMs = 2_000,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  try {
+    const res = await fetchImpl(new URL("/api/event", baseUrl).toString(), {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    // 401 = 端点在、要密码（2.x 的铁证）。其余状态码不当作 2.x 证据。
+    return res.status === 401;
+  } catch {
+    return false;
+  }
+}
 
 export function opencodeServerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   // TODO(rebrand-retire): 双读过渡，移除 CLAWMESSENGER_OPENCODE_SERVER 于 v1.6+
@@ -2044,7 +2085,15 @@ async function runOpenCodeServerTurn(
       }
       if (url && !passwordTimer) {
         passwordTimer = setTimeout(() => {
-          finish(() => resolve({ baseUrl: url }));
+          // 密码行没在宽限期内出现。先探测是不是 2.x：是 → 密码行只是晚到，
+          // 继续等 stdout（或等启动超时兜底），绝不按 1.x 协议去驱动 2.x serve
+          // —— V1 兼容层会丢掉 providers，对话直接 Model not found。
+          // 不是 2.x（探测失败 / 404）→ 维持老行为，按 1.x resolve。
+          void isOpencodeV2Api(url, undefined, opts.v2ProbeFetch ?? fetch).then((isV2) => {
+            if (done) return;
+            if (isV2) return;
+            finish(() => resolve({ baseUrl: url }));
+          });
         }, SERVE_PASSWORD_GRACE_MS);
       }
       // 启动期会打若干行日志；只留尾部，别让长跑把内存吃满。

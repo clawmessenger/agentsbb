@@ -355,6 +355,53 @@ describe("parseOpencodeConfig", () => {
       expect(parseOpencodeConfig(text)).toEqual({ endpoints: [], defaultModel: null });
     }
   });
+
+  // 2026-11-16 现场（小久，opencode 2.1.4）：官方安装器装的 2.x 读 **V2 形态**
+  // （providers 复数 + package + settings）；V1 引擎遇到 providers 段会整段
+  // 丢弃并打 compatibility WARN。解析器必须两代都收，否则 2.x 机器的目录
+  // 永远缺配置里声明的供应商。
+  it("reads the V2 shape: providers + package + settings", () => {
+    const config = parseOpencodeConfig(JSON.stringify({
+      model: "quukk/glm-5.2",
+      providers: {
+        quukk: {
+          name: "Quukk AI",
+          package: "@opencode/ai/providers/openai-compatible",
+          settings: { baseURL: "https://llmapi.example.com/v1", apiKey: "sk-v2" },
+          models: { "glm-5.2": { name: "GLM 5.2" }, "k3": { name: "K3" } },
+        },
+        "no-url": { name: "No URL", models: { x: {} } },
+      },
+    }));
+    expect(config.endpoints).toEqual([
+      { id: "quukk", name: "Quukk AI", baseUrl: "https://llmapi.example.com/v1", apiKey: "sk-v2" },
+    ]);
+    expect(config.declaredModels).toEqual({ quukk: ["glm-5.2", "k3"], "no-url": ["x"] });
+    expect(config.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("prefers the V2 providers entry wholesale when both shapes declare the same id", () => {
+    const config = parseOpencodeConfig(JSON.stringify({
+      provider: {
+        quukk: { name: "V1 Name", options: { baseURL: "https://v1.example.com/v1", apiKey: "sk-v1" } },
+        v1only: { options: { baseURL: "https://v1only.example.com/v1" } },
+      },
+      providers: {
+        quukk: {
+          name: "V2 Name",
+          settings: { baseURL: "https://v2.example.com/v1", apiKey: "sk-v2" },
+          models: { "glm-5.2": {} },
+        },
+      },
+    }));
+    const quukk = config.endpoints.filter((e) => e.id === "quukk");
+    // 同 id 只留 V2 条目，不并字段、不重复。
+    expect(quukk).toEqual([
+      { id: "quukk", name: "V2 Name", baseUrl: "https://v2.example.com/v1", apiKey: "sk-v2" },
+    ]);
+    expect(config.endpoints.map((e) => e.id)).toContain("v1only");
+    expect(config.declaredModels).toEqual({ quukk: ["glm-5.2"] });
+  });
 });
 
 describe("readAgentConfig", () => {
