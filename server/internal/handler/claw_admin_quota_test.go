@@ -323,3 +323,138 @@ func seedQuotaWorkspace(t *testing.T, pool *pgxpool.Pool) string {
 	}
 	return id
 }
+
+// adminPlainReq 造一个只带超管 Bearer 的请求（默认套餐接口没有 {id} 路由参数）。
+func (f *quotaFixture) adminPlainReq(t *testing.T, method, target, body string) *http.Request {
+	t.Helper()
+	var reader *strings.Reader
+	if body == "" {
+		reader = strings.NewReader("")
+	} else {
+		reader = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, reader)
+	req.Header.Set("Authorization", "Bearer "+f.adminJWT)
+	return req
+}
+
+// TestClawAdminDefaultQuotaPlan 覆盖「后台改默认值」这条链：
+// 读到的默认值 = 用户详情页那个「生效上限」的来源；PUT 之后，一个**没有任何覆盖**
+// 的用户下一次 Resolve 立刻按新默认走（这就是运营最常用的诉求：把 3/5/1 调成别的）。
+//
+// 会改全局默认套餐行，所以先快照、测试结束原样还原，避免污染同机开发库。
+func TestClawAdminDefaultQuotaPlan(t *testing.T) {
+	f := setupQuotaFixture(t)
+	ctx := context.Background()
+
+	// GET：形状与取值域。
+	rr := httptest.NewRecorder()
+	f.h.ClawAdminGetDefaultQuotaPlan(rr, f.adminPlainReq(t, "GET", "/api/admin/quota/default-plan", ""))
+	if rr.Code != 200 {
+		t.Fatalf("GET 默认配额 = %d (%s)", rr.Code, rr.Body.String())
+	}
+	body := decodeQuotaBody(t, rr)
+	data, _ := body["data"].(map[string]interface{})
+	if data == nil {
+		t.Fatalf("GET data 为空: %s", rr.Body.String())
+	}
+	if _, ok := data["discussion_limit"].(float64); !ok {
+		t.Fatalf("缺 discussion_limit: %#v", data)
+	}
+	source, _ := data["source"].(string)
+	if source != "plan" && source != "builtin" {
+		t.Fatalf("source = %q, want plan/builtin", source)
+	}
+	before := [3]int{
+		int(data["discussion_limit"].(float64)),
+		int(data["group_limit"].(float64)),
+		int(data["chatroom_limit"].(float64)),
+	}
+	// 还原：有行就改回原值；原本没有默认行（builtin）就把这次补种的删掉。
+	t.Cleanup(func() {
+		if source == "builtin" {
+			_, _ = f.pool.Exec(ctx, `DELETE FROM claw_im_plan WHERE name = '免费版' AND is_default`)
+			return
+		}
+		_, _ = f.pool.Exec(ctx, `
+			UPDATE claw_im_plan
+			SET discussion_limit = $1, group_limit = $2, chatroom_limit = $3
+			WHERE is_default`, before[0], before[1], before[2])
+	})
+
+	// PUT：改默认值 → 回包就是新值。
+	rr = httptest.NewRecorder()
+	f.h.ClawAdminPutDefaultQuotaPlan(rr, f.adminPlainReq(t, "PUT", "/api/admin/quota/default-plan",
+		`{"discussion_limit": 7, "group_limit": 9, "chatroom_limit": 2}`))
+	if rr.Code != 200 {
+		t.Fatalf("PUT 默认配额 = %d (%s)", rr.Code, rr.Body.String())
+	}
+	body = decodeQuotaBody(t, rr)
+	data, _ = body["data"].(map[string]interface{})
+	if data["discussion_limit"].(float64) != 7 || data["group_limit"].(float64) != 9 || data["chatroom_limit"].(float64) != 2 {
+		t.Fatalf("PUT 回包 = %#v, want {7,9,2}", data)
+	}
+	if data["source"] != "plan" {
+		t.Fatalf("PUT 后 source = %v, want plan（保存必须落成真实套餐行）", data["source"])
+	}
+
+	// 保存即生效：这个用户没有任何覆盖行，Resolve 读到的就是新的默认值。
+	limits, err := f.h.ClawQuota.Resolve(ctx, f.userID)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if limits.DiscussionLimit != 7 || limits.GroupLimit != 9 || limits.ChatroomLimit != 2 {
+		t.Fatalf("Resolve = %+v, want {7,9,2}", limits)
+	}
+
+	// 用户覆盖仍然压过默认值：这才是三级优先级的正确姿势。
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO claw_im_user_quota (user_id, discussion_limit, updated_by)
+		VALUES ($1, 1, 'test')`, f.userID); err != nil {
+		t.Fatalf("seed override: %v", err)
+	}
+	limits, err = f.h.ClawQuota.Resolve(ctx, f.userID)
+	if err != nil {
+		t.Fatalf("Resolve(override): %v", err)
+	}
+	if limits.DiscussionLimit != 1 {
+		t.Fatalf("覆盖未压过默认: discussion = %d, want 1", limits.DiscussionLimit)
+	}
+}
+
+// TestClawAdminDefaultQuotaPlanValidation 校验三类取值的合法性/必填。
+func TestClawAdminDefaultQuotaPlanValidation(t *testing.T) {
+	f := setupQuotaFixture(t)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"缺一项", `{"discussion_limit": 3, "group_limit": 5}`},
+		{"小于 -1", `{"discussion_limit": -2, "group_limit": 5, "chatroom_limit": 1}`},
+		{"非法 JSON", `{not json`},
+	}
+	for _, tc := range cases {
+		rr := httptest.NewRecorder()
+		f.h.ClawAdminPutDefaultQuotaPlan(rr, f.adminPlainReq(t, "PUT", "/api/admin/quota/default-plan", tc.body))
+		if rr.Code != 400 {
+			t.Fatalf("%s = %d, want 400 (%s)", tc.name, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+// TestClawAdminDefaultQuotaPlanRequiresAuth 无 token 401。
+func TestClawAdminDefaultQuotaPlanRequiresAuth(t *testing.T) {
+	f := setupQuotaFixture(t)
+	rr := httptest.NewRecorder()
+	f.h.ClawAdminGetDefaultQuotaPlan(rr, httptest.NewRequest("GET", "/api/admin/quota/default-plan", nil))
+	if rr.Code != 401 {
+		t.Fatalf("无 token = %d, want 401", rr.Code)
+	}
+	rr = httptest.NewRecorder()
+	f.h.ClawAdminPutDefaultQuotaPlan(rr, httptest.NewRequest("PUT", "/api/admin/quota/default-plan",
+		strings.NewReader(`{"discussion_limit": 1, "group_limit": 1, "chatroom_limit": 1}`)))
+	if rr.Code != 401 {
+		t.Fatalf("无 token PUT = %d, want 401", rr.Code)
+	}
+}
