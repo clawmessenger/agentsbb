@@ -184,7 +184,7 @@ func TestClawUpgradeMirrorsPreferGitHubThenServerProxy(t *testing.T) {
 		Tag:     "agentsbb-v1.3.0",
 		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
 	}
-	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok")
+	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "tok", clawUpgradeEnvNetSettings())
 
 	if len(mirrors) != 2 {
 		t.Fatalf("mirrors = %v", mirrors)
@@ -209,7 +209,7 @@ func TestClawUpgradeMirrorsDropTheProxyWithoutASecret(t *testing.T) {
 		Tag:     "agentsbb-v1.3.0",
 		Assets:  map[string]string{clawUpgradeWindowsAsset: "https://github.example/asset"},
 	}
-	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "")
+	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "", clawUpgradeEnvNetSettings())
 	if len(mirrors) != 1 || mirrors[0] != direct {
 		t.Fatalf("without a token only the direct GitHub URL may remain, got %v", mirrors)
 	}
@@ -461,7 +461,7 @@ func TestResolveClawUpgradeLatestCachesAndDegradesToTheLastKnownVersion(t *testi
 	t.Setenv("CLAW_UPGRADE_RELEASE_WEB", "https://github.example")
 
 	ctx := context.Background()
-	release, stale, err := resolveClawUpgradeLatest(ctx)
+	release, stale, err := resolveClawUpgradeLatest(ctx, clawUpgradeEnvNetSettings())
 	if err != nil {
 		t.Fatalf("first resolve failed: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestResolveClawUpgradeLatestCachesAndDegradesToTheLastKnownVersion(t *testi
 	afterFirst := hits.Load()
 
 	// 第二次必须命中缓存，不能再打 GitHub。
-	if _, _, err := resolveClawUpgradeLatest(ctx); err != nil {
+	if _, _, err := resolveClawUpgradeLatest(ctx, clawUpgradeEnvNetSettings()); err != nil {
 		t.Fatalf("cached resolve failed: %v", err)
 	}
 	if hits.Load() != afterFirst {
@@ -487,7 +487,7 @@ func TestResolveClawUpgradeLatestCachesAndDegradesToTheLastKnownVersion(t *testi
 	clawUpgradeLatest.mu.Unlock()
 	failing.Store(true)
 
-	degraded, degradedStale, err := resolveClawUpgradeLatest(ctx)
+	degraded, degradedStale, err := resolveClawUpgradeLatest(ctx, clawUpgradeEnvNetSettings())
 	if err != nil {
 		t.Fatalf("degraded resolve must not fail when a previous value exists: %v", err)
 	}
@@ -505,7 +505,7 @@ func TestResolveClawUpgradeLatestFailsLoudlyWithoutAnyCache(t *testing.T) {
 	server, _ := fakeGitHub(t, "1.3.0", &failing)
 	t.Setenv("CLAW_UPGRADE_RELEASE_API", server.URL)
 
-	_, _, err := resolveClawUpgradeLatest(context.Background())
+	_, _, err := resolveClawUpgradeLatest(context.Background(), clawUpgradeEnvNetSettings())
 	if err == nil {
 		t.Fatal("resolve must fail when GitHub is unreachable and nothing is cached")
 	}

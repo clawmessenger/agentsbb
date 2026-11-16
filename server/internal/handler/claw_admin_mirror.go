@@ -278,7 +278,8 @@ func (h *Handler) ClawAdminGetMirrorStatus(w http.ResponseWriter, r *http.Reques
 	// GitHub latest：单独超时，别让页面因为 GitHub 慢转圈 10 秒。
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	release, stale, err := resolveClawUpgradeLatest(ctx)
+	// 网络出口每次现读（后台可改、即时生效）：基址/代理都从这里来。
+	release, stale, err := resolveClawUpgradeLatest(ctx, h.clawUpgradeNetSettings(ctx))
 	if err != nil {
 		status["github_latest"] = map[string]interface{}{"error": err.Error()}
 	} else {
@@ -396,9 +397,12 @@ func (h *Handler) ClawAdminPullMirrorFromGitHub(w http.ResponseWriter, r *http.R
 	}
 	// 任务上下文独立于请求：请求返回后任务要继续跑。
 	ctx, cancel := context.WithTimeout(context.Background(), clawMirrorJobTimeout)
+	// 网络出口在任务开跑前读一次（后台改配置的即时性以「任务开始时刻」为准）：
+	// 任务一跑几十分钟，跑到一半换基址既没必要也不安全（半新半旧的镜像更糟）。
+	settings := h.clawUpgradeNetSettings(r.Context())
 	go func() {
 		defer cancel()
-		err := clawMirrorPullFromGitHub(ctx, dir, base)
+		err := clawMirrorPullFromGitHub(ctx, dir, base, settings)
 		clawMirror.finish(err)
 		if err != nil {
 			slog.Error("claw mirror: 从 GitHub 拉取失败", "error", err)
@@ -408,9 +412,10 @@ func (h *Handler) ClawAdminPullMirrorFromGitHub(w http.ResponseWriter, r *http.R
 }
 
 // clawMirrorPullFromGitHub 是拉取任务的主体：解析 latest → 下载 → 校验 → 切换。
-func clawMirrorPullFromGitHub(ctx context.Context, dir, publicBase string) error {
+// settings 是任务开跑时刻读到的网络出口（基址/代理），整个任务用同一份。
+func clawMirrorPullFromGitHub(ctx context.Context, dir, publicBase string, settings clawUpgradeNetSettings) error {
 	clawMirror.update("", "解析 GitHub 最新版本")
-	release, stale, err := resolveClawUpgradeLatest(ctx)
+	release, stale, err := resolveClawUpgradeLatest(ctx, settings)
 	if err != nil {
 		return fmt.Errorf("解析 GitHub 最新版本失败: %w", err)
 	}
@@ -427,7 +432,7 @@ func clawMirrorPullFromGitHub(ctx context.Context, dir, publicBase string) error
 		// 「上次已知版本」而不是被静默降级的假最新。
 		slog.Warn("claw mirror: GitHub 解析降级，使用上次缓存的版本", "tag", tag)
 	}
-	client := clawUpgradeHTTPClient()
+	client := clawUpgradeClientForSettings(settings)
 	stage, err := os.MkdirTemp(dir, ".incoming-")
 	if err != nil {
 		return fmt.Errorf("创建暂存目录失败: %w", err)
@@ -440,20 +445,22 @@ func clawMirrorPullFromGitHub(ctx context.Context, dir, publicBase string) error
 		// 资产名先按新名单找，找不到再退回旧名单的等价名：品牌改名后的第一次
 		// 发布之前，GitHub 上的 latest 仍然是纯旧名单的 Release。落盘用**实际
 		// 拿到的那套名字**，校验阶段会据此挑对应名单。
-		assetURL, local := release.Assets[asset], asset
-		if assetURL == "" {
-			if legacy := clawMirrorLegacyName(asset); legacy != "" && release.Assets[legacy] != "" {
-				assetURL, local = release.Assets[legacy], legacy
+		local := asset
+		if _, ok := release.Assets[asset]; !ok {
+			if legacy := clawMirrorLegacyName(asset); legacy != "" {
+				if _, legacyOK := release.Assets[legacy]; legacyOK {
+					local = legacy
+				}
 			}
 		}
-		// 运维显式配了 CLAW_UPGRADE_RELEASE_WEB（gh 代理）时，构造 URL 优先于
-		// GitHub API 返回的 github.com 直链 —— 直链在这类机器上本来就不通。
-		if override := clawUpgradeWebBase(); override != "https://github.com" {
-			assetURL = clawUpgradeAssetURL(tag, local)
-		}
-		if assetURL == "" {
+		if _, ok := release.Assets[local]; !ok {
 			return fmt.Errorf("GitHub Release 里没有资产 %s", asset)
 		}
+		// 回源地址统一按「基址 + 仓库 + /releases/download/ + tag + / + 资产」拼：
+		// 基址来自后台/环境变量（gh 镜像前缀），默认是 https://github.com。不再
+		// 使用 GitHub API 返回的 browser_download_url —— 配镜像前缀的机器上那个
+		// 直链本来就不通，重拼是唯一可靠路径。
+		assetURL := clawUpgradeAssetURLWithBase(settings.ReleaseWeb, tag, local)
 		sum, derr := clawMirrorDownload(ctx, client, assetURL, filepath.Join(stage, local))
 		if derr != nil {
 			return fmt.Errorf("下载 %s 失败: %w", local, derr)

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -320,7 +321,7 @@ func mirrorFakeGitHub(t *testing.T, gate chan struct{}) *httptest.Server {
 	tag := "agentsbb-v9.8.7"
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/repos/clawmessenger/claw-messenger/releases/latest":
+		case r.URL.Path == "/repos/clawmessenger/agentsbb/releases/latest":
 			type asset struct {
 				Name               string `json:"name"`
 				BrowserDownloadURL string `json:"browser_download_url"`
@@ -337,11 +338,14 @@ func mirrorFakeGitHub(t *testing.T, gate chan struct{}) *httptest.Server {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"tag_name": tag, "assets": assets})
-		case strings.HasPrefix(r.URL.Path, "/dl/"):
+		case strings.HasPrefix(r.URL.Path, "/dl/"),
+			// 拉取路径按基址重拼后请求 /<repo>/releases/download/<tag>/<asset>。
+			strings.HasPrefix(r.URL.Path, "/"+clawUpgradeReleasesRepo+"/releases/download/"):
+			name := strings.TrimPrefix(r.URL.Path, "/dl/")
+			name = path.Base(name)
 			if gate != nil {
 				<-gate // 挂住下载，制造「任务正在跑」的窗口
 			}
-			name := strings.TrimPrefix(r.URL.Path, "/dl/")
 			_, _ = w.Write(files[name])
 		default:
 			http.NotFound(w, r)
@@ -368,6 +372,9 @@ func mirrorWaitJob(t *testing.T, want string) clawMirrorJobState {
 func TestClawAdminMirrorPullFromGitHubActivates(t *testing.T) {
 	ts := mirrorFakeGitHub(t, nil)
 	t.Setenv("CLAW_UPGRADE_RELEASE_API", ts.URL)
+	// 拉取路径统一按「基址 + /releases/download/ + tag + / + 资产」重拼（不再用
+	// API 返回的 browser_download_url），所以下载也要指到这个假服务上。
+	t.Setenv("CLAW_UPGRADE_RELEASE_WEB", ts.URL)
 	t.Cleanup(clawUpgradeResetCacheForTest)
 	clawUpgradeResetCacheForTest()
 	dir := mirrorSetEnv(t)
@@ -402,6 +409,7 @@ func TestClawAdminMirrorUploadConflictsWithRunningPull(t *testing.T) {
 	gate := make(chan struct{})
 	ts := mirrorFakeGitHub(t, gate)
 	t.Setenv("CLAW_UPGRADE_RELEASE_API", ts.URL)
+	t.Setenv("CLAW_UPGRADE_RELEASE_WEB", ts.URL) // 同上：重拼后的下载地址指到假服务
 	t.Cleanup(clawUpgradeResetCacheForTest)
 	clawUpgradeResetCacheForTest()
 	mirrorSetEnv(t)

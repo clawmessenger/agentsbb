@@ -31,9 +31,14 @@ import (
 )
 
 const (
-	// clawUpgradeReleasesRepo 与 CLI 内置自更新同源（self-update.ts 的 RELEASES_REPO），
-	// 不新增发布方式。仓库地址属于 git remote 事务，品牌改名期保持原值。
-	clawUpgradeReleasesRepo = "clawmessenger/claw-messenger"
+	// clawUpgradeReleasesRepo 与发布流水线（.github/workflows/agentsbb-release.yml）
+	// 同源：Release 就发布在这个仓库。历史值是 `clawmessenger/claw-messenger`
+	// （见 clawUpgradeLegacyRepo），GitHub 侧做了 301 跳转，但 gh 镜像前缀不
+	// 一定跟随跳转，API 请求也多一跳 —— 所以这里直接用新名。
+	clawUpgradeReleasesRepo = "clawmessenger/agentsbb"
+	// clawUpgradeLegacyRepo 是改名前的仓库。保留它只为了注释与排查历史 URL，
+	// 任何 API / 下载请求都**不再**打老仓库。
+	clawUpgradeLegacyRepo = "clawmessenger/claw-messenger"
 	// clawUpgradeTagPrefix 是发布 tag 的新前缀（`agentsbb-v1.4.0`）。
 	clawUpgradeTagPrefix = "agentsbb-v"
 	// clawUpgradeLegacyTagPrefix 是改名前的 tag 前缀。过渡期仍然接受：
@@ -47,10 +52,13 @@ const (
 	clawUpgradePlatformWindows = "win32-x64"
 	// clawUpgradeReleaseTTL 是 latest 的缓存时长。
 	clawUpgradeReleaseTTL = 10 * time.Minute
-	// clawUpgradeAPITimeout / clawUpgradeAssetTimeout 都是「宁可降级也不要挂住请求」
-	// 的墙钟：管理端点一次升级按钮，不该因为 GitHub 慢而让管理员等 30 秒。
-	clawUpgradeAPITimeout   = 8 * time.Second
-	clawUpgradeAssetTimeout = 15 * time.Second
+	// clawUpgradeAPIRequestTimeout 是 GitHub API 列举 / SHA256SUMS 这类**小请求**
+	// 的墙钟（靠 ctx 控制，client 本身没有墙钟 —— 见 clawUpgradeClientForSettings）。
+	// 改动前是 8s/15s 两个 client 级常量，其中 15s 那个还被错误地当成了整个
+	// client 的墙钟：85MB 的资产要 ≈5.7MB/s 才来得及，国内直连必然
+	// context deadline exceeded。API 请求放宽到 20s；资产下载的墙钟单独走
+	// clawMirrorAssetTimeout（30 分钟），不在这里。
+	clawUpgradeAPIRequestTimeout = 20 * time.Second
 	// clawUpgradeTokenTTL 是下载代理 token 的有效期。设备领到指令后的下载窗口
 	// 通常是分钟级，30 分钟足够覆盖「先排队等空闲」的场景，又不至于长到可以
 	// 被拿去当免费 CDN 长期刷。
@@ -78,26 +86,14 @@ type clawUpgradeRelease struct {
 	SHA256 map[string]string
 }
 
-func clawUpgradeAPIBase() string {
-	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("CLAW_UPGRADE_RELEASE_API")), "/"); base != "" {
-		return base
-	}
-	return "https://api.github.com"
-}
-
-// clawUpgradeWebBase 是 release 资产的基址。测试与内网镜像可以覆盖它，
-// 与 CLI 的 CLAWMESSENGER_UPDATE_WEB 同义。
-func clawUpgradeWebBase() string {
-	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("CLAW_UPGRADE_RELEASE_WEB")), "/"); base != "" {
-		return base
-	}
-	return "https://github.com"
-}
-
-// clawUpgradeAssetURL 拼出某个 tag 下某个资产的下载地址。
-// 入参只能来自服务端解析出的 tag 与白名单资产名。
-func clawUpgradeAssetURL(tag, asset string) string {
-	return fmt.Sprintf("%s/%s/releases/download/%s/%s", clawUpgradeWebBase(), clawUpgradeReleasesRepo, tag, asset)
+// clawUpgradeAssetURLWithBase 按给定基址拼出某个 tag 下某个资产的下载地址。
+// 所有需要资产 URL 的路径（镜像拉取、latest 解析兜底、下发指令、下载代理回源）
+// 统一走这一个函数 —— 不允许任何一条路径还写死 https://github.com。
+// base 来自 clawUpgradeNetSettings（后台/环境变量/默认值），入参 tag 与 asset
+// 只能来自服务端解析出的值。
+func clawUpgradeAssetURLWithBase(base, tag, asset string) string {
+	return fmt.Sprintf("%s/%s/releases/download/%s/%s",
+		strings.TrimRight(strings.TrimSpace(base), "/"), clawUpgradeReleasesRepo, tag, asset)
 }
 
 // parseClawSHA256Sums 解析 GitHub Release 里的 `SHA256SUMS`
@@ -186,13 +182,14 @@ func clawUpgradeTagCandidates(version string) []string {
 	return tags
 }
 
-// fetchClawUpgradeLatest 直连 GitHub 解析 latest：一次 API 调用拿 tag+assets
-// （顺带 assets[].digest 里的 sha256），再取一次 SHA256SUMS（小文件）作为权威
-// 校验和清单。第一次失败返回错误 —— 由缓存层决定是降级还是报错；第二次失败只
-// 记日志（digest 兜底），因为「没有校验和」在下发那一刻是明确的拒绝，不是崩。
-func fetchClawUpgradeLatest(ctx context.Context, client *http.Client) (*clawUpgradeRelease, error) {
-	apiURL := fmt.Sprintf("%s/repos/%s/releases/latest", clawUpgradeAPIBase(), clawUpgradeReleasesRepo)
-	apiCtx, cancel := context.WithTimeout(ctx, clawUpgradeAPITimeout)
+// fetchClawUpgradeLatest 解析 latest：一次 API 调用拿 tag+assets（顺带
+// assets[].digest 里的 sha256），再取一次 SHA256SUMS（小文件）作为权威
+// 校验和清单。API 基址与代理都来自 settings（后台/环境变量）。第一次失败返回
+// 错误 —— 由缓存层决定是降级还是报错；第二次失败只记日志（digest 兜底），因为
+// 「没有校验和」在下发那一刻是明确的拒绝，不是崩。
+func fetchClawUpgradeLatest(ctx context.Context, client *http.Client, settings clawUpgradeNetSettings) (*clawUpgradeRelease, error) {
+	apiURL := fmt.Sprintf("%s/repos/%s/releases/latest", settings.ReleaseAPI, clawUpgradeReleasesRepo)
+	apiCtx, cancel := context.WithTimeout(ctx, clawUpgradeAPIRequestTimeout)
 	defer cancel()
 	res, err := doGitHubAPIGet(apiCtx, client, apiURL)
 	if err != nil {
@@ -249,7 +246,7 @@ func fetchClawUpgradeLatest(ctx context.Context, client *http.Client) (*clawUpgr
 		slog.Warn("claw upgrade: 取校验和失败 —— Release 里没有 SHA256SUMS 资产，本次只有资产 digest 兜底",
 			"tag", tag, "asset", "SHA256SUMS")
 	default:
-		sumCtx, sumCancel := context.WithTimeout(ctx, clawUpgradeAssetTimeout)
+		sumCtx, sumCancel := context.WithTimeout(ctx, clawUpgradeAPIRequestTimeout)
 		defer sumCancel()
 		sumRes, sumErr := doGitHubAPIGet(sumCtx, client, sumsURL)
 		switch {
@@ -317,6 +314,10 @@ func fetchClawUpgradeLatest(ctx context.Context, client *http.Client) (*clawUpgr
 // clawUpgradeCache 是进程级的 latest 缓存。放包级而不是 Handler 字段：Handler
 // 结构体不在这次改动的授权范围里，且这份缓存本来就没有「按 handler 实例隔离」的
 // 语义 —— 它缓存的是上游 GitHub 的事实。
+//
+// client 只是**测试注入点**（clawUpgradeSetHTTPClientForTest），生产恒为 nil：
+// 生产 client 由 clawUpgradeClientForSettings 按后台/环境变量设置现场构造
+// （代理、无 client 级墙钟）。
 type clawUpgradeCache struct {
 	mu       sync.Mutex
 	release  *clawUpgradeRelease
@@ -325,9 +326,7 @@ type clawUpgradeCache struct {
 	client   *http.Client
 }
 
-var clawUpgradeLatest = &clawUpgradeCache{
-	client: &http.Client{Timeout: clawUpgradeAssetTimeout},
-}
+var clawUpgradeLatest = &clawUpgradeCache{}
 
 // clawUpgradeHTTPClient 让测试能把上游换成一个假 server。
 func clawUpgradeHTTPClient() *http.Client {
@@ -359,7 +358,12 @@ func clawUpgradeResetCacheForTest() {
 
 // resolveClawUpgradeLatest 返回 latest 版本。stale=true 表示这次没打成 GitHub，
 // 返回的是上次成功的值（页面必须显式提示「上次已知版本」）。
-func resolveClawUpgradeLatest(ctx context.Context) (release *clawUpgradeRelease, stale bool, err error) {
+//
+// settings 是本次解析生效的网络设置（基址/代理），由调用方在开始时读好 ——
+// 缓存命中的请求根本不打网络，settings 只在真正回源时起作用。并发点批量升级
+// 时第一个请求的 settings 决定回源方式（缓存语义：下游要的是「最新版本」这个
+// 事实，不是「用谁的网络出口取的」）。
+func resolveClawUpgradeLatest(ctx context.Context, settings clawUpgradeNetSettings) (release *clawUpgradeRelease, stale bool, err error) {
 	cache := clawUpgradeLatest
 	cache.mu.Lock()
 	// 并发点批量升级时只让一个请求去打 GitHub，其余等它的结果。
@@ -380,10 +384,13 @@ func resolveClawUpgradeLatest(ctx context.Context) (release *clawUpgradeRelease,
 	}
 	done := make(chan struct{})
 	cache.inflight = done
-	client := cache.client
 	cache.mu.Unlock()
 
-	fetched, fetchErr := fetchClawUpgradeLatest(ctx, client)
+	// client 现场按 settings 构造（测试注入的假 client 优先）。它没有 client 级
+	// 墙钟：API 与 SHA256SUMS 的 20s 由 fetchClawUpgradeLatest 里的 ctx 控制。
+	client := clawUpgradeClientForSettings(settings)
+
+	fetched, fetchErr := fetchClawUpgradeLatest(ctx, client, settings)
 
 	cache.mu.Lock()
 	if fetchErr == nil {
@@ -501,16 +508,26 @@ func mustHexDecode(s string) []byte {
 	return raw
 }
 
-// clawUpgradeMirrors 给出设备下载该版本资产的顺序：先直连 GitHub（CDN 不限流、
-// 不过服务端带宽），失败再回退服务端代理。代理地址是 **服务端相对路径** ——
-// 设备自己知道它的 serverUrl（凭据里就有），不需要服务端配置公网域名。
+// clawUpgradeMirrors 给出设备下载该版本资产的顺序：先直连（CDN 不限流、不过
+// 服务端带宽），失败再回退服务端代理。代理地址是 **服务端相对路径** —— 设备
+// 自己知道它的 serverUrl（凭据里就有），不需要服务端配置公网域名。
+//
+// 直连地址的取值：后台没配镜像基址（ReleaseWeb == 默认值）时用 Release API 返回
+// 的 browser_download_url（它可能是预签名/自建 CDN 地址，比机械重拼更可信）；
+// 一旦后台配了镜像前缀，直连地址也按该前缀重拼 —— 配镜像的那台服务器上的设备
+// 大概率同样出不了 github.com，给它们一个必 404 的直链毫无意义。基址走
+// settings，与镜像拉取/下载代理同源。
 //
 // token 为空（服务端没配 MULTICA_CLAW_UPGRADE_TOKEN_SECRET）时只给直连地址：
 // 代理端点此刻是 503，把它排在 mirrors 里只会让设备多等一次必然失败的尝试。
-func clawUpgradeMirrors(release *clawUpgradeRelease, asset, token string) (mirrors []string, directURL string) {
+func clawUpgradeMirrors(release *clawUpgradeRelease, asset, token string, settings clawUpgradeNetSettings) (mirrors []string, directURL string) {
 	direct := release.Assets[asset]
-	if direct == "" {
-		direct = clawUpgradeAssetURL(release.Tag, asset)
+	if settings.ReleaseWeb != clawUpgradeDefaultWebBase {
+		// 镜像前缀生效：直连地址改由基址重拼（资产名不变，tag 用 Release 的权威值）。
+		direct = ""
+	}
+	if direct == "" && release.Tag != "" {
+		direct = clawUpgradeAssetURLWithBase(settings.ReleaseWeb, release.Tag, asset)
 	}
 	if direct == "" {
 		// 资产名不在发布矩阵里：连直连地址都拼不出来，此处返回空列表让调用方

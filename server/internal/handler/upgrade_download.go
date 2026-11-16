@@ -112,7 +112,9 @@ func (h *Handler) ClawUpgradeDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, err := clawUpgradeCachedAsset(r.Context(), version, asset)
+	// 网络出口每次现读（后台可改、即时生效）：回源走后台配的镜像基址与代理。
+	settings := h.clawUpgradeNetSettings(r.Context())
+	file, err := clawUpgradeCachedAsset(r.Context(), settings, version, asset)
 	if err != nil {
 		var upstream *clawUpgradeUpstreamError
 		if errors.As(err, &upstream) {
@@ -152,7 +154,8 @@ func (e *clawUpgradeUpstreamError) Error() string {
 }
 
 // clawUpgradeCachedAsset 保证 <cache>/<version>/<asset> 存在，返回其路径。
-func clawUpgradeCachedAsset(ctx context.Context, version, asset string) (string, error) {
+// settings 决定回源基址与代理（后台可改、每次请求现读）。
+func clawUpgradeCachedAsset(ctx context.Context, settings clawUpgradeNetSettings, version, asset string) (string, error) {
 	dir := filepath.Join(clawUpgradeCacheDir(), version)
 	dest := filepath.Join(dir, asset)
 	if info, err := os.Stat(dest); err == nil && info.Size() > 0 {
@@ -175,28 +178,42 @@ func clawUpgradeCachedAsset(ctx context.Context, version, asset string) (string,
 	//
 	// GET 是幂等的，重复请求没有副作用；每个候选各建一次请求（Header 不共享），
 	// 401/403/5xx 立刻收手，避免把 GitHub 的边缘限流放大 N 倍。
+	//
+	// 地址统一按基址拼（后台 claw_upgrade_release_web / env
+	// CLAW_UPGRADE_RELEASE_WEB），与镜像拉取、下发指令同源；代理同样来自设置。
+	// client 无 client 级墙钟，靠下面每个候选的 30 分钟 ctx 控时（与镜像拉取
+	// 的单资产墙钟一致 —— 85MB 在慢出口上 10 分钟是远远不够的，改动前这里
+	// client.Timeout=10min 同样会掐断慢下载）。
+	client := clawUpgradeClientForSettings(settings)
+	// 命中 200 的那个 ctx 还要覆盖函数后半段的 body 读取，cancel 不能立刻调用；
+	// 未命中的分支当场 cancel。函数返回时统一释放。
+	successCancel := context.CancelFunc(func() {})
 	var res *http.Response
 	for _, tag := range clawUpgradeTagCandidates(version) {
-		url := clawUpgradeAssetURL(tag, asset)
+		url := clawUpgradeAssetURLWithBase(settings.ReleaseWeb, tag, asset)
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return "", err
 		}
 		request.Header.Set("User-Agent", "agentsbb-server")
-		client := &http.Client{Timeout: 10 * time.Minute}
-		attempt, err := client.Do(request)
+		dctx, cancel := context.WithTimeout(ctx, clawMirrorAssetTimeout)
+		attempt, err := client.Do(request.WithContext(dctx))
 		if err != nil {
+			cancel()
 			return "", err
 		}
 		if attempt.StatusCode == http.StatusOK {
 			res = attempt
+			successCancel = cancel
 			break
 		}
 		attempt.Body.Close()
+		cancel()
 		if attempt.StatusCode != http.StatusNotFound {
 			return "", &clawUpgradeUpstreamError{Status: attempt.StatusCode}
 		}
 	}
+	defer successCancel()
 	if res == nil {
 		return "", &clawUpgradeUpstreamError{Status: http.StatusNotFound}
 	}

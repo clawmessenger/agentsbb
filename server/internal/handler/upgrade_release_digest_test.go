@@ -121,7 +121,7 @@ func clawDigestFetch(t *testing.T, srv *httptest.Server, client *http.Client) (*
 		client = &http.Client{}
 	}
 	t.Cleanup(clawUpgradeSetHTTPClientForTest(client))
-	return fetchClawUpgradeLatest(context.Background(), client)
+	return fetchClawUpgradeLatest(context.Background(), client, clawUpgradeEnvNetSettings())
 }
 
 // clawDigestWindowsAsset 是「带 digest 的 windows 资产」这条最常见的形状。
@@ -467,7 +467,7 @@ func TestClawUpgradeFetchLatestCollectsDigestForAssetWithoutDownloadURL(t *testi
 	}
 	// 「URL 为空」在生产上唯一有意义的后果：下发指令时用 Tag 拼出直连地址
 	// （clawUpgradeMirrors 的 fallback），而不是给设备一个 404 的空地址。
-	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "")
+	mirrors, direct := clawUpgradeMirrors(release, clawUpgradeWindowsAsset, "", clawUpgradeEnvNetSettings())
 	wantDirect := srv.URL + "/" + clawUpgradeReleasesRepo + "/releases/download/" + release.Tag + "/" + clawUpgradeWindowsAsset
 	if direct != wantDirect {
 		t.Fatalf("clawUpgradeMirrors 的直连地址 = %q，期望按 Tag 拼出的 %q（Assets 里没地址时的唯一退路）", direct, wantDirect)
@@ -523,7 +523,7 @@ func TestClawUpgradeExpectedSumReadsDigestFallbackFromCachedRelease(t *testing.T
 	t.Setenv("CLAW_UPGRADE_RELEASE_WEB", srv.URL)
 	t.Cleanup(clawUpgradeSetHTTPClientForTest(&http.Client{}))
 
-	release, stale, err := resolveClawUpgradeLatest(context.Background())
+	release, stale, err := resolveClawUpgradeLatest(context.Background(), clawUpgradeEnvNetSettings())
 	if err != nil || stale {
 		t.Fatalf("解析/缓存 latest 失败: err=%v stale=%v", err, stale)
 	}

@@ -205,8 +205,9 @@ func (h *Handler) ClawAdminRequestNodeUpgrade(w http.ResponseWriter, r *http.Req
 
 	// 目标版本 = 服务端解析出的 latest。解析不出来就明确报错（不假装成功）：
 	// 自托管部署没有外网时，管理员应当看到「无法获取最新版本」，而不是点完
-	// 按钮后设备永远 pending。
-	release, stale, err := resolveClawUpgradeLatest(ctx)
+	// 按钮后设备永远 pending。网络出口（基址/代理）每次现读 —— 后台改完下一个
+	// 请求立即生效。
+	release, stale, err := resolveClawUpgradeLatest(ctx, h.clawUpgradeNetSettings(ctx))
 	if err != nil {
 		slog.Warn("claw admin: upgrade release lookup failed", "error", err)
 		clawAdminFail(w, 503, err.Error())

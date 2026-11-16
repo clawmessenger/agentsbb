@@ -522,7 +522,11 @@ func (h *Handler) clawDeviceUpgradeIntent(
 	if err != nil || !upgradeWaveOpen(pending) {
 		return nil, err
 	}
-	release, _, err := resolveClawUpgradeLatest(ctx)
+	// 网络出口每次现读（后台可改、即时生效）：下发指令里的直连地址也要跟镜像
+	// 基址走 —— 设备大概率与服务端同一台机器/同一出口，服务端配了镜像前缀，
+	// 设备直连 github.com 同样不通。
+	settings := h.clawUpgradeNetSettings(ctx)
+	release, _, err := resolveClawUpgradeLatest(ctx, settings)
 	if err != nil {
 		// 服务端查不到 latest（无外网）：指令先挂着，下一轮再试。这里不落 failed ——
 		// 「服务端暂时查不到最新版」不是设备的问题，也不该让管理员看到设备失败。
@@ -549,7 +553,7 @@ func (h *Handler) clawDeviceUpgradeIntent(
 		return nil, nil
 	}
 	token := signClawUpgradeToken(release.Version, asset, time.Now().Add(clawUpgradeTokenTTL))
-	mirrors, direct := clawUpgradeMirrors(release, asset, token)
+	mirrors, direct := clawUpgradeMirrors(release, asset, token, settings)
 	if len(mirrors) == 0 {
 		// 连直连地址都拼不出来（资产不在发布矩阵 / release 里没有这条资产）。
 		// 下发出去只会让设备报一个看不懂的 download_failed，这里先按「本轮不下发」
