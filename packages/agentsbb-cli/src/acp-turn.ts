@@ -709,7 +709,11 @@ export function runAcpTurn(opts: AcpTurnOpts): Promise<string> {
             Boolean(process.env.XAI_API_KEY),
           );
           if (!methodId) {
-            startupFail("grok 未提供可用认证方式；请设置 XAI_API_KEY 或先跑 grok login");
+            // 面向用户的失败原因，按仓内版式给中英两行（bin.ts 的迁移提示同款）。
+            startupFail(
+              "grok 未提供可用的认证方式；请设置 XAI_API_KEY，或先在本机跑一次 grok login\n"
+              + "grok offered no usable auth method: set XAI_API_KEY, or run `grok login` once on this machine",
+            );
             return;
           }
           await request("authenticate", { methodId, _meta: { headless: true } });
@@ -751,7 +755,10 @@ export function runAcpTurn(opts: AcpTurnOpts): Promise<string> {
         }
         const sessionId = acpSessionId(session) || (resumed ? opts.resumeSessionId ?? "" : "");
         if (!sessionId) {
-          startupFail("session 建立后没有 sessionId");
+          startupFail(
+            "会话建立后没有拿到 sessionId，无法继续本轮\n"
+            + "the ACP session was created without a sessionId, so this turn cannot continue",
+          );
           return;
         }
         activeSessionId = sessionId;
@@ -780,7 +787,12 @@ export function runAcpTurn(opts: AcpTurnOpts): Promise<string> {
           }
           if (!applied) {
             // 绝不静默回落：那正是「面板上选了、实际没生效」的老毛病。
-            fail(new Error(`${spec.label} ACP: 无法切换到模型 ${opts.model}：${describe(lastError)}`));
+            // 这条会作为本轮失败原因上屏，所以中英各一行。
+            const detail = describe(lastError);
+            fail(new Error(
+              `${spec.label} ACP: 无法切换到模型 ${opts.model}：${detail}\n`
+              + `${spec.label} ACP: could not switch to model ${opts.model}: ${detail}`,
+            ));
             return;
           }
         }

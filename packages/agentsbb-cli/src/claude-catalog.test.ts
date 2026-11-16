@@ -246,3 +246,55 @@ describe("loader: claude live catalog", () => {
     expect(catalog.providers[0].models.length).toBeGreaterThan(5);
   });
 });
+
+// 真机形状（claude 2.1.325，Windows，2026-11-16 实跑）：default 与 opus 解析到
+// **同一个** resolvedModel，default 行排在前面。若按「谁先出现谁定名字」，面板上
+// 就会冒出「Default (recommended)」这条「模型」—— 它是位置说明，不是模型名。
+describe("claude list_models 真机形状（default 与具体别名同解析）", () => {
+  const LIVE = controlResponse([
+    { value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default (recommended)", disabled: false },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus", disabled: false },
+    { value: "fable", resolvedModel: "claude-fable-5-2", displayName: "Fable", disabled: false },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet", disabled: false },
+    { value: "haiku", resolvedModel: "claude-haiku-5-5", displayName: "Haiku", disabled: false },
+    {
+      value: "DeepSeek-V4-Pro-0813",
+      resolvedModel: "DeepSeek-V4-Pro-0813",
+      displayName: "DeepSeek-V4-Pro-0813",
+      disabled: false,
+    },
+  ]);
+
+  it("names the default row's model after its concrete alias", () => {
+    const parsed = parseClaudeListModels(LIVE);
+    expect(parsed?.rows).toHaveLength(6);
+
+    const catalog = claudeCatalogFromRows(parsed!.rows);
+    const models = catalog.providers[0].models;
+    // default 与 opus 是同一档，只该剩 5 条。
+    expect(models).toHaveLength(5);
+    expect(models.map((model) => model.id).sort()).toEqual([
+      "DeepSeek-V4-Pro-0813",
+      "claude-fable-5-2",
+      "claude-haiku-5-5",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+    ]);
+    expect(models.find((model) => model.id === "claude-opus-5-5")?.name).toBe("Opus");
+    expect(catalog.defaultModel).toBe("anthropic/claude-opus-5-5");
+  });
+
+  it("keeps the default label when that model has no concrete alias", () => {
+    const catalog = claudeCatalogFromRows([
+      row({
+        value: "default",
+        resolvedModel: "claude-opus-5-5",
+        displayName: "Default (recommended)",
+      }),
+    ]);
+    expect(catalog.providers[0].models[0]).toEqual({
+      id: "claude-opus-5-5",
+      name: "Default (recommended)",
+    });
+  });
+});

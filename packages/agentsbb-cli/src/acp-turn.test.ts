@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { runAgentTurn } from "./agents.js";
 import {
@@ -579,6 +579,10 @@ process.stdout.write("HEADLESS 回答");
     const binary = wrapAsBinary(scriptPath, "qodercli");
     const originalPath = process.env.PATH;
     process.env.PATH = `${dirname(process.execPath)}${process.platform === "win32" ? ";" : ":"}${originalPath ?? ""}`;
+    const warnings: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((message: unknown) => {
+      warnings.push(String(message));
+    });
     try {
       const answer = await runAgentTurn({
         execPath: binary,
@@ -587,8 +591,50 @@ process.stdout.write("HEADLESS 回答");
         timeoutMs: 20_000,
       });
       expect(answer).toBe("HEADLESS 回答");
+      // 回退告警运维会看，也按双语版式：两半分开断言。
+      const joined = warnings.join("\n");
+      expect(joined).toContain("ACP 不可用，回退 headless");
+      expect(joined).toContain("falling back to headless");
     } finally {
+      warn.mockRestore();
       process.env.PATH = originalPath;
     }
+  });
+});
+
+// 这几条是「面向用户的失败原因」，按仓内版式（中文一行 + 英文一行，见 bin.ts 的
+// 迁移提示）给双语。两半分开断言：任何一半被改回单语都会立刻变红。
+describe("面向用户的失败文案是中英双语", () => {
+  it("session 没有 sessionId", async () => {
+    const fixture = writeServer("no-session-id", { sessionResult: {} });
+    const err = await runAcpTurn({
+      execPath: process.execPath,
+      spec: spec({ args: [fixture.path] }),
+      prompt: "hi",
+      timeoutMs: 20_000,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AcpStartupError);
+    const message = (err as Error).message;
+    expect(message).toContain("没有拿到 sessionId");
+    expect(message).toContain("without a sessionId");
+  });
+
+  it("切换模型被 agent 拒绝", async () => {
+    const fixture = writeServer("set-model-rejected", {
+      failModelIds: ["e-1", "trae/e-1"],
+      updates: [textChunk("不该到这里")],
+    });
+    const err = await runAcpTurn({
+      execPath: process.execPath,
+      spec: spec({ args: [fixture.path], providerFallback: "trae" }),
+      prompt: "hi",
+      model: "trae/e-1",
+      timeoutMs: 20_000,
+    }).catch((e: unknown) => e);
+
+    const message = (err as Error).message;
+    expect(message).toContain("无法切换到模型");
+    expect(message).toContain("could not switch to model");
   });
 });

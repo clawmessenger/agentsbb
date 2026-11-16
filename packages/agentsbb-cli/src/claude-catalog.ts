@@ -128,6 +128,11 @@ export function claudeCatalogFromRows(
   rows: readonly ClaudeModelRow[],
 ): DiscussionModelCatalog & { skipped: number } {
   const models = new Map<string, string>();
+  // `default` 行的 displayName 是「Default (recommended)」这种**位置说明**，不是
+  // 模型名。真机（claude 2.1.325）里 default 与 opus 都解析到 claude-opus-5-5，
+  // 谁先出现谁定名字，于是面板上会冒出「Default (recommended)」这条模型。这里
+  // 把 default 行标成临时标签，后面出现具体别名（opus / sonnet …）时覆盖掉。
+  const provisionalLabels = new Set<string>();
   let defaultModel: string | null = null;
   let skipped = 0;
   for (const row of rows) {
@@ -137,8 +142,15 @@ export function claudeCatalogFromRows(
       skipped += 1;
       continue;
     }
-    if (row.resolvedModel && !models.has(row.resolvedModel)) {
-      models.set(row.resolvedModel, row.displayName);
+    if (row.resolvedModel) {
+      const isDefaultRow = row.value === "default";
+      if (!models.has(row.resolvedModel)) {
+        models.set(row.resolvedModel, row.displayName);
+        if (isDefaultRow) provisionalLabels.add(row.resolvedModel);
+      } else if (!isDefaultRow && provisionalLabels.has(row.resolvedModel)) {
+        models.set(row.resolvedModel, row.displayName);
+        provisionalLabels.delete(row.resolvedModel);
+      }
     }
     if (row.value === "default" && !defaultModel) defaultModel = route;
   }

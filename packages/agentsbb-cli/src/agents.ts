@@ -2275,7 +2275,10 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       if (!(err instanceof AcpStartupError) || opts.disableAcp) throw err;
       // 起不来就退回 headless：内容仍然拿得到，只是模型选择对这家 agent
       // 不生效（与改造前一致），绝不因为 ACP 让一轮失败。
-      console.warn(`${acpSpec.label} ACP 不可用，回退 headless：${err.message}`);
+      console.warn(
+        `${acpSpec.label} ACP 不可用，回退 headless：${err.message}\n`
+        + `${acpSpec.label} ACP unavailable — falling back to headless: ${err.message}`,
+      );
       return runAgentTurn({ ...opts, disableAcp: true });
     });
   }
