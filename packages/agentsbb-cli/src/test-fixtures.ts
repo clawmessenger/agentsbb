@@ -22,6 +22,8 @@ export interface EchoAgentOptions {
   cjkRepeat?: number;
   /** 固定 stdout 文本，用来复现特定输出形状（如 openclaw 的 --json 信封）。 */
   stdoutText?: string;
+  /** 固定 stderr 文本，用来复现「结果打在 stderr、stdout 为空」的 CLI（pi 0.73.1 --list-models）。 */
+  stderrText?: string;
 }
 
 // Creates a temporary directory holding a fake agent executable named `name`
@@ -57,12 +59,13 @@ export function createEchoAgentScript(name: string, opts: EchoAgentOptions = {})
     return makeFixture(dir, scriptPath, argsFile);
   }
 
-  if (opts.stdoutText !== undefined) {
-    // 固定 stdout（经 node 写出，避免 .cmd 里引号/换行的转义地狱）。用来复现
-    // 特定输出形状，例如 openclaw 的 --json 信封。
+  if (opts.stdoutText !== undefined || opts.stderrText !== undefined) {
+    // 固定 stdout/stderr（经 node 写出，避免 .cmd 里引号/换行的转义地狱）。用来
+    // 复现特定输出形状，例如 openclaw 的 --json 信封、pi 的 stderr 模型表。
     const cjsPath = join(dir, "fixed-agent.cjs");
     writeFileSync(cjsPath, [
-      `process.stdout.write(${JSON.stringify(opts.stdoutText)});`,
+      `process.stdout.write(${JSON.stringify(opts.stdoutText ?? "")});`,
+      `process.stderr.write(${JSON.stringify(opts.stderrText ?? "")});`,
       `process.stdin.resume();`,
     ].join("\n"));
     if (isWin) {

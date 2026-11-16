@@ -1175,6 +1175,10 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     let stderr = "";
+    // stderr 的完整累积（独立于下面 2000 字符的环形缓冲）：stderr 兜底解析时
+    // 要拿到完整输出，不能被「只留末尾 2000 字符」的日志缓冲截头。
+    const stderrChunks: Buffer[] = [];
+    let stderrBytes = 0;
     let settled = false;
 
     const settle = (fn: () => void) => {
@@ -1209,6 +1213,11 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
     });
     child.stderr.on("data", (buf: Buffer) => {
       stderr = (stderr + buf.toString("utf8")).slice(-2000);
+      if (stderrBytes < maxBytes) {
+        const room = maxBytes - stderrBytes;
+        stderrChunks.push(buf.length > room ? buf.subarray(0, room) : buf);
+        stderrBytes += Math.min(buf.length, room);
+      }
     });
     child.on("error", (err) => {
       settle(() => reject(err));
@@ -1217,6 +1226,15 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
       settle(() => {
         const stdout = Buffer.concat(chunks).toString("utf8");
         if (code === 0) {
+          // stderr 兜底：有的列举命令把人类可读结果打到 stderr 而不是 stdout
+          // （2026-11-16 实测 pi 0.73.1 的 `--list-models` 表格整个走 stderr，
+          // exit 0，stdout 恒为空 —— 设备端目录于是永远 0 provider）。成功退出
+          // 且 stdout 为空时退回 stderr，让解析器仍能拿到内容；同样截到
+          // maxBytes，防一条超长错误日志把目录撑爆。
+          if (stdout.trim() === "" && stderrChunks.length > 0) {
+            resolve(Buffer.concat(stderrChunks).toString("utf8"));
+            return;
+          }
           resolve(stdout);
         } else {
           reject(new Error(`agent command exited with code ${code}: ${stderr}`));

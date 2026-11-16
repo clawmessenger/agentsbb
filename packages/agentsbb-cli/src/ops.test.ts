@@ -1,10 +1,18 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
+import { mkdirSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { agentNameFromRcUser, detectOpsShell, ensureOpencodeInstalled, setupOpsWorkdir } from "./ops.js";
+import {
+  agentNameFromRcUser,
+  detectOpsShell,
+  ensureOpencodeInstalled,
+  resolveNpmInvocation,
+  setupOpsWorkdir,
+  windowsCandidateDirs,
+} from "./ops.js";
 import type { AgentInfo } from "./agents.js";
 
 function agent(pathOverride: string): AgentInfo {
@@ -43,6 +51,7 @@ describe("ensureOpencodeInstalled", () => {
     const promise = ensureOpencodeInstalled({
       discover,
       spawnFn: spawnFn as unknown as typeof import("node:child_process").spawn,
+      resolveNpm: () => ({ file: "npm", args: [] }),
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     emitters[0].emit("close", 0);
@@ -50,6 +59,21 @@ describe("ensureOpencodeInstalled", () => {
     expect(result.path).toBe("C:\\tools\\opencode.cmd");
     expect(spawnCalls).toEqual([{ command: "npm", args: ["install", "-g", "opencode-ai@latest"] }]);
     expect(discoverCount).toBe(2);
+  });
+
+  it("rejects with a clear error when npm cannot be resolved", async () => {
+    const spawnCalls: unknown[][] = [];
+    const spawnFn = (...args: unknown[]): EventEmitter => {
+      spawnCalls.push(args);
+      return new EventEmitter();
+    };
+    const promise = ensureOpencodeInstalled({
+      discover: async () => [],
+      spawnFn: spawnFn as unknown as typeof import("node:child_process").spawn,
+      resolveNpm: () => null,
+    });
+    await expect(promise).rejects.toThrow(/npm is not available/);
+    expect(spawnCalls).toHaveLength(0);
   });
 
   it("rejects when npm install exits non-zero", async () => {
@@ -64,6 +88,7 @@ describe("ensureOpencodeInstalled", () => {
     const promise = ensureOpencodeInstalled({
       discover: async () => [],
       spawnFn: spawnFn as unknown as typeof import("node:child_process").spawn,
+      resolveNpm: () => ({ file: "npm", args: [] }),
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     emitters[0].emit("close", 1);
@@ -80,10 +105,48 @@ describe("ensureOpencodeInstalled", () => {
     const promise = ensureOpencodeInstalled({
       discover: async () => [],
       spawnFn: spawnFn as unknown as typeof import("node:child_process").spawn,
+      resolveNpm: () => ({ file: "npm", args: [] }),
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     emitters[0].emit("close", 0);
     await expect(promise).rejects.toThrow(/still not discoverable/);
+  });
+});
+
+describe("resolveNpmInvocation / windowsCandidateDirs", () => {
+  it("returns plain npm on posix", () => {
+    if (process.platform === "win32") return;
+    expect(resolveNpmInvocation({ PATH: "" })).toEqual({ file: "npm", args: [] });
+    expect(windowsCandidateDirs({})).toEqual([]);
+  });
+
+  it("resolves npm.cmd from candidate dirs when the process PATH is broken (win32)", () => {
+    if (process.platform !== "win32") return;
+    // 现场复现：supervisor 由计划任务拉起，PATH 里 %NVM_HOME% 以字面量形式
+    // 挂着、从未展开 —— PATH 扫描一无所获，只能靠候选目录兜底。
+    const dir = path.join(os.tmpdir(), `agentsbb-npm-test-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "npm.cmd"), "@echo off\r\n");
+    try {
+      const inv = resolveNpmInvocation({ PATH: "" }, [dir]);
+      expect(inv).not.toBeNull();
+      const flat = [inv!.file, ...inv!.args].join(" ");
+      expect(flat).toContain(dir);
+    } finally {
+      rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null when neither PATH nor candidate dirs contain npm (win32)", () => {
+    if (process.platform !== "win32") return;
+    const empty = path.join(os.tmpdir(), `agentsbb-npm-empty-${Date.now()}`);
+    mkdirSync(empty, { recursive: true });
+    writeFileSync(path.join(empty, "placeholder.txt"), "x");
+    try {
+      expect(resolveNpmInvocation({ PATH: "" }, [empty])).toBeNull();
+    } finally {
+      rm(empty, { recursive: true, force: true });
+    }
   });
 });
 

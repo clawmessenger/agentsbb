@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { discoverAgents, type AgentInfo } from "./agents.js";
+import { delimiter, join } from "node:path";
+import { buildSpawnInvocation, discoverAgents, type AgentInfo } from "./agents.js";
 import { stateHome } from "./paths.js";
 
 // Built-in agent name bound on every agentsbb device. Distinct from the
@@ -19,10 +20,69 @@ export interface EnsureOpencodeDeps {
   discover?: () => Promise<AgentInfo[]>;
   spawnFn?: typeof spawn;
   log?: (message: string) => void;
+  /**
+   * 解析 npm 可执行文件；返回 null = 本机找不到 npm。
+   * 默认实现见 resolveNpmInvocation（win32 扫 PATH + 常见目录并处理 .cmd shim，
+   * posix 直接用 `npm`）。测试注入桩以保持密闭。
+   */
+  resolveNpm?: () => { file: string; args: string[] } | null;
 }
 
 function findOpencode(agents: AgentInfo[]): AgentInfo | undefined {
   return agents.find((a) => a.name === "opencode");
+}
+
+// Windows：以计划任务 / 开机脚本拉起的 supervisor 常拿不到用户级 PATH。
+// 2026-11-16 现场（小久）：注册表 PATH 里 `%NVM_HOME%`/`%NVM_SYMLINK%` 以
+// REG_SZ 字面量形式写死、进程环境从未展开 —— npm 与 npm 全局安装的 opencode
+// 在进程眼里"不存在"，ops 子进程于是永远走到 npm 安装分支、再被
+// spawn npm ENOENT 打死，无限重启。这些目录按常见度补进探测与解析的候选；
+// 多列几个无害，命中与否取决于机器。
+export function windowsCandidateDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  if (process.platform !== "win32") return [];
+  const dirs: string[] = [];
+  const push = (dir?: string | null) => {
+    const trimmed = dir?.trim();
+    if (trimmed && !dirs.includes(trimmed)) dirs.push(trimmed);
+  };
+  push(env.APPDATA ? join(env.APPDATA, "npm") : null); // npm 全局 bin（npm i -g 的落点）
+  push("C:\\Program Files\\nodejs"); // 官方安装器默认目录
+  push(env.NVM_SYMLINK); // nvm-windows 的当前 node 目录
+  push("C:\\nvm4w\\nodejs"); // nvm-windows 自定义符号链接的常见落点
+  push(env.NVM_HOME);
+  return dirs;
+}
+
+/** 进程 PATH + 候选目录拼成的探测用 PATH（posix 与进程 PATH 等价）。 */
+function discoveryPath(env: NodeJS.ProcessEnv = process.env): string {
+  const base = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  return [...base, ...windowsCandidateDirs(env)].join(delimiter);
+}
+
+/**
+ * 解析 npm 的 spawn 形态。win32 上 npm 通常是 .cmd（CVE-2024-27980：Node
+ * ≥18.20 拒绝直接 spawn .cmd），必须走 buildSpawnInvocation 的 shim 解析 /
+ * cmd.exe 包装；同时扫候选目录兜底损坏的进程 PATH。
+ */
+export function resolveNpmInvocation(
+  env: NodeJS.ProcessEnv = process.env,
+  candidateDirsOverride?: string[],
+): {
+  file: string;
+  args: string[];
+} | null {
+  if (process.platform !== "win32") return { file: "npm", args: [] };
+  const dirs = [
+    ...(env.PATH ?? "").split(delimiter).filter(Boolean),
+    ...(candidateDirsOverride ?? windowsCandidateDirs(env)),
+  ];
+  for (const dir of dirs) {
+    for (const name of ["npm.cmd", "npm.exe", "npm"]) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return buildSpawnInvocation(candidate, []);
+    }
+  }
+  return null;
 }
 
 // opencode is a mandatory dependency of the ops agent. When missing we
@@ -30,16 +90,26 @@ function findOpencode(agents: AgentInfo[]): AgentInfo | undefined {
 // service's opencode-starter). npm.cmd on Windows goes through cmd.exe
 // like any other .cmd/.bat (CVE-2024-27980).
 export async function ensureOpencodeInstalled(deps: EnsureOpencodeDeps = {}): Promise<AgentInfo> {
-  const discover = deps.discover ?? (() => discoverAgents({}));
+  // 探测用增强 PATH：进程 PATH 可能缺用户级目录（见 windowsCandidateDirs）。
+  const discover =
+    deps.discover ??
+    (() => discoverAgents({ extraPath: discoveryPath() }));
   const spawnFn = deps.spawnFn ?? spawn;
+  const resolveNpm = deps.resolveNpm ?? resolveNpmInvocation;
   const log = deps.log ?? ((message: string) => console.log(message));
 
   const preinstalled = findOpencode(await discover());
   if (preinstalled) return preinstalled;
 
   log("opencode not found; installing opencode-ai@latest globally via npm…");
+  const npm = resolveNpm();
+  if (!npm) {
+    throw new Error(
+      "opencode not found and npm is not available on PATH; install Node.js or opencode manually",
+    );
+  }
   await new Promise<void>((resolve, reject) => {
-    const child = spawnFn("npm", ["install", "-g", "opencode-ai@latest"], {
+    const child = spawnFn(npm.file, [...npm.args, "install", "-g", "opencode-ai@latest"], {
       stdio: "inherit",
       windowsHide: true,
     });

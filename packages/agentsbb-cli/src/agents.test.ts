@@ -584,6 +584,61 @@ describe("runAgentCommand stopWhen", () => {
   });
 });
 
+// stderr 兜底：有的 CLI 把人类可读结果打在 stderr、stdout 恒为空（pi 0.73.1
+// 的 `--list-models` 表格，2026-11-16 实测 exit 0、stdout 0 字节）。没有这条
+// 兜底，设备端 pi 的模型目录永远 0 provider。
+describe("runAgentCommand stderr fallback", () => {
+  it("resolves with stderr when the command exits 0 with empty stdout", async () => {
+    const fixture = createEchoAgentScript("pi", {
+      stderrText: "provider  model\nquukk     glm-5.2\nquukk     kimi-k2.7-code\n",
+    });
+    try {
+      const out = await runAgentCommand({
+        execPath: fixture.agentPath,
+        argv: ["--list-models"],
+        timeoutMs: 30_000,
+      });
+      expect(out).toContain("quukk     glm-5.2");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("keeps stdout when it is non-empty and ignores stderr", async () => {
+    const fixture = createEchoAgentScript("pi", {
+      stdoutText: "quukk/glm-5.2\n",
+      stderrText: "noise line\n",
+    });
+    try {
+      const out = await runAgentCommand({
+        execPath: fixture.agentPath,
+        argv: ["--list-models"],
+        timeoutMs: 30_000,
+      });
+      expect(out).toBe("quukk/glm-5.2\n");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("does not mask a non-zero exit: failure still rejects with the stderr detail", async () => {
+    const fixture = createEchoAgentScript("pi", {
+      failWith: { code: 1, message: "boom" },
+    });
+    try {
+      await expect(
+        runAgentCommand({
+          execPath: fixture.agentPath,
+          argv: [],
+          timeoutMs: 30_000,
+        }),
+      ).rejects.toThrow(/code 1/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
 describe("agentRuntimeEnv", () => {
   const CONFIG = {
     endpoints: [
