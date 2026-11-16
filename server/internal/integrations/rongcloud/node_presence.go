@@ -51,6 +51,39 @@ func nodeIsOnline(ctx context.Context, client *rongcloudAPIClient, node db.Rongc
 	return online
 }
 
+// nodePresenceByRCID 是 nodeIsOnline 的「只有融云 id、没有节点行」版本，供
+// 群聊/聊天室的按序派发使用（成员表只带 rongcloud_user_id）。
+//
+// 与 nodeIsOnline 的差别只有一个，但很关键：它把「这次问不出结论」与「确实
+// 离线」分开返回（known）。派发方只在 known && !online 时才跳过成员 ——
+// 拿不到结论时宁可照旧派发（让超时/派发失败分支兜底），也不能因为一次接口
+// 抖动把所有发言者都判成离线，那样用户看到的是一屋子占位气泡。
+//
+// 同样复用 client.presence 的短 TTL 缓存：一次接力里同一位成员只会在自己那
+// 一轮被问到（轮间隔以秒/分钟计），缓存主要用来吸收「同一轮内重复确认」。
+func nodePresenceByRCID(ctx context.Context, client *rongcloudAPIClient, rcID string) (online bool, known bool) {
+	if client == nil || rcID == "" {
+		return false, false
+	}
+	if online, hit := client.presence.lookup(rcID); hit {
+		return online, true
+	}
+	online, known, err := client.checkOnlinePresence(ctx, rcID)
+	if err != nil {
+		slog.Warn("rongcloud: 成员在线查询失败，按未知处理（不跳过）",
+			"rongcloud_user_id", rcID,
+			"error", err)
+		return false, false
+	}
+	if !known {
+		// 响应里没有 status：协议/网关异常。不落缓存（未知不是观测值），也不
+		// 当成离线 —— 调用方会照旧派发。
+		return false, false
+	}
+	client.presence.store(rcID, online)
+	return online, true
+}
+
 // syncNodePresenceCache 把一次 presence 观测写回 rongcloud_node.deploy_status。
 // 只在观测值与列值不一致时写，避免热点路径上产生无谓的 UPDATE。
 // 写失败不影响判定（列只是缓存，不是权威状态）。

@@ -589,6 +589,32 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 				return
 			}
 			member := s.members[s.index]
+			// 离线闸门：派发前确认这位成员此刻连着融云。
+			//
+			// 为什么必须有它：融云私聊消息对**离线账号**是「存离线」语义，
+			// sendPrivateJSON 照样返回成功。于是一台早已掉线的设备（卸载了 CLI
+			// 的幽灵节点、关机的开发机）根本收不到 your_turn，也不会有任何心跳，
+			// 而服务端只能等满整轮超时（relayTurnTimeoutFloor = 10 分钟）才推进
+			// —— 群里 18 个成员里有 5 个幽灵，用户发一句「大家好」要等将近一小
+			// 时才轮到真正在线的设备开口，表现就是「发出去没人接话」。
+			//
+			// 判定口径：只在**确实离线**（known && !online）时跳过；问不出结论
+			// （融云 5xx/超时/响应缺 status）时照旧派发 —— 拿不到在线状态就把
+			// 全员判离线，等于用一次接口抖动让整个群哑掉，比多等一轮严重得多。
+			if online, known := nodePresenceByRCID(ctx, h.rt.client, member.rcID); known && !online {
+				h.rt.logger.Info("relay: member offline, skipping",
+					"chatroom", s.chatroomRCID, "group", s.isGroup,
+					"target", member.rcID, "round", s.roundIndex+1)
+				note := relayOfflineNote(member.roleName)
+				if s.targeted {
+					// 定向会话：被 @ 的人离线要说清是「不在线」而不是「超时」，
+					// 用户才知道该重试还是该换人。
+					note = relayTargetFailedNote(member.roleName, "当前不在线")
+				}
+				h.noteSkippedMember(ctx, s, &member, note)
+				s.index++
+				continue
+			}
 			requestID := fmt.Sprintf("relay_%d_%d_%d", time.Now().UnixNano(), s.roundIndex, member.order)
 			done := make(chan struct{})
 			h.mu.Lock()
@@ -949,6 +975,13 @@ func relayEmptyOutputNote(roleName string) string {
 // 就是「上一位卡住不动，下一位抢话」。
 func relayTimeoutNote(roleName string) string {
 	return fmt.Sprintf("（%s 本轮思考超时，已跳过）", roleName)
+}
+
+// relayOfflineNote 是「这位成员此刻不在线」的占位：与超时区分开，因为二者对
+// 用户的含义完全不同 —— 超时是「它在想但没应答」（值得等/重试），离线是「设备
+// 根本没连上」（重试也没用，得先把那台设备弄上线）。
+func relayOfflineNote(roleName string) string {
+	return fmt.Sprintf("（%s 当前不在线，已跳过）", roleName)
 }
 
 func relayTurnFailedNote(roleName string) string {

@@ -50,13 +50,32 @@ func (c *rongcloudAPIClient) refreshUser(ctx context.Context, userID, name, port
 
 // checkOnline returns true if the user is currently online.
 func (c *rongcloudAPIClient) checkOnline(ctx context.Context, userID string) (bool, error) {
+	online, _, err := c.checkOnlinePresence(ctx, userID)
+	return online, err
+}
+
+// checkOnlinePresence 是 checkOnline 的**三态**版本：除了「在线/离线」，还能
+// 表达「这次问不出结论」。
+//
+// 为什么必须分开：checkOnline 把「响应里没有 status 字段」直接当离线。对
+// 「这台设备能不能收命令」的判定来说这是安全的（fail closed），但用它做
+// **跳过发言者**的依据就不安全了 —— 一次协议变更、一个代理回包、或者一个只
+// 实现了消息端点的测试替身，都会让全员被当成离线，表现为「群里突然谁都不说话」。
+// 所以调用方（relay 的离线闸门）只在 known=true 时才敢跳过，known=false 时
+// 退回旧行为（照常派发，让超时/派发失败分支兜底）。
+//
+// 判定口径：status="1" → 在线；status="0" → 离线；缺失/非字符串 → 未知。
+func (c *rongcloudAPIClient) checkOnlinePresence(ctx context.Context, userID string) (online bool, known bool, err error) {
 	form := url.Values{"userId": {userID}}
 	result, err := c.postForm(ctx, "/user/checkOnline.json", form)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	status, _ := result["status"].(string)
-	return status == "1", nil
+	status, ok := result["status"].(string)
+	if !ok {
+		return false, false, nil
+	}
+	return status == "1", true, nil
 }
 
 // expireToken invalidates tokens issued before the given timestamp (ms).
