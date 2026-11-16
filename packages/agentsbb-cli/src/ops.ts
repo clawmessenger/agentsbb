@@ -45,6 +45,11 @@ export function windowsCandidateDirs(env: NodeJS.ProcessEnv = process.env): stri
     const trimmed = dir?.trim();
     if (trimmed && !dirs.includes(trimmed)) dirs.push(trimmed);
   };
+  // opencode 官方安装器的默认落点（%USERPROFILE%\.opencode\bin）必须排在 npm
+  // 全局目录**之前**：npm 包 opencode-ai 的版本长期滞后于官方安装器（2026-11-16
+  // 现场：npm 1.19.x vs 官方 2.1.4），兜底装出的旧版会长期遮蔽机器上已有的
+  // 新版 —— 两者并存时，宁可探到官方版。
+  push(env.USERPROFILE ? join(env.USERPROFILE, ".opencode", "bin") : null);
   push(env.APPDATA ? join(env.APPDATA, "npm") : null); // npm 全局 bin（npm i -g 的落点）
   push("C:\\Program Files\\nodejs"); // 官方安装器默认目录
   push(env.NVM_SYMLINK); // nvm-windows 的当前 node 目录

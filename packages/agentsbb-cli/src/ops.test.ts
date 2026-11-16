@@ -114,6 +114,20 @@ describe("ensureOpencodeInstalled", () => {
 });
 
 describe("resolveNpmInvocation / windowsCandidateDirs", () => {
+  it("puts the official opencode install dir ahead of the npm global dir (win32)", () => {
+    if (process.platform !== "win32") return;
+    // npm 包 opencode-ai 版本滞后于官方安装器：两者并存时官方版必须优先，
+    // 否则兜底/探测都会长期报 npm 的旧版本（2026-11-16 现场实测）。
+    const dirs = windowsCandidateDirs({
+      USERPROFILE: "C:\\Users\\demo",
+      APPDATA: "C:\\Users\\demo\\AppData\\Roaming",
+    });
+    const official = dirs.findIndex((d) => d.toLowerCase().endsWith(".opencode\\bin"));
+    const npmGlobal = dirs.findIndex((d) => d.toLowerCase().endsWith("appdata\\roaming\\npm"));
+    expect(official).toBeGreaterThanOrEqual(0);
+    expect(npmGlobal).toBeGreaterThan(official);
+  });
+
   it("returns plain npm on posix", () => {
     if (process.platform === "win32") return;
     expect(resolveNpmInvocation({ PATH: "" })).toEqual({ file: "npm", args: [] });
