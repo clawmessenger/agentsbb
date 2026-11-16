@@ -1292,6 +1292,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			rcClient := rongcloud.NewRongCloudAPIClientForServices(rcBox, queries, slog.Default())
 			h.RongCloudInstall = rongcloud.NewInstallService(queries, rcBox, slog.Default())
 			h.RongCloudNode = rongcloud.NewNodeService(queries, rcClient, rcBox, slog.Default())
+			// per-agent 运维账号默认退役（2026-11，融云注册用户上限 100）：
+			// 每台机器保留一个机器级 ops，作用域隔离改由提示词 + 命令层 scope
+			// 承担。需要旧行为时把 CLAW_PER_AGENT_OPS_ENABLED 置真。
+			h.RongCloudNode.SetPerAgentOpsEnabled(envBool("CLAW_PER_AGENT_OPS_ENABLED", false))
 			h.RongCloudChatroom = rongcloud.NewChatroomService(queries, rcClient, slog.Default())
 			h.RongCloudPairing = rongcloud.NewPairingService(queries, rcBox, slog.Default())
 			// The coordinator needs the admin-configured 「人设提示词」 for the
@@ -1774,6 +1778,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 用户配额（保存即生效；updated_by 记管理员账号）。
 	r.Get("/api/admin/users/{id}/quota", h.ClawAdminGetUserQuota)
 	r.Put("/api/admin/users/{id}/quota", h.ClawAdminPutUserQuota)
+	// 全局默认配额（默认套餐那一行）：改这里 = 所有「没有按用户覆盖」的用户一起变。
+	// 之前这一层只能在代码里改常量，运营侧完全无法调整 3/5/1。
+	r.Get("/api/admin/quota/default-plan", h.ClawAdminGetDefaultQuotaPlan)
+	r.Put("/api/admin/quota/default-plan", h.ClawAdminPutDefaultQuotaPlan)
 	r.Get("/api/admin/stats", h.ClawAdminStats)
 	r.Get("/api/admin/audit-logs", h.ClawAdminAuditLogs)
 	r.Get("/api/admin/system/config", h.ClawAdminSystemConfigList)

@@ -26,7 +26,8 @@ import {
 } from "./agent-permissions.js";
 import { DEFAULT_SERVER_URL, machineId, defaultAnsweredTurnsPath, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
 import { stateHome } from "./paths.js";
-import { agentNameFromRcUser, ensureOpencodeInstalled, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
+import { agentNameFromRcUser, ensureOpencodeInstalled, opsScopeAgentName, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
+import { readOpsScopeSync } from "./ops-scope.js";
 import {
   ALLOW_DUPLICATE_SUPERVISOR_ENV,
   clearSupervisorState,
@@ -115,6 +116,22 @@ export function isSupervisedChild(env: NodeJS.ProcessEnv = process.env): boolean
 }
 
 /**
+ * 「我是运维子进程」标记（supervisor 对内置 ops agent 注入）。
+ *
+ * 与 OPS_SCOPE_ENV 的分工：per-agent ops 的作用域是**进程级**（启动参数
+ * `--ops-suffix` 派生），机器级 ops 没有固定对象，作用域按**轮次**落盘
+ * （见 ops-scope.ts）。命令层需要区分这两种情况 —— 只有确认自己是 ops 子
+ * 进程，才去读那份逐轮变化的 scope.json；用户在终端手敲 `agentsbb stop`
+ * 时不能被上一轮运维的作用域连坐。
+ */
+// TODO(rebrand-retire): 双读过渡，旧名 CLAWMESSENGER_OPS_AGENT 移除于 v1.6+
+export const OPS_AGENT_ENV = "AGENTSBB_OPS_AGENT";
+
+export function isOpsChild(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (envVal(env, OPS_AGENT_ENV) ?? "").trim() === "1";
+}
+
+/**
  * 托管子进程里执行整机 stop/restart 的拒绝文案。
  *
  * 与运维作用域（OPS_SCOPE_ENV）不同，这条**对所有 agent 都成立**：不管是不是
@@ -140,7 +157,13 @@ export function supervisedSelfKillRejection(
 }
 
 export function opsScope(env: NodeJS.ProcessEnv = process.env): string {
-  return (envVal(env, OPS_SCOPE_ENV) ?? "").trim();
+  // per-agent ops：进程级作用域，启动参数派生，优先级最高。
+  const fromEnv = (envVal(env, OPS_SCOPE_ENV) ?? "").trim();
+  if (fromEnv) return fromEnv;
+  // 机器级 ops：作用域按轮次写进 scope.json（见 ops-scope.ts），只有确认
+  // 自己是 ops 子进程才读 —— 否则终端里手敲命令会被上一轮运维的 scope 连坐。
+  if (isOpsChild(env)) return readOpsScopeSync();
+  return "";
 }
 
 /**
@@ -177,7 +200,9 @@ export function opsScopeTargetRejection(scopeAgent: string, target: string): str
 export function scopeDaemonReport<T extends { agents: string[] }>(report: T, scope: string): T {
   const scopedId = scope.trim();
   if (!scopedId) return report;
-  const agentName = agentNameFromRcUser(scopedId);
+  // 作用域可能是 per-agent ops 的融云 id，也可能是机器级 ops 逐轮落盘的
+  // agent 名（见 ops-scope.ts）：两者都要能收敛到「只看得到自己」。
+  const agentName = opsScopeAgentName(scopedId);
   const own = new Set<string>([`ops@${scopedId}`]);
   if (agentName) {
     own.add(agentName);
@@ -922,7 +947,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       // 运维作用域内只看得到自己那一个智能体：同一台机器上还有谁装了 CLI，
       // 不归它知道（见 scopeDaemonReport 的注释）。
       const scope = opsScope();
-      const visible = scope ? found.filter((a) => a.name === agentNameFromRcUser(scope)) : found;
+      const visible = scope ? found.filter((a) => a.name === opsScopeAgentName(scope)) : found;
       if (visible.length === 0) {
         opts.stdout.write(scope
           ? `no agent CLI found for this ops scope (${scope})\n`
@@ -963,7 +988,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         return;
       }
       const scope = opsScope();
-      const scopeAgent = scope ? agentNameFromRcUser(scope) : "";
+      const scopeAgent = scope ? opsScopeAgentName(scope) : "";
       const target = (name ?? scopeAgent).trim();
       if (!target) {
         opts.stdout.write("which agent? e.g. agentsbb agent restart opencode\n");
@@ -973,6 +998,18 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       // 本地先拦一道（服务端还会再校验一次）：per-agent 运维只能动自己那一个。
       if (scopeAgent && target !== scopeAgent) {
         opts.stdout.write(opsScopeTargetRejection(scopeAgent, target));
+        process.exitCode = 1;
+        return;
+      }
+      // 机器级 ops 且本轮还没确定对象（用户没点名、scope.json 也是空的）：
+      // 不许猜。这时正确的动作是回头问用户，而不是自己挑一个目标执行 ——
+      // 同机几个智能体共用这一个 ops 账号，猜错就是动了别人的东西。
+      if (!scopeAgent && isOpsChild()) {
+        opts.stdout.write(
+          "本轮还没确定要操作哪个智能体（用户没有点名）。\n"
+          + "先用一句话问用户要操作哪一个，得到明确答复后再执行 "
+          + "`agentsbb agent <start|stop|restart> <name>`。\n",
+        );
         process.exitCode = 1;
         return;
       }
@@ -1027,7 +1064,8 @@ export function buildProgram(opts: BuildProgramOpts): Command {
     .option("--agent <name>", "agent CLI name; must be discoverable on PATH (see agentsbb agents)")
     .option("--model <model>", "model override passed to the agent CLI")
     .option("--ops-suffix <suffix>", "ops agent only: per-agent workdir suffix (supervisor passes the served agent's RongCloud id)")
-    .action(async (cmdOpts: { agent?: string; model?: string; opsSuffix?: string }) => {
+    .option("--ops-agents <list>", "ops agent only: comma-separated bound agent names; each turn is scoped to the one the user names")
+    .action(async (cmdOpts: { agent?: string; model?: string; opsSuffix?: string; opsAgents?: string }) => {
       // Supervisor-spawned children carry their agent-specific credentials
       // in the environment; a plain `agentsbb run` never sees them otherwise
       // because each child overwrites nothing in the shared keystore.
@@ -1241,6 +1279,9 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       let turnTimeoutMs: number | undefined;
       let cwd: string | undefined;
       let ensureRuntime: (() => Promise<void>) | undefined;
+      // 机器级 ops 的可运维对象（见下方 --ops-agents）；非 ops 或 per-agent
+      // ops 保持 undefined —— run loop 据此决定要不要启用逐轮作用域。
+      let opsBoundAgents: string[] | undefined;
       if (cmdOpts.agent === OPS_AGENT_NAME) {
         const opencode = await ensureOpencodeInstalled();
         // per-agent 运维子进程（supervisor 传 --ops-suffix <agentRC>）用独立
@@ -1253,11 +1294,18 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           }
           workdirOverride = path.join(stateHome(), "ops", cmdOpts.opsSuffix);
         }
+        // 机器级 ops 的合法运维对象集合（supervisor 从本次凭据里挑出非 ops 的
+        // agent 名传进来）。per-agent ops 用不到它：它的作用域就是 opsSuffix。
+        // 空数组也算「机器级」—— 那就是「一个名字都没读到」，提示词与命令层
+        // 都要按「未指定对象」处理，而不是退回全机视野。
+        opsBoundAgents = cmdOpts.opsSuffix
+          ? undefined
+          : (cmdOpts.opsAgents ?? "").split(",").map((s) => s.trim()).filter(Boolean);
         const workdir = await setupOpsWorkdir(
           workdirOverride,
           cmdOpts.opsSuffix
             ? { opsFor: cmdOpts.opsSuffix, agentName: agentNameFromRcUser(cmdOpts.opsSuffix) }
-            : {},
+            : { boundAgents: opsBoundAgents },
         );
         agentExecPath = opencode.path;
         agentName = "opencode";
@@ -1300,6 +1348,10 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           cwd,
           processedUidsPath: defaultProcessedUidsPath(creds.nodeId),
           answeredTurnsPath: defaultAnsweredTurnsPath(creds.nodeId),
+          // 机器级 ops 的单目标作用域（见 ops-scope.ts）：每轮从消息里点名
+          // 的 agent 解析出本轮对象，注入抬头并写 scope.json。per-agent ops
+          // 有自己的进程级作用域（AGENTSBB_OPS_SCOPE），不传这个。
+          opsBoundAgents: cmdOpts.agent === OPS_AGENT_NAME && !cmdOpts.opsSuffix ? opsBoundAgents : undefined,
           ensureRuntime,
         });
       } finally {
@@ -2183,6 +2235,11 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
           // per-agent 运维子进程带上服务范围：CLI 据此拒绝整机级 stop/restart，
           // 也把同一个值写进 AGENTS.md 的「服务范围」，让模型自己守住边界。
           ...(entry.opsScope ? { [OPS_SCOPE_ENV]: entry.opsScope } : {}),
+          // 运维子进程标记（per-agent 与机器级都要）：命令层据此判断「要不要
+          // 读逐轮作用域 scope.json」。终端里手敲命令没有这个标记，不受连坐。
+          ...(entry.agent === OPS_AGENT_NAME || entry.agent.startsWith(`${OPS_AGENT_NAME}@`)
+            ? { [OPS_AGENT_ENV]: "1" }
+            : {}),
         },
         // supervisor 是 detached + windowsHide 拉起的，自己没有控制台；这里的子进程
         // 若不带 windowsHide，Windows 会为每个 console 子进程**新分配一个可见的
@@ -2753,6 +2810,13 @@ export async function runSupervisor(supervisor: RunSupervisorOpts): Promise<void
     // 共享目录会让多个 ops 子进程互相踩会话文件）。
     if (agent.agent === OPS_AGENT_NAME && agent.opsFor) {
       runArgs.push("--ops-suffix", agent.opsFor);
+    }
+    // 机器级 ops：把本机绑定的智能体名带过去。它没有进程级作用域，每轮靠
+    // 用户消息里点名的那个名字定对象（见 ops-scope.ts）—— 没有这份清单，
+    // 提示词只能让模型去猜「本机有哪些智能体」。
+    if (agent.agent === OPS_AGENT_NAME && !agent.opsFor) {
+      const names = [...new Set(bound.map((b) => b.agent).filter((n) => n && n !== OPS_AGENT_NAME))];
+      if (names.length > 0) runArgs.push("--ops-agents", names.join(","));
     }
     const intent = initialDesired.get(agent.agent);
     const desired = intent?.state ?? "running";

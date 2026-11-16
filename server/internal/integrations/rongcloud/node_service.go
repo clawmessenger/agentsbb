@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -51,6 +52,16 @@ type NodeService struct {
 	logger     *slog.Logger
 	mu         sync.Mutex
 	heartbeats map[pgtype.UUID]time.Time
+	// perAgentOpsEnabled 决定是否为每个 agent 单独建一个运维账号
+	// （"<agentRC>_ops"）。2026-11 起默认关闭：融云开发环境注册用户上限 100，
+	// 而「每 agent 一个 ops」在本机一台就吃掉 20+ 个名额，还让运维入口跟着
+	// agent 数量线性膨胀。关掉后运维入口统一回落到每机一个的机器级 ops，
+	// 作用域隔离改由提示词 + 命令层 scope 承担（见 packages/agentsbb-cli 的
+	// ops.ts / main.ts）。
+	//
+	// 保留开关是为了可回退：个别设备如果确实需要「每个 agent 一个独立运维
+	// 会话」，把 CLAW_PER_AGENT_OPS_ENABLED 置真即可恢复旧行为。
+	perAgentOpsEnabled atomic.Bool
 	// claimMu guards the memoised friend-edge inversion behind NodeClaimants.
 	claimMu      sync.Mutex
 	claimCache   map[string]string
@@ -68,6 +79,17 @@ func NewNodeService(queries *db.Queries, client *rongcloudAPIClient, box *secret
 		logger = slog.Default()
 	}
 	return &NodeService{queries: queries, client: client, box: box, logger: logger, heartbeats: make(map[pgtype.UUID]time.Time)}
+}
+
+// SetPerAgentOpsEnabled 打开/关闭 per-agent 运维账号（默认关闭，见字段注释）。
+// 必须在服务开始处理请求前调用；启动后再改只影响此后新建的节点。
+func (s *NodeService) SetPerAgentOpsEnabled(enabled bool) {
+	s.perAgentOpsEnabled.Store(enabled)
+}
+
+// PerAgentOpsEnabled 报告当前是否仍为每个 agent 单独建运维账号。
+func (s *NodeService) PerAgentOpsEnabled() bool {
+	return s.perAgentOpsEnabled.Load()
 }
 
 // heartbeatTTL is how long a device heartbeat stays fresh before the node is
@@ -139,40 +161,64 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 	if err != nil {
 		return "", false, false, fmt.Errorf("list nodes: %w", err)
 	}
-	// 优先该 agent 的专属运维节点（新 CLI 起的 per-agent ops 子进程按自己的
-	// nodeId 心跳）；机器上只有机器级 ops（旧 CLI）时回退到它。机器级 ops
-	// 的旧命名（"rc_node_<key>_ops"）同样以 "_ops" 结尾，必须用同机 agent
-	// 集合判别，不能只看后缀。
+	// 机器级 ops 的旧命名（"rc_node_<key>_ops"）同样以 "_ops" 结尾，必须用
+	// 同机 agent 集合判别，不能只看后缀。挑哪一个由 pickOpsNode 决定 ——
+	// per-agent 账号已退役，默认优先机器级（见该函数的注释）。
 	agentRCs := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
 		if n.MachineID == node.MachineID && !isHiddenNode(n) {
 			agentRCs[n.RongcloudUserID] = true
 		}
 	}
-	perAgentRC := perAgentOpsRCUserID(node.RongcloudUserID)
 	// 宿主节点有心跳 = 这台机器的 supervisor 还活着。ops 子进程是 supervisor
 	// 拉起的、和它服务的 agent 同生共死，所以「宿主在线」已经足够说明运维端
 	// 在跑 —— ops 自己的心跳只是 30s 一拍，服务端重启后心跳表是空的，头 90s
 	// 读到的一定是离线。运维是随设备常驻的能力，不能因为一拍空窗就报离线，
 	// 否则用户每次重启服务都会看到「运维助手离线」。
 	hostAlive := s.IsOnline(node.ID)
-	var machineLevel *db.RongcloudNode
+	chosen := pickOpsNode(nodes, node.MachineID, node.RongcloudUserID, agentRCs, s.perAgentOpsEnabled.Load())
+	if chosen == nil {
+		return "", false, false, nil
+	}
+	return chosen.RongcloudUserID, s.IsOnline(chosen.ID) || hostAlive, true, nil
+}
+
+// pickOpsNode 在机器的 ops 节点里挑出运维入口（纯函数，便于单测）。
+//
+// perAgentEnabled 为真 → 旧行为：优先该 agent 专属的 "<agentRC>_ops"，没有
+// 再回退机器级。默认（关闭）则相反：per-agent 运维账号已退役（见
+// NodeService.perAgentOpsEnabled），存量行可能还在库里但**没有进程应答**，
+// 指向它会让用户看到「运维助手离线」；机器级 ops 才是每机唯一在跑的那个。
+//
+// 机器级 ops 的在野命名有两种（"ops_<key>" / 旧 "rc_node_<key>_ops"），都以
+// 去掉 "_ops" 后能否命中同机 agent 来判别（见 classifyOpsRCUser）。
+func pickOpsNode(nodes []db.RongcloudNode, machineID, agentRC string, agentRCs map[string]bool, perAgentEnabled bool) *db.RongcloudNode {
+	wantPerAgentRC := perAgentOpsRCUserID(agentRC)
+	var machineLevel, perAgent *db.RongcloudNode
 	for _, n := range nodes {
-		if n.MachineID != node.MachineID || n.AiType.String != OpsAgentType {
+		if n.MachineID != machineID || n.AiType.String != OpsAgentType {
 			continue
 		}
-		if n.RongcloudUserID == perAgentRC {
-			return n.RongcloudUserID, s.IsOnline(n.ID) || hostAlive, true, nil
+		if n.RongcloudUserID == wantPerAgentRC {
+			copied := n
+			perAgent = &copied
+			continue
 		}
-		if _, perAgent := classifyOpsRCUser(n.RongcloudUserID, agentRCs); !perAgent {
+		if _, isPerAgent := classifyOpsRCUser(n.RongcloudUserID, agentRCs); !isPerAgent {
 			copied := n
 			machineLevel = &copied
 		}
 	}
-	if machineLevel != nil {
-		return machineLevel.RongcloudUserID, s.IsOnline(machineLevel.ID) || hostAlive, true, nil
+	if perAgentEnabled {
+		if perAgent != nil {
+			return perAgent
+		}
+		return machineLevel
 	}
-	return "", false, false, nil
+	if machineLevel != nil {
+		return machineLevel
+	}
+	return perAgent
 }
 
 func pgText(s string) pgtype.Text {
@@ -2254,7 +2300,10 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: list machine nodes: %w", err)
 	}
-	if len(wantPerAgentOps) > 0 && wantPerAgentOps[0] {
+	// per-agent ops 默认关闭（SetPerAgentOpsEnabled，默认 false）：CLI 仍会
+	// 传 wantPerAgentOps（老版本不认识开关），这里统一忽略，避免名额继续被
+	// 吃掉。只有显式打开开关时才走旧的「每 agent 一个运维账号」路径。
+	if s.perAgentOpsEnabled.Load() && len(wantPerAgentOps) > 0 && wantPerAgentOps[0] {
 		// 为本机每个已绑定的非 ops agent 确保专属运维节点（幂等）。单个失败
 		// 不阻断整体下发：缺的 agent 退化为机器级 ops（前端回退 om_ 账号）。
 		created := false
@@ -2287,11 +2336,27 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 		}
 		agentRCs[n.RongcloudUserID] = true
 	}
+	// 每机只下发一个运维凭据（per-agent ops 退役后）。不下发的存量 per-agent
+	// 行会让 supervisor 为每个都起一个 ops 子进程 —— 本机一台就 20 个，既浪费
+	// 又让一批早该下线的融云账号持续在线。
+	//
+	// 判据与 OmStatusForNode 用同一个 pickOpsNode：「前端运维入口指向谁」与
+	// 「设备实际拉起哪个 ops 进程」必须永远是同一个，否则会出现点进运维却是
+	// 另一个账号在应答。开关打开（回退旧行为）时不过滤，全部照发。
+	var chosenOpsRC string
+	if !s.perAgentOpsEnabled.Load() {
+		if chosen := pickOpsNode(nodes, machineID, "", agentRCs, false); chosen != nil {
+			chosenOpsRC = chosen.RongcloudUserID
+		}
+	}
 	for _, n := range nodes {
 		if n.ID == machineNode.ID {
 			continue // the machine node itself is not an agent target
 		}
 		if !n.AiType.Valid || n.AiType.String == "" {
+			continue
+		}
+		if n.AiType.String == OpsAgentType && chosenOpsRC != "" && n.RongcloudUserID != chosenOpsRC {
 			continue
 		}
 		rcUser, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID)

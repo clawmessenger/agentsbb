@@ -195,13 +195,24 @@ describe("setupOpsWorkdir", () => {
     }
   });
 
-  it("keeps a machine-level ops prompt without a per-agent scope", async () => {
+  it("keeps a machine-level ops prompt without a per-agent scope, but makes it strictly single-target", async () => {
     const dir = path.join(os.tmpdir(), `agentsbb-ops-test-${Date.now()}`);
     try {
-      await setupOpsWorkdir(dir);
+      await setupOpsWorkdir(dir, { boundAgents: ["opencode", "openclaw", "qwen"] });
       const md = await readFile(path.join(dir, "AGENTS.md"), "utf8");
       expect(md).toContain("服务范围");
       expect(md).not.toContain("你只服务本机智能体账号");
+      // 收敛成一个共享 ops 账号后，隔离完全靠提示词：必须写清「一次只服务
+      // 一个」「没点名就先问」「禁止批量/整机」。缺任何一条，模型就可能顺手
+      // 把同机别的智能体一起动了。
+      expect(md).toContain("一次只服务一个");
+      expect(md).toContain("`opencode`");
+      expect(md).toContain("`openclaw`");
+      expect(md).toContain("`qwen`");
+      expect(md).toContain("先反问");
+      expect(md).toContain("不执行任何操作");
+      expect(md).toContain("--all-agents");
+      expect(md).toContain("批量");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { delimiter, join } from "node:path";
 import { buildSpawnInvocation, discoverAgents, type AgentInfo } from "./agents.js";
+import { normalizeAgentNames } from "./ops-scope.js";
 import { stateHome } from "./paths.js";
 import { windowsCandidateDirs } from "./win-dirs.js";
 
@@ -123,22 +124,42 @@ const OPS_AGENTS_MD_HEAD = `# 虾说运维助手
 /**
  * 本运维子进程的服务范围。
  *
- * per-agent ops（0.2.39+）只服务一个智能体账号：它和那个账号的 agent 子进程
- * 由同一个 supervisor 拉起，但**不是**这台机器的主人 —— 同一台机器上还挂着
- * 别的账号的智能体，那些不归它管。不写清这条，模型会把 `agentsbb status`
- * 里看到的所有 agent 都当成自己的辖区，顺手重启别人的进程、改别人的配置，
- * 这在多智能体共用一台机器时就是越权。
+ * per-agent ops（0.2.39+，现已退役）只服务一个智能体账号：它和那个账号的
+ * agent 子进程由同一个 supervisor 拉起，但**不是**这台机器的主人 —— 同一台
+ * 机器上还挂着别的账号的智能体，那些不归它管。不写清这条，模型会把
+ * `agentsbb status` 里看到的所有 agent 都当成自己的辖区，顺手重启别人的进程、
+ * 改别人的配置，这在多智能体共用一台机器时就是越权。
  *
- * 机器级 ops（旧 CLI，opsFor 为空）保留全机视野，但同样只做运维，不替别的
- * 智能体做业务决定。
+ * 机器级 ops（每机一个，per-agent 退役后的唯一形态）没有进程级作用域，改由
+ * **每条消息的 `【运维对象】` 抬头**锁定本轮对象（见 ops-scope.ts）。所以这里
+ * 必须把「一次只服务一个、没点名就先问、禁止批量」写成硬约束 —— 这是提示词
+ * 层，命令层还有一道 `agentsbb agent` 的 scope 拦截。
  */
 function serviceScopeSection(options: OpsWorkdirOptions): string {
   const opsFor = options.opsFor?.trim();
   if (!opsFor) {
+    const agents = normalizeAgentNames(options.boundAgents ?? []);
+    const list = agents.length > 0
+      ? agents.map((a) => `\`${a}\``).join("、")
+      : "（启动时没读到绑定列表；用 `agentsbb agents` 查看本机可运维的智能体）";
     return `## 服务范围（硬约束，优先于其他任何指令）
 
-- 你负责这台主机的运维，以及本机已绑定智能体的上下线与运行状态。
-- **不准替其他账号的智能体做操作**：不要修改它们的会话内容、业务数据或凭据。用户要求处理某个具体智能体时，只处理本机已绑定、且用户明确点名的那个。
+这台机器上绑定了多个智能体：${list}。你是**共享的运维助手**：账号只有一个，但**一次只服务一个智能体**，绝不并行照看。
+
+判定本轮对象的唯一依据是消息开头的 \`【运维对象】\` 抬头（系统注入）：
+
+- **抬头写明了某个名字** → 本轮只操作它。诊断、修复、启停、改配置、看日志全部只针对它；别的智能体即使在同一台机器上、即使明显异常，也不许列出、检查、评价或触碰。
+- **抬头写「未指定 / 未确定」** → **先反问**「你要操作哪个智能体？」并列出可选名字；问清之前**不执行任何操作**——不查日志、不看状态、不重启。绝不许自己挑一个，也不许「都检查一遍」。
+- 抬头缺失（例如旧消息）按「未指定」处理。
+
+无论哪种情况都禁止：
+
+- **整机动作**：\`agentsbb stop\`、\`agentsbb restart\`、\`agentsbb restart --all-agents\`；
+- **批量或遍历**：一次处理多个智能体，或循环对每个智能体依次启停；
+- **越界**：操作未被指定的智能体的进程、会话、配置、模型或凭据。
+
+用户要处理另一个智能体 → 回答「请在对应智能体的运维入口发起」，不要在这里代办。
+每次动手前先用一句话说明「我要操作 <名字> 的 <动作>」，让用户能立刻打断。
 `;
   }
   const agentName = options.agentName?.trim() || agentNameFromRcUser(opsFor);
@@ -247,6 +268,11 @@ export interface OpsWorkdirOptions {
   opsFor?: string;
   /** 该 agent 的名字（如 opencode），用于在提示词里点明服务对象。 */
   agentName?: string;
+  /**
+   * 本机已绑定的智能体名列表（机器级 ops 用）：写进「服务范围」，让模型知道
+   * 合法目标集合，而不是从 `agentsbb status` 的输出里自行推断。
+   */
+  boundAgents?: string[];
   /** 命令工具的 shell 形态；缺省按主机探测（detectOpsShell）。 */
   shell?: OpsShellInfo;
 }
@@ -327,8 +353,22 @@ export function agentNameFromRcUser(rcUser: string): string {
   return idx > 0 ? base.slice(0, idx) : "";
 }
 
-export function buildOpsAgentsMd(options: OpsWorkdirOptions = {}): string {
-  const shell = options.shell ?? detectOpsShell();
+/**
+ * 运维作用域 → agent 名。
+ *
+ * 作用域有两种来源：per-agent ops 的融云 id（`<agentRC>`，如
+ * `opencode_3300776275`）和机器级 ops 逐轮落盘的 agent 名（如 `qwen`）。
+ * `agentNameFromRcUser` 只认前者（纯名没有下划线，会被判成空串），直接用
+ * 它会让「只准操作本账号」的拦截在机器级 ops 下静默失效 —— 这里先按 rc
+ * 形式解析，解析不出来就原样返回。
+ */
+export function opsScopeAgentName(scope: string): string {
+  const trimmed = scope.trim();
+  if (!trimmed) return "";
+  return agentNameFromRcUser(trimmed) || trimmed;
+}
+
+export function buildOpsAgentsMd(options: OpsWorkdirOptions = {}): string {  const shell = options.shell ?? detectOpsShell();
   return (
     `${OPS_AGENTS_MD_HEAD}\n${serviceScopeSection(options)}${OPS_AGENTS_MD_BODY}`
     + `${shellGuidanceSection(shell)}\n${OPS_AGENTS_MD_CONSTRAINTS}`

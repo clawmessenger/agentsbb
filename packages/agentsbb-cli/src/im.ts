@@ -175,6 +175,18 @@ export interface DispatcherDeps {
   // Echoed back in the response's data.agent so the web can show which runtime
   // it was talking to. Purely informational.
   agentName?: string;
+  /**
+   * 机器级运维助手（每机一个 ops 账号）的「本轮运维对象」注入。
+   *
+   * 为什么需要：per-agent 运维账号退役后，同机所有智能体的运维入口都指向
+   * 同一个 ops 账号 —— 融云私聊的对端只有一个，入口信息在 IM 层就丢了。
+   * 模型只能从这一轮的消息里知道「现在该动谁」，所以由 run.ts 在派发前注入
+   * `【运维对象】X` 抬头并落盘作用域（见 ops-scope.ts）。
+   *
+   * 返回注入后的 prompt；返回 null 表示本轮跳过（不加抬头）。省略 = 不是
+   * 机器级 ops，行为与之前完全一致。
+   */
+  scopeOpsTurnText?: (text: string) => string | null;
   // 设备详情页「系统健康状态 / 会话列表」的数据来源（见 device-status.ts）。
   // 会话表来自 agent-sessions：sessionKey → agent 会话 id。用**函数**而不是对象，
   // 因为 dispatcher 在 run.ts 里先于 agentSessions 构造（同一份快照要等它建好）。
@@ -652,6 +664,14 @@ export class MessageDispatcher {
         await this.handleUseModelCommand(msg.fromUserId, useModel);
         return;
       }
+      // 机器级运维助手：把「本轮运维对象」钉在消息上（见 ops-scope.ts）。
+      //
+      // 这里确实拼进了 prompt —— 与「行为规范只走指令层」的惯例不同，因为
+      // 作用域不是行为规范而是**本轮上下文**：同一个 ops 账号服务同机所有
+      // 智能体，没有这条抬头，模型根本无从判断用户说的是哪一个。抬头格式
+      // 明确标注「系统注入」，用户原话原样跟在后面，不会被改写。
+      // useModel 等命令分支已在上面截走，不会走到这里。
+      const scopedPrompt = this.deps.scopeOpsTurnText?.(text) ?? null;
       // 私聊也走流式：web 端 chat_stream 帧先逐帧渲染，完成后 command_result
       // / 卡片兜底。sendStream 缺失（测试）时退回整包回复。
       await this.runStreamedTurn({
@@ -659,7 +679,7 @@ export class MessageDispatcher {
         conversationId: msg.fromUserId,
         requestMessageId: msg.messageUId || `req-${Date.now()}`,
         requesterId: msg.fromUserId,
-        prompt: text,
+        prompt: scopedPrompt ?? text,
         // per-user 模型：这个人自己选过的就用他的，没选过则跟随节点默认；
         // 选过但已失效（provider 下架 / 旧客户端写进内部名）会被清掉并回退。
         model: await this.resolveTurnModel(msg.fromUserId),

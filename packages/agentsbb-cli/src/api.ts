@@ -286,10 +286,12 @@ export class XiachatApi {
     const raw = await this.request<{ data?: { nodes?: MachineAgentCredential[] } }>(
       "POST",
       "/api/claw/device/nodes",
-      // wantPerAgentOps：请服务端为本机每个 agent 确保专属运维节点并下发
-      // （运维会话按智能体隔离）；旧服务端不认识该字段会忽略，结果退化为
-      // 只有机器级 ops —— 与旧行为一致。
-      { nodeId, credentialId, secret, wantPerAgentOps: true },
+      // 不再请求 per-agent 运维账号（2026-11）：融云开发环境注册用户上限 100，
+      // 而「每个 agent 一个 ops 账号」在本机一台就吃掉 20+ 个名额。服务端默认
+      // 也已停建（CLAW_PER_AGENT_OPS_ENABLED=false），这里只是不再主动要。
+      // 运维入口回落到每机一个的机器级 ops；「OpenClaw 的运维只能动 OpenClaw」
+      // 由 ops 提示词 + 命令层作用域（main.ts 的 opsScope）承担。
+      { nodeId, credentialId, secret },
     );
     const nodes = raw.data?.nodes;
     if (!Array.isArray(nodes)) {

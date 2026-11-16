@@ -94,8 +94,53 @@ describe("MessageDispatcher single chat", () => {
     expect(parsed.content).toContain("echo:hi agent");
   });
 
-  it("does not reply when agent turn fails (logs only)", async () => {
+  // 收敛成一个共享 ops 账号后，同机所有智能体的运维入口都指向它 —— 本轮该动
+  // 谁只能靠派发前注入的抬头（见 ops-scope.ts）。注入点必须在 im 的私聊文本
+  // 分支上，否则模型看到的就是一句没有对象的「帮我重启一下」。
+  it("injects the ops turn scope header into the private prompt", async () => {
     const deps = makeDeps();
+    const seen: string[] = [];
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      scopeOpsTurnText: (text) => `【运维对象】qwen\n\n${text}`,
+    });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user_1",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({ content: "帮我重启一下" }),
+      },
+      { runTurn: async (prompt) => { seen.push(prompt); return "ok"; } },
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBe("【运维对象】qwen\n\n帮我重启一下");
+    // 用户自己看到的气泡仍是原话，抬头不会漏到聊天记录里。
+    const parsed = JSON.parse(deps.sent[0].content);
+    expect(parsed.content).toBe("ok");
+  });
+
+  it("leaves the prompt untouched when no ops scope hook is wired", async () => {
+    const deps = makeDeps();
+    const seen: string[] = [];
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user_1",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({ content: "普通提问" }),
+      },
+      { runTurn: async (prompt) => { seen.push(prompt); return "ok"; } },
+    );
+    expect(seen[0]).toBe("普通提问");
+  });
+
+  it("does not reply when agent turn fails (logs only)", async () => {    const deps = makeDeps();
     const dispatcher = new MessageDispatcher({ send: deps.send });
     await dispatcher.handle(
       {

@@ -18,6 +18,7 @@ import {
 import type { StoredCredentials } from "./keystore.js";
 import type { XiachatApi } from "./api.js";
 import { loadPermissionSnapshot } from "./agent-permissions.js";
+import { opsScopeHeader, resolveOpsScope, withOpsScopeHeader, writeOpsScope } from "./ops-scope.js";
 import { cliVersion } from "./version.js";
 import { defaultUserModelsPath, FileUserModelStore } from "./user-models.js";
 import { defaultAgentModelPath, FileAgentDefaultModelStore } from "./agent-default-model.js";
@@ -361,6 +362,15 @@ export interface StartRunLoopOpts extends ConnectTransportOpts {
    * 运维才不会因为别的 agent 关掉读写而连 bash 工具都拿不到。
    */
   agentIdentity?: string;
+  /**
+   * 机器级运维助手（每机一个 ops 账号）的可运维对象集合。
+   *
+   * 传了（哪怕是空数组）就代表「这是共享的机器级 ops」：每轮消息前注入
+   * `【运维对象】` 抬头、写 scope.json，让命令层知道该放行哪一个智能体。
+   * 省略 = per-agent ops 或普通 agent，不启用（per-agent 有进程级的
+   * AGENTSBB_OPS_SCOPE，用不到这套）。见 ops-scope.ts。
+   */
+  opsBoundAgents?: string[];
   model?: string;
   stdout: NodeJS.WriteStream;
   turnTimeoutMs?: number;
@@ -478,6 +488,22 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     onDefaultModelChanged: () => catalogLoader.invalidate(),
     probeRuntime,
     agentName: opts.agentName,
+    // 机器级 ops 的单目标作用域：每轮解析「用户点名的那个智能体」，注入抬头
+    // 并落盘给命令层（agentsbb agent 的 scope 拦截读同一份文件）。per-agent
+    // ops 不传，仍以进程级 AGENTSBB_OPS_SCOPE 为准。
+    ...(opts.opsBoundAgents
+      ? {
+          scopeOpsTurnText: (text: string): string => {
+            const resolution = resolveOpsScope(text, opts.opsBoundAgents ?? []);
+            // 命令层在模型执行 `agentsbb agent ...` 时读这份文件；写失败只降级
+            // 为「命令层不知道本轮对象」（会拒绝启停），不会放行越权。
+            void writeOpsScope(resolution.target ?? "").catch((err: unknown) => {
+              console.error("ops scope: write failed:", err instanceof Error ? err.message : err);
+            });
+            return withOpsScopeHeader(text, opsScopeHeader(resolution, opts.opsBoundAgents ?? []));
+          },
+        }
+      : {}),
     // 设备详情页「系统健康状态 / 会话列表」的数据源（见 device-status.ts）。
     // 会话表在下面才构造，这里用闭包延迟读取 —— dispatcher 的生命周期比它长。
     loadAgentSessions: () => agentSessions.snapshot(),
