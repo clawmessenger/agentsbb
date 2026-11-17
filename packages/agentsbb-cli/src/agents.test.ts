@@ -15,6 +15,7 @@ import {
   emitsJsonEnvelope,
   extractOpenclawEnvelopeDetails,
   extractOpenclawReply,
+  extractStreamJsonFinalText,
   grokCliModelId,
   grokRouteFromCliModelId,
   KNOWN_AGENT_CLIS,
@@ -30,7 +31,7 @@ import {
   trimIncompleteUtf8Tail,
 } from "./agents.js";
 import { createEchoAgentScript, type EchoAgentFixture } from "./test-fixtures.js";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyTurnError } from "./turn-error.js";
@@ -1465,16 +1466,20 @@ describe("runAgentTurn", () => {
   });
 
   it("dsh：stdin 收到的是 v=1 execute 命令帧（prompt 与模型在内），不是裸文本", async () => {
-    // stdoutText 与 stdin 探测共存：fixture 的 fixed-agent 只吐固定 stdout，
-    // stdin 落地进 args 文件的验证交给下面的专用 fixture（recordArgs + 裸跑）。
-    // 这里直接用 node 脚本把 stdin 原样回显，检查 execute 帧的字段。
+    // 帧内容写到文件里核对：不再靠「stdout 回显 + 原始输出兜底」拿回来 ——
+    // 事件流型 stdout 现在**故意不兜底**（整段 JSONL 上屏是比没有正文更糟的
+    // 事故形态，见 agents.ts 的 looksLikeEventStream），所以这里让 fixture
+    // 正常吐一帧 result。
     const dir = mkdtempSync(join(tmpdir(), "cm-dsh-stdin-"));
     const helper = join(dir, "dsh-stdin.cjs");
+    const framePath = join(dir, "stdin-frame.json");
     writeFileSync(helper, [
+      "const fs=require('fs');",
       "let buf='';",
       "process.stdin.on('data',(d)=>{buf+=d;});",
       "process.stdin.on('end',()=>{",
-      "  process.stdout.write(buf);",
+      `  fs.writeFileSync(${JSON.stringify(framePath)}, buf);`,
+      '  process.stdout.write(JSON.stringify({v:1,type:"result",output:"done"})+"\\n");',
       "  process.exit(0);",
       "});",
     ].join("\n"));
@@ -1493,7 +1498,8 @@ describe("runAgentTurn", () => {
         model: "deepseek/dsh-r2",
         timeoutMs: 30_000,
       });
-      const frame = JSON.parse(out.trim());
+      expect(out).toBe("done");
+      const frame = JSON.parse(readFileSync(framePath, "utf8").trim());
       expect(frame).toMatchObject({
         v: 1,
         type: "execute",
@@ -1626,6 +1632,109 @@ describe("runAgentTurn", () => {
     } finally {
       fixture.cleanup();
     }
+  });
+
+  // pi 0.73 的 v3 会话事件（--mode json）。2026-11-17 真机抓包：
+  // 正常轮 = thinking_delta/text_delta 增量 + 末尾整条 message；
+  // 失败轮（上游 402）= **一条增量都没有**，只有 message_end.stopReason=error。
+  it("pi：v3 会话事件的增量进正文/思考，整条快照不重复上屏", async () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "想", thinkingSignature: "reasoning_content" },
+        { type: "text", text: "好的" },
+      ],
+      stopReason: "stop",
+    };
+    const fixture = createEchoAgentScript("pi", {
+      stdoutText: [
+        '{"type":"session","version":3,"id":"01a1e8d1-d375-73bb-9f9c-c501778dd291","cwd":"C:\\\\Users"}',
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}',
+        '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"想"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"好"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"的"}}',
+        `{"type":"message_end","message":${JSON.stringify(message)}}`,
+        `{"type":"turn_end","message":${JSON.stringify(message)},"toolResults":[]}`,
+        `{"type":"agent_end","messages":[${JSON.stringify(message)}]}`,
+      ].join("\n") + "\n",
+    });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "pi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("好的");
+      expect(reasoning.join("")).toBe("想");
+      // 末尾整条 message 是快照：只能补后缀，不能把「好的」再发一遍
+      expect(chunks.join("")).toBe("好的");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("pi：402 失败轮没有增量，必须报失败而不是把 JSONL 当正文", async () => {
+    const failed = {
+      role: "assistant",
+      content: [],
+      provider: "quukk",
+      model: "deepseek-v4-flash",
+      stopReason: "error",
+      errorMessage: "402 Insufficient Balance (request_id: 1c347cf5)",
+    };
+    const fixture = createEchoAgentScript("pi", {
+      stdoutText: [
+        '{"type":"session","version":3,"id":"01a1e8c0-be85-74e7-a722-5d6458c5ecb1","cwd":"C:\\\\Users"}',
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}',
+        '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}',
+        `{"type":"message_start","message":${JSON.stringify(failed)}}`,
+        `{"type":"message_end","message":${JSON.stringify(failed)}}`,
+        `{"type":"turn_end","message":${JSON.stringify(failed)},"toolResults":[]}`,
+        `{"type":"agent_end","messages":[${JSON.stringify(failed)}]}`,
+      ].join("\n") + "\n",
+    });
+    try {
+      await expect(runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "pi",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onChunk: () => {},
+      })).rejects.toMatchObject({ code: "model_balance_exhausted" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("pi：整条 message 只在增量缺席时兜底（会话恢复/中途被掐）", () => {
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "只有快照" }],
+      stopReason: "stop",
+    };
+    const raw = [
+      '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}',
+      `{"type":"message_end","message":${JSON.stringify(message)}}`,
+    ].join("\n");
+    expect(extractStreamJsonFinalText(raw)).toBe("只有快照");
+    // 用户回显不能当正文；失败轮的 errorMessage 也不进正文通道
+    expect(extractStreamJsonFinalText('{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}'))
+      .toBeUndefined();
+    expect(parseStreamJsonLine(`{"type":"message_end","message":${JSON.stringify(message)}}`)).toBeNull();
+    expect(parseStreamJsonLine(JSON.stringify({ type: "message_end", message: { ...message, stopReason: "error", errorMessage: "402 Insufficient Balance" } })))
+      .toEqual({ errorText: "402 Insufficient Balance" });
+    expect(parseStreamJsonLine('{"type":"agent_start"}')).toBeNull();
+    expect(parseStreamJsonLine('{"type":"session","version":3,"id":"x"}')).toBeNull();
   });
 
   // traecli / qodercli：exec --json 与 stream-json 的 thought 字段待装机实测

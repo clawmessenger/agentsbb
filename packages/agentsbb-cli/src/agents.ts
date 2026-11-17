@@ -1494,6 +1494,63 @@ export function extractSessionId(line: string): string | null {
   return null;
 }
 
+/**
+ * pi/omp 的整条 assistant message → 纯正文（thinking 块不算正文）。
+ *
+ * pi 0.73 的 `--mode json` 在 turn_end / message_end / agent_end 里给的是**整条
+ * message**（content 是 thinking/text/tool_use 块数组），不是增量。正文只能从
+ * text 块拼——把 thinking 混进去等于把模型的草稿当回答。
+ */
+function piMessageText(message: unknown): string {
+  if (typeof message !== "object" || message === null) return "";
+  const msg = message as Record<string, unknown>;
+  if (msg.role !== "assistant") return "";
+  const content = msg.content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => (typeof block === "object" && block !== null
+      ? (block as Record<string, unknown>) : undefined))
+    .filter((block): block is Record<string, unknown> =>
+      block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("");
+}
+
+/**
+ * pi/omp 的「这一轮运行时自己说挂了」→ errorText 帧。
+ *
+ * 只认 stopReason:"error"：stopReason 缺省（undefined/stop）不算失败——正常
+ * 收尾的 message 也走同一个事件，误判会让每一轮都变成失败。
+ */
+function piFailureOf(message: unknown): StreamJsonDelta | null {
+  if (typeof message !== "object" || message === null) return null;
+  const msg = message as Record<string, unknown>;
+  if (msg.stopReason !== "error") return null;
+  const reason = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
+  return reason ? { errorText: reason } : null;
+}
+
+/**
+ * stdout 是不是「事件流」而不是「正文」：首个非空行是带 type 字段的 JSON 对象
+ * 就是。用于收尾兜底 —— 事件流整段上屏比没有正文更糟（用户看到一串
+ * message_start/agent_end），而纯文本输出（老 agent、stdin 回显）仍要照旧透传。
+ */
+function looksLikeEventStream(raw: string): boolean {
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("{")) return false;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      return typeof parsed === "object" && parsed !== null
+        && typeof (parsed as Record<string, unknown>).type === "string";
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) return null;
@@ -1634,6 +1691,25 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     }
     if (inner.type === "text_delta" && typeof inner.delta === "string") {
       return { text: inner.delta };
+    }
+    return null;
+  }
+
+  // --- pi / omp：v3 会话事件里的「这一轮挂了」---
+  // pi 0.73 的 `--mode json` 除增量外还有 message_end / turn_end（整条 message）。
+  // **失败轮没有 message_update**，只有 message_end 带 stopReason:"error" +
+  // errorMessage（2026-11-17 现场：quukk 上游 402 Insufficient Balance，整段
+  // JSONL 被当正文发上屏）。这里只交出错误原文，不交正文：正文由收尾时的
+  // extractStreamJsonFinalText 统一取，避免多轮工具循环里快照与增量重复叠加。
+  if (event.type === "message_end" || event.type === "turn_end") {
+    return piFailureOf(event.message);
+  }
+  if (event.type === "agent_end") {
+    const messages = event.messages;
+    if (!Array.isArray(messages)) return null;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const failure = piFailureOf(messages[i]);
+      if (failure) return failure;
     }
     return null;
   }
@@ -1801,8 +1877,10 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
   const agyDeltas: string[] = [];
   let agyResult: string | undefined;
   // pi/omp 的 message_update.assistantMessageEvent.delta 是增量（无 result 帧，
-  // 终值就是增量拼接）。
+  // 终值就是增量拼接）。另有一条兜底：v3 会话事件的整条 message 快照——增量
+  // 缺席时（会话恢复、运行中被掐但 message_end 已到）它是唯一能拿到正文的地方。
   const piDeltas: string[] = [];
+  let piSnapshot: string | undefined;
   // grok streaming-json 没有 result 帧：{"type":"text","data":…} 增量拼起来才是终值。
   const grokDeltas: string[] = [];
   // mcode 的权威全文在 exec.completed.result.output（增量只是过程）。
@@ -1858,6 +1936,17 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
       const inner = event.assistantMessageEvent as Record<string, unknown> | undefined;
       if (inner?.type === "text_delta" && typeof inner.delta === "string" && inner.delta) {
         piDeltas.push(inner.delta);
+      }
+    }
+    // pi/omp：整条 message 快照（只当兜底，见 piSnapshot 声明处）。
+    if (event.type === "message_end" || event.type === "turn_end") {
+      const snap = piMessageText(event.message);
+      if (snap) piSnapshot = snap;
+    }
+    if (event.type === "agent_end" && Array.isArray(event.messages)) {
+      for (let i = event.messages.length - 1; i >= 0; i -= 1) {
+        const snap = piMessageText(event.messages[i]);
+        if (snap) { piSnapshot = snap; break; }
       }
     }
     // grok：{"type":"text","data":…} 增量（thought 帧不是正文）
@@ -1925,11 +2014,12 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
     const ay = agyDeltas.join("");
     if (ay.trim().length > 0) return ay;
   }
-  // pi/omp：无 result 帧，增量拼接即终值。
+  // pi/omp：优先增量拼接（跨多轮工具循环累积更全）；增量缺席时才用整条快照。
   if (piDeltas.length > 0) {
     const pi = piDeltas.join("");
     if (pi.trim().length > 0) return pi;
   }
+  if (piSnapshot !== undefined && piSnapshot.trim().length > 0) return piSnapshot;
   // grok：无 result 帧同上。
   if (grokDeltas.length > 0) {
     const gk = grokDeltas.join("");
@@ -2772,7 +2862,15 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
               return;
             }
             // 缓冲被截断时原始 stdout 只是前缀，以流式正文为准（它才是全的）。
-            resolve(capped ? streamedText : (extractStreamJsonFinalText(stdout) ?? stdout));
+            //
+            // 但「stdout 是事件流」时绝不兜底透传：那种输出整段上屏等于把
+            // JSONL 当回答（2026-11-17 现场：pi 撞 402 一条增量都没有，用户看到的
+            // 就是 message_start/agent_end 串）。提取不到就交空串，让上层按
+            // 「本轮没有产出」处理，失败原因由 errorText 分支说明。
+            const extracted = extractStreamJsonFinalText(stdout);
+            resolve(capped
+              ? streamedText
+              : (extracted ?? (looksLikeEventStream(stdout) ? "" : stdout)));
           } else {
             // JSON 信封型 agent（openclaw）：正文之外还能从信封里拿到本轮的
             // 思考与工具汇总。只能在一轮结束时整段补上（信封是一次性的），
