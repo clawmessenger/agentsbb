@@ -335,6 +335,20 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("qwenpaw", "quukk/glm-5.2")).toEqual([]);
   });
 
+  it("zeroclaw 走 agent -a default，-p <provider> --model <id> 注入（真机 0.8.7 实测）", () => {
+    expect(buildAgentArgs("zeroclaw", "hi")).toEqual(["agent", "-a", "default", "-m", "hi"]);
+    // provider 名含点（custom.quukk）只按 / 拆，点号原样保留。
+    expect(buildModelArgs("zeroclaw", "custom.quukk/glm-5.2")).toEqual([
+      "-p", "custom.quukk", "--model", "glm-5.2",
+    ]);
+    expect(buildAgentArgs("zeroclaw", "hi", "custom.quukk/glm-5.2")).toEqual([
+      "agent", "-a", "default", "-m", "hi", "-p", "custom.quukk", "--model", "glm-5.2",
+    ]);
+    // 无斜杠裸 id 走 --model 兜底，不崩。
+    expect(buildModelArgs("zeroclaw", "glm-5.2")).toEqual(["--model", "glm-5.2"]);
+    expect(buildModelArgs("zeroclaw", undefined)).toEqual([]);
+  });
+
   it("dim 走 exec 一次性入口（不再进 TUI 撞未信任目录）", () => {
     expect(buildAgentArgs("dim", "hi")).toEqual(["exec", "hi"]);
     expect(buildModelArgs("dim", "quukk/glm-5.2")).toEqual([]);
@@ -358,9 +372,12 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("reasonix", "quukk/glm-5.2")).toEqual([]);
   });
 
-  it("zeroclaw 走 agent -a default -m（缺别名时它只打 usage help）", () => {
+  it("zeroclaw 走 agent -a default -m（缺别名时它只打 usage help），-p/--model 注入", () => {
     expect(buildAgentArgs("zeroclaw", "hi")).toEqual(["agent", "-a", "default", "-m", "hi"]);
-    expect(buildModelArgs("zeroclaw", "quukk/glm-5.2")).toEqual([]);
+    // 旧断言「不注入」被真机推翻：`-p custom.quukk --model glm-5.2` 实测生效。
+    expect(buildModelArgs("zeroclaw", "quukk/glm-5.2")).toEqual([
+      "-p", "quukk", "--model", "glm-5.2",
+    ]);
   });
 
   it("extractQwenpawReply 从 INFO 日志 + JSON 信封里提取正文", async () => {

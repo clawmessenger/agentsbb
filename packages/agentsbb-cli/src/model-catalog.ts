@@ -169,6 +169,18 @@ const AGENT_MODEL_LIST: Readonly<Record<string, ModelListSpec>> = {
   // quukk/DeepSeek-V4-Flash-A、quukk/glm-5.2 两条 —— 设备端此前因未登记而
   // 完全没跑过任何列举命令，面板一直空态。
   omp: { argv: ["models", "--json"], timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
+  // zeroclaw（ZeroClaw，Rust）：`zeroclaw models list` 列出**已配置**的 provider
+  // 模型（本机 0.8.7 实测 exit 0）：
+  //   🩺 ZeroClaw — Configured Models
+  //     [custom.quukk]
+  //       model: glm-5.2
+  //     1 provider configured
+  // 每段 `[<provider>]` + 其下 `model: <id>` 组成 `provider/model` 路由，正好是
+  // wire 目录与 `agent -p <provider> --model <id>` 注入都认的形状。
+  // ⚠️ Go 侧（models.go:325）判空目录的理由是「ACP session/new 不报目录、
+  // session/set_model 会写持久配置」——但设备端走 **argv 注入**，绕开了 ACP
+  // 这条限制（`agent -p ... --model ...` 2026-11-17 实测生效）。两者不矛盾。
+  zeroclaw: { argv: ["models", "list"], timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
   // cursor-agent：`--list-models`，输出 `Available models` 头 + `<id> - <label>`
   // 行（server/pkg/agent/models.go:2604 discoverCursorModels / parseCursorModels）。
   "cursor-agent": { argv: ["--list-models"], timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
@@ -657,11 +669,47 @@ export function parseOmpModelsJson(stdout: string): DiscussionModelCatalog | nul
   return catalogFromRoutes(routes, null, names);
 }
 
+/**
+ * `zeroclaw models list` 的目录解析（2026-11-17 真机 0.8.7 实测）。
+ *
+ * 输出按 provider 分段，`model:` 行给出该段的模型 id：
+ *   [custom.quukk]
+ *     model: glm-5.2
+ * provider 名可含点（`custom.quukk`），ROUTE_RE 允许点号，正好过 wire。
+ * 有些版本同一段会有多个 `model:` / `models:` 行，全部收；去重保序。
+ * 用 `models status` 里的默认模型不在这条命令的输出中，defaultModel 置 null。
+ */
+export function parseZeroclawModelsList(stdout: string): DiscussionModelCatalog {
+  const lines = stripAnsiCodes(stdout).split(/\r?\n/).slice(0, MAX_LINES_SCANNED);
+  const routes: string[] = [];
+  const seen = new Set<string>();
+  let provider = "";
+  for (const raw of lines) {
+    const line = raw.trim();
+    // 段头：[custom.quukk] —— 只允许安全字符，避免把横幅误当 provider
+    const header = /^\[([A-Za-z0-9][A-Za-z0-9._-]{0,127})\]$/.exec(line);
+    if (header) {
+      provider = header[1];
+      continue;
+    }
+    // 模型行：model: glm-5.2 / models: glm-5.2（大小写不敏感）
+    const modelLine = /^models?\s*[:：]\s*(\S+)/i.exec(line);
+    if (!modelLine || !provider) continue;
+    const id = modelLine[1].replace(/[.,;]+$/, "");
+    const route = `${provider}/${id}`;
+    if (!ROUTE_RE.test(route) || seen.has(route)) continue;
+    seen.add(route);
+    routes.push(route);
+  }
+  return catalogFromRoutes(routes, null);
+}
+
 export function parseModelCatalogOutput(
   agentName: string | undefined,
   stdout: string,
 ): DiscussionModelCatalog {
   if (agentName === "omp") return parseOmpModelsJson(stdout) ?? EMPTY_MODEL_CATALOG;
+  if (agentName === "zeroclaw") return parseZeroclawModelsList(stdout);
   if (agentName === "openclaw") {
     const json = parseOpenclawModelListJson(stdout);
     if (json && json.providers.length > 0) return json;

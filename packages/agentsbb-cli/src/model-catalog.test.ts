@@ -16,6 +16,7 @@ import {
   parseGrokModelsList,
   parseKimiProviderListJson,
   parseOmpModelsJson,
+  parseZeroclawModelsList,
   parseModelCatalogOutput,
   parseModelCatalogRequest,
   parseModelListText,
@@ -595,7 +596,63 @@ describe("parseOmpModelsJson（omp models --json）", () => {
     expect(parseModelCatalogOutput("omp", "not json")).toBe(EMPTY_MODEL_CATALOG);
     expect(parseModelCatalogOutput("omp", OMP_JSON).providers[0].id).toBe("quukk");
   });
+});
 
+describe("parseZeroclawModelsList（zeroclaw models list）", () => {
+  // 2026-11-17 本机 zeroclaw 0.8.7 `models list` 的真实输出。
+  const ZEROCLAW_LIST = [
+    "🩺 ZeroClaw — Configured Models",
+    "",
+    "  [custom.quukk]",
+    "    model: glm-5.2",
+    "",
+    "  1 provider configured",
+  ].join("\n");
+
+  it("parses provider section + model line into a wire route", () => {
+    // provider 名含点（custom.quukk）必须原样保留 —— config.toml 的 key 就是它。
+    expect(parseZeroclawModelsList(ZEROCLAW_LIST).providers).toEqual([
+      {
+        id: "custom.quukk",
+        name: "custom.quukk",
+        models: [{ id: "glm-5.2", name: "glm-5.2" }],
+      },
+    ]);
+  });
+
+  it("collects multiple models per section and dedupes", () => {
+    const out = [
+      "[custom.quukk]",
+      "  model: glm-5.2",
+      "  model: DeepSeek-V4-Flash-A",
+      "  model: glm-5.2",
+      "[anthropic]",
+      "  models: claude-sonnet-4-6",
+    ].join("\n");
+    const catalog = parseZeroclawModelsList(out);
+    // finalizeCatalog 按 provider id 字母序排（anthropic < custom.quukk）。
+    expect(catalog.providers.map((p) => p.id)).toEqual(["anthropic", "custom.quukk"]);
+    const byId = (id: string) => catalog.providers.find((p) => p.id === id)!;
+    expect(byId("custom.quukk").models.map((m) => m.id)).toEqual([
+      "DeepSeek-V4-Flash-A", "glm-5.2",
+    ]);
+    expect(byId("anthropic").models.map((m) => m.id)).toEqual(["claude-sonnet-4-6"]);
+  });
+
+  it("skips banners and model lines without a preceding section", () => {
+    const catalog = parseZeroclawModelsList([
+      "🩺 ZeroClaw — Configured Models",
+      "  model: orphan",
+      "  2 providers configured",
+      "[bad key]",
+      "  model: x",
+    ].join("\n"));
+    expect(catalog.providers).toEqual([]);
+    expect(parseModelCatalogOutput("zeroclaw", "no catalog").providers).toEqual([]);
+  });
+});
+
+describe("legacy omp + codearts loader", () => {
   it("codearts discovery carries the launcher env", () => {
     // Go buildCodeArtsEnv 的字段必须逐项在，否则 native 读不到已登录配置。
     const env = codeartsDiscoveryEnv({ SCENARIO: "custom" });
@@ -1250,11 +1307,12 @@ describe("createModelCatalogLoader with static fallback catalogs", () => {
   // 能力闸门的负向测试：injection 'none' 的 agent 即使将来有人往
   // STATIC_CATALOGS 里塞了清单，也不许漏出来；也没有任何列举命令可跑。
   //
-  // 注意这三位与「catalogSource: acp」的 agent（traecli/kiro/qoder/dim/
-  // reasonix）不是一类：那些能通过 ACP 握手拿到真实目录，只有这三位既没有
-  // 目录来源、也没有注入通道。
+  // 注意这两位与「catalogSource: acp」的 agent（traecli/kiro/qoder/dim/
+  // reasonix）不是一类：那些能通过 ACP 握手拿到真实目录，只有这两位既没有
+  // 目录来源、也没有注入通道。zeroclaw 已于 2026-11-17 接上原生目录 + argv
+  // 注入（models list / agent -p --model 真机实测），不在此列。
   it("never serves a catalog for agents that cannot inject a model", async () => {
-    for (const agentName of ["qwenpaw", "mcode", "zeroclaw"]) {
+    for (const agentName of ["qwenpaw", "mcode"]) {
       const runCommand = vi.fn();
       const loader = createModelCatalogLoader({
         agentName,

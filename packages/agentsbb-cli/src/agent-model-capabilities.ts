@@ -154,11 +154,16 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   // （agents.ts:191-199）。
   qwen: { catalogSource: "config", modelInjection: "argv" },
 
-  // qwenpaw / mcode / zeroclaw：set_model 不支持 session 粒度 / 无目录 / 无
-  // set_model（models.go:298-309、325-331、433-452 ModelSelectionSupported）。
+  // qwenpaw / mcode：ACP set_model 不支持 session 粒度（会写 agent 级持久配置）
+  // 且无 CLI 目录命令（models.go:298-309、325-331、433-452）。
   qwenpaw: { catalogSource: "none", modelInjection: "none" },
   mcode: { catalogSource: "none", modelInjection: "none" },
-  zeroclaw: { catalogSource: "none", modelInjection: "none" },
+
+  // zeroclaw：Go 侧因 ACP session/new 不报目录 + set_model 会写持久配置而判空
+  // （models.go:325-331）——但设备端另有 **argv 注入** 通道：
+  // `zeroclaw models list` 报已配置目录 + `agent -p <provider> --model <id>`
+  // 真机实测生效（2026-11-17，0.8.7，注入后回「蓝鲸收到」）。两者不矛盾。
+  zeroclaw: { catalogSource: "cli", modelInjection: "argv" },
 
   // dim：`dim acp` 的 session/new 回报 models.availableModels
   // （models.go:2988；需 OAuth 登录，失败回落手动填写）。注入：回合走 ACP，

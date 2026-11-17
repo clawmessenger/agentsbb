@@ -269,21 +269,26 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   if (name === "grok") {
     return model ? ["-m", grokCliModelId(model)] : [];
   }
+  // zeroclaw：`agent -p <provider> --model <id>` 分别收 provider 与裸模型 id
+  // （2026-11-17 真机 0.8.7 实测，`-p custom.quukk --model glm-5.2` 正常出正文）。
+  // 目录 route 是 `custom.quukk/glm-5.2`，按首斜杠拆成两段；provider 名本身含点
+  // （`custom.quukk`），splitModelRoute 只按 `/` 拆，点号原样保留 —— 正好匹配
+  // config.toml 的 `[providers.models.custom.quukk]`。
+  if (name === "zeroclaw") {
+    return route ? ["-p", route.provider, "--model", route.model] : ["--model", model];
+  }
   // dsh：协议的模型字段是 {provider,id} 对（dsh.go:36-40），JSONL 命令在
   // stdin 里拼装（runAgentTurn 的 dsh 专用分支），argv 里没有 --model 这个
   // 旗标——这里返回空，模型信息由 stdin 命令携带。
   if (name === "dsh") return [];
-  // B 类第二批（2026-11-10）：deveco / mcode / qwenpaw / dim /
-  // reasonix / zeroclaw 的模型选择都走各家自己的账户或配置文件（deveco 的
-  // auth.json、kimi 同款目录型配置、zeroclaw 的 [providers.models.custom]），
-  // 我们的 provider/model 路由它们并不认识——deveco 的 -m 虽然自称收
-  // provider/model，但凭据为 0 时注入只会把「没登录」报错提前；qwenpaw 的
-  // -m 要的是 `anthropic/claude-sonnet-4-5` 形的它家路由。没有证据就不注入，
-  // 模型跟随各家默认配置。
+  // B 类第二批（2026-11-10）：mcode / qwenpaw / dim / reasonix 的模型选择
+  // 走各家自己的账户或配置文件，我们的 provider/model 路由它们并不认识：
+  // qwenpaw 的 -m 要的是 `anthropic/claude-sonnet-4-5` 形的它家路由，dim 走 ACP
+  // set_model（见 acp-turn）。没有证据就不注入，模型跟随各家默认配置。
+  // zeroclaw 已有专门的 argv 注入分支（见上方），不在此列。
   if (
     name === "mcode" || name === "qwenpaw"
     || name === "dim" || name === "reasonix"
-    || name === "zeroclaw"
   ) return [];
   return ["--model", model];
 }
@@ -720,8 +725,10 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 带 `-a/--agent <alias>`（没有默认 agent，缺别名直接打 usage help 退出）
   // 与 `-m/--message`（单条消息模式，不进交互会话）。输出为纯正文。
   // 设备约定别名固定为 "default"（~/.zeroclaw/config.toml 的 [agents.default]）。
-  zeroclaw: (prompt) => [
+  // 模型选择：`-p <provider> --model <id>` 真机实测生效（2026-11-17，0.8.7）。
+  zeroclaw: (prompt, model) => [
     "agent", "-a", "default", "-m", prompt,
+    ...buildModelArgs("zeroclaw", model),
   ],
 };
 
