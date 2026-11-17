@@ -6,6 +6,7 @@ import {
 import {
   buildModelCatalogResponse,
   catalogFromRoutes,
+  codeartsDiscoveryEnv,
   createModelCatalogLoader,
   dshModelsFrameComplete,
   EMPTY_MODEL_CATALOG,
@@ -14,6 +15,7 @@ import {
   parseDshModelListJsonl,
   parseGrokModelsList,
   parseKimiProviderListJson,
+  parseOmpModelsJson,
   parseModelCatalogOutput,
   parseModelCatalogRequest,
   parseModelListText,
@@ -529,6 +531,113 @@ describe("parseKimiProviderListJson", () => {
     // 分派层把它降级成空目录（而不是抛错）
     expect(parseModelCatalogOutput("kimi", "not json")).toBe(EMPTY_MODEL_CATALOG);
     expect(parseModelCatalogOutput("kimi", KIMI_PROVIDER_JSON).providers[0].id).toBe("quukk");
+  });
+});
+
+describe("parseOmpModelsJson（omp models --json）", () => {
+  // 2026-11-17 本机 `omp models --json` 的真实输出（省略无关元数据字段）。
+  const OMP_JSON = JSON.stringify({
+    models: [
+      {
+        provider: "quukk", id: "DeepSeek-V4-Flash-A", selector: "quukk/DeepSeek-V4-Flash-A",
+        name: "DeepSeek V4 Flash", reasoning: false,
+      },
+      {
+        provider: "quukk", id: "glm-5.2", selector: "quukk/glm-5.2",
+        name: "GLM 5.2", reasoning: true,
+      },
+    ],
+  });
+
+  it("selects the qualified selector, not the bare id (Go parseOmpModels contract)", () => {
+    const catalog = parseOmpModelsJson(OMP_JSON);
+    expect(catalog).not.toBeNull();
+    expect(catalog?.providers).toEqual([
+      {
+        id: "quukk",
+        name: "quukk",
+        models: [
+          { id: "DeepSeek-V4-Flash-A", name: "DeepSeek V4 Flash" },
+          { id: "glm-5.2", name: "GLM 5.2" },
+        ],
+      },
+    ]);
+  });
+
+  it("prefers selector over provider/id when they disagree", () => {
+    // selector 是 buildPiArgs 整段透传给 --model 的值；拿 provider/id 重组会让
+    // omp 按自己的 provider 优先级重新猜后端 —— 选中的模型可能换一家供应商。
+    const catalog = parseOmpModelsJson(JSON.stringify({
+      models: [{ provider: "other", id: "glm-5.2", selector: "quukk/glm-5.2", name: "GLM" }],
+    }));
+    expect(catalog?.providers[0].models).toEqual([{ id: "glm-5.2", name: "GLM" }]);
+    expect(catalog?.providers[0].id).toBe("quukk");
+  });
+
+  it("falls back to provider/id and skips rows that cannot form a wire route", () => {
+    const catalog = parseOmpModelsJson(JSON.stringify({
+      models: [
+        { provider: "quukk", id: "glm-5.2", name: "" },
+        { id: "no-provider" },
+        { provider: "bad key", id: "x", selector: "bad key/x" },
+        {},
+      ],
+    }));
+    expect(catalog?.providers).toEqual([
+      { id: "quukk", name: "quukk", models: [{ id: "glm-5.2", name: "glm-5.2" }] },
+    ]);
+  });
+
+  it("degrades to an empty catalog on junk instead of throwing", () => {
+    expect(parseOmpModelsJson("not json")).toBeNull();
+    expect(parseOmpModelsJson('{"models":[]}')?.providers).toEqual([]);
+    expect(parseOmpModelsJson('{"something":1}')).toBeNull();
+    expect(parseModelCatalogOutput("omp", "not json")).toBe(EMPTY_MODEL_CATALOG);
+    expect(parseModelCatalogOutput("omp", OMP_JSON).providers[0].id).toBe("quukk");
+  });
+
+  it("codearts discovery carries the launcher env", () => {
+    // Go buildCodeArtsEnv 的字段必须逐项在，否则 native 读不到已登录配置。
+    const env = codeartsDiscoveryEnv({ SCENARIO: "custom" });
+    expect(env).toMatchObject({
+      SCENARIO: "custom", // extra 覆盖默认值
+      CODEAGENT_USE_MESSAGE_FEEDBACK: "false",
+      OMO_SEND_ANONYMOUS_TELEMETRY: "0",
+      OPENCODE_CHANNEL: "latest",
+      OPENCODE_MODE: "tui",
+      PLUGIN_ENV: "hc",
+      OPENCODE_DISABLE_MODELS_FETCH: "1",
+      OPENCODE_DISABLE_AUTOUPDATE: "true",
+      OPENCODE_CONFIG_FILE: "codearts_cli.json,codearts_cli.jsonc",
+    });
+    expect(env.KERNEL_CONFIG_DIR).toContain(".codeartsdoer");
+    expect(env.KERNEL_DATA_DIR).toContain("cli-data");
+    expect(env.OPENCODE_CONFIG).toContain("codearts_cli.json");
+  });
+
+  it("codearts: main command yields nothing, falls back to `models` with the same env", async () => {
+    const runCommand = vi.fn()
+      .mockResolvedValueOnce("verbose header, no catalog rows\n")
+      .mockResolvedValueOnce("quukk/glm-5.2\nexample/sonnet\n");
+    const loader = createModelCatalogLoader({ agentName: "codearts", runCommand, readConfig: () => null });
+    const catalog = await loader.load();
+    expect(runCommand).toHaveBeenCalledTimes(2);
+    expect(runCommand.mock.calls[0][0]).toEqual(["models", "--verbose"]);
+    expect(runCommand.mock.calls[1][0]).toEqual(["models"]);
+    const env = runCommand.mock.calls[0][4] as NodeJS.ProcessEnv;
+    expect(env.SCENARIO).toBe("codeartsdoer");
+    expect(runCommand.mock.calls[1][4]).toBe(env);
+    expect(catalog.providers.flatMap((p) => p.models)).toContainEqual({ id: "glm-5.2", name: "glm-5.2" });
+  });
+
+  it("uses the native discovery command, never pi's --list-models", () => {
+    expect(modelListSpec("omp")).toEqual({
+      argv: ["models", "--json"],
+      timeoutMs: 15_000,
+      maxOutputBytes: 256 * 1024,
+    });
+    // 能力矩阵必须同步登记，否则 loader 的静态兜底闸门会按 modelInjection 判型。
+    expect(agentModelCapability("omp")).toEqual({ catalogSource: "cli", modelInjection: "argv" });
   });
 });
 

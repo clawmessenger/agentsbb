@@ -89,10 +89,13 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   // 硬错误（agents.ts:220-225，pi.go:1001-1010）。
   pi: { catalogSource: "cli", modelInjection: "argv" },
 
-  // omp：Go 按 builtin runtime 走 descriptor 的 ModelDiscovery，无则空目录
-  // （models.go:203-209）；设备端没有已验证的列举命令。注入同 pi 家族（argv
-  // 整段路由，agents.ts:223-225）——能注入但没有目录来源，面板走解释文案。
-  omp: { catalogSource: "none", modelInjection: "argv" },
+  // omp：Go 按 builtin runtime 走 descriptor 的 ModelDiscovery（models.go:196-209），
+  // 实际策略是 `omp models --json`（discoverOmpModels / parseOmpModels，
+  // models.go:1352-1443）—— 不是 pi 的 `--list-models`，omp 对后者会报 unknown
+  // flag 并以非 0 退出。2026-11-17 真机实跑该命令拿到 2 条 quukk/* 模型；
+  // 设备端此前没登记这条命令，面板一直空态。注入同 pi 家族：--model 收整段
+  // provider/id selector（Go parseOmpModels 把 selector 作为 Model.ID）。
+  omp: { catalogSource: "cli", modelInjection: "argv" },
 
   // cursor-agent：`cursor-agent --list-models`（models.go:2604，行格式
   // `<id> - <label>`，`(default)` 标记即默认值），设备端目录用虚拟 provider

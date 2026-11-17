@@ -1175,6 +1175,11 @@ export interface RunAgentCommandOpts {
    * 目录永远为空。等 EOF 的实现（照 Go 的 scanner 写法）在设备端是错的。
    */
   stopWhen?: OutputStopPredicate;
+  /**
+   * 子进程环境。目录发现要复刻官方 launcher 注入的环境（codearts 尤其如此），
+   * 不能只继承设备进程自己的 —— Go exe 的 buildCodeArtsEnv 也是这么做的。
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** `stopWhen` 判据：入参是迄今为止累计的 stdout。 */
@@ -1196,6 +1201,7 @@ export function runAgentCommand(opts: RunAgentCommandOpts): Promise<string> {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       cwd: opts.cwd,
+      ...(opts.env ? { env: opts.env } : {}),
     });
 
     const chunks: Buffer[] = [];

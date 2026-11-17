@@ -588,6 +588,34 @@ describe("runAgentCommand stopWhen", () => {
     }
   });
 
+  // codearts 的目录发现要复刻官方 launcher 的环境（KERNEL_CONFIG_DIR 等），
+  // 只继承设备进程自己的 env 会读不到已登录配置 —— 钉住 env 真的传到子进程。
+  it("runAgentCommand passes the discovery env through to the child", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cm-env-agent-"));
+    const helper = join(dir, "env-agent.cjs");
+    writeFileSync(helper,
+      'process.stdout.write(String(process.env.CLAW_TEST_ENV_MARKER ?? "MISSING") + "\\n");\n');
+    const isWin = process.platform === "win32";
+    const agentPath = join(dir, isWin ? "env-agent.cmd" : "env-agent");
+    if (isWin) {
+      writeFileSync(agentPath, `@echo off\r\nnode "${helper}"\r\n`, { mode: 0o755 });
+    } else {
+      writeFileSync(agentPath, `#!/bin/sh\nexec node "${helper}"\n`, { mode: 0o755 });
+      chmodSync(agentPath, 0o755);
+    }
+    try {
+      const stdout = await runAgentCommand({
+        execPath: agentPath,
+        argv: [],
+        timeoutMs: 30_000,
+        env: { ...process.env, CLAW_TEST_ENV_MARKER: "from-loader" },
+      });
+      expect(stdout.trim()).toBe("from-loader");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("still waits for a normal exit when no predicate is given", async () => {
     const fixture = createEchoAgentScript("dsh", { stdoutText: "done\n" });
     try {

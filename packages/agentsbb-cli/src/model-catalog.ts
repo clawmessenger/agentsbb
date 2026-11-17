@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import {
   grokRouteFromCliModelId,
   stripAnsiCodes,
@@ -67,6 +70,44 @@ export interface ModelListSpec {
    * 打完帧**不会自己退出**（2026-11 实测），等 EOF 只能等到超时 → 空目录。
    */
   stopWhen?: OutputStopPredicate;
+  /**
+   * 主命令产出空目录时的回退命令。codearts 的 `models --verbose` 在部分版本
+   * 只输出元数据，`models` 才是清单（Go discoverCodeArtsModels 的两级回退）。
+   */
+  fallbackArgv?: string[];
+  /** 目录发现专用的子进程环境（复刻官方 launcher 注入的变量）。 */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * 复刻 CodeArts 官方 Windows launcher 在绕过 .cmd shim 时设置的环境
+ * （Go buildCodeArtsEnv，codearts.go:730-753）。缺了 KERNEL_CONFIG_DIR /
+ * OPENCODE_CONFIG 时 native 读不到已登录的账号配置，列举命令直接报
+ * 「认证失败」或吐空清单 —— 面板上就成了「没有可选的模型目录」。
+ * agent 自定义变量（Extra）优先，与 Go 的 extra map 语义一致。
+ */
+export function codeartsDiscoveryEnv(
+  extra: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  const configDir = join(homedir(), ".codeartsdoer");
+  return {
+    ...process.env,
+    package_tag: "undefined",
+    CODEAGENT_USE_MESSAGE_FEEDBACK: "false",
+    OMO_SEND_ANONYMOUS_TELEMETRY: "0",
+    SCENARIO: "codeartsdoer",
+    OPENCODE_CHANNEL: "latest",
+    OPENCODE_CONFIG_FILE: "codearts_cli.json,codearts_cli.jsonc",
+    OPENCODE_MODE: "tui",
+    PLUGIN_ENV: "hc",
+    OPENCODE_DISABLE_MODELS_FETCH: "1",
+    OPENCODE_DISABLE_AUTOUPDATE: "true",
+    OPENCODE_ALWAYS_NOTIFY_UPDATE: "false",
+    KERNEL_DATA_DIR: join(configDir, "cli-data"),
+    KERNEL_CONFIG_DIR: configDir,
+    OPENCODE_CONFIG: join(configDir, "codearts_cli.json"),
+    ...extra,
+  };
 }
 
 // Agents whose CLI can enumerate models as `provider/model` routes — the only
@@ -111,10 +152,23 @@ const AGENT_MODEL_LIST: Readonly<Record<string, ModelListSpec>> = {
   // 依据：server/pkg/agent/codearts.go:765 discoverCodeArtsModels —— 它先试
   // `models --verbose`，为空再退回 `models`。设备端把两级合并成一条：先 verbose，
   // 失败/空则由 loader 的静态兜底接住。
-  codearts: { argv: ["models", "--verbose"], timeoutMs: 20_000, maxOutputBytes: 512 * 1024 },
+  codearts: {
+    argv: ["models", "--verbose"],
+    fallbackArgv: ["models"],
+    env: codeartsDiscoveryEnv(),
+    timeoutMs: 20_000,
+    maxOutputBytes: 512 * 1024,
+  },
   // deveco：`deveco models`，每行首个 token 是 `provider/model`
   // （server/pkg/agent/deveco_models.go:20 discoverDevecoModels）。
   deveco: { argv: ["models"], timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
+  // omp：不能沿用 pi 的 `--list-models`（omp 从不认这个 pi 专属参数，会打印
+  // usage 后以非 0 退出）。它的原生目录命令是 `omp models --json`，输出包在
+  // `{"models":[…]}` 对象里；Go 侧 discoverOmpModels/parseOmpModels
+  // （models.go:1352-1443）走的就是这条。2026-11-17 真机实跑该命令拿到
+  // quukk/DeepSeek-V4-Flash-A、quukk/glm-5.2 两条 —— 设备端此前因未登记而
+  // 完全没跑过任何列举命令，面板一直空态。
+  omp: { argv: ["models", "--json"], timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
   // cursor-agent：`--list-models`，输出 `Available models` 头 + `<id> - <label>`
   // 行（server/pkg/agent/models.go:2604 discoverCursorModels / parseCursorModels）。
   "cursor-agent": { argv: ["--list-models"], timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
@@ -565,10 +619,49 @@ export function parseCursorModelsList(stdout: string): DiscussionModelCatalog {
   return catalogFromRoutes(routes, defaultModel, names);
 }
 
+/**
+ * `omp models --json` 的目录解析（对齐 Go parseOmpModels，models.go:1379）。
+ *
+ * 输出是**对象包着 models 数组**，不是顶层数组；每项的 `selector` 已经是
+ * `provider/id` 且是 buildPiArgs 会整段注入 --model 的值 —— 必须优先用它，
+ * 退回裸 id 会让 omp 用自己的 provider 优先级猜后端，选中的模型可能跑到
+ * 另一个供应商上。wire 仍要求单斜杠路由，因此过 ROUTE_RE 后才上屏。
+ */
+export function parseOmpModelsJson(stdout: string): DiscussionModelCatalog | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const rawModels = (parsed as Record<string, unknown>).models;
+  if (!Array.isArray(rawModels)) return null;
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  const seen = new Set<string>();
+  for (const raw of rawModels) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const entry = raw as Record<string, unknown>;
+    const bareId = typeof entry.id === "string" ? entry.id.trim() : "";
+    if (!bareId) continue;
+    const provider = typeof entry.provider === "string" ? entry.provider.trim() : "";
+    const selector = typeof entry.selector === "string" ? entry.selector.trim() : "";
+    const route = selector || (provider ? `${provider}/${bareId}` : bareId);
+    if (routes.length >= MAX_LINES_SCANNED || seen.has(route) || !ROUTE_RE.test(route)) continue;
+    seen.add(route);
+    routes.push(route);
+    const label = typeof entry.name === "string" ? entry.name.trim() : "";
+    if (label) names.set(route, label.slice(0, 500));
+  }
+  return catalogFromRoutes(routes, null, names);
+}
+
 export function parseModelCatalogOutput(
   agentName: string | undefined,
   stdout: string,
 ): DiscussionModelCatalog {
+  if (agentName === "omp") return parseOmpModelsJson(stdout) ?? EMPTY_MODEL_CATALOG;
   if (agentName === "openclaw") {
     const json = parseOpenclawModelListJson(stdout);
     if (json && json.providers.length > 0) return json;
@@ -728,6 +821,7 @@ export interface ModelCatalogLoaderOpts {
     timeoutMs: number,
     maxOutputBytes: number,
     stopWhen?: OutputStopPredicate,
+    env?: NodeJS.ProcessEnv,
   ) => Promise<string>;
   // Reads the agent's own config (provider endpoints + configured default).
   // Defaults to the real readers; inject a stub to keep tests hermetic.
@@ -925,8 +1019,28 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
           cliTimeoutMs,
           spec.maxOutputBytes,
           spec.stopWhen,
+          spec.env,
         );
-        const fromCli = parseModelCatalogOutput(opts.agentName, stdout);
+        let fromCli = parseModelCatalogOutput(opts.agentName, stdout);
+        // codearts 的 `models --verbose` 在部分版本只给元数据、空清单；Go 的
+        // discoverCodeArtsModels 随后会再跑一次 `models`。设备端以前缺这一步，
+        // 于是这台机器上有凭据也拿不到目录。回退只在主命令**没产出条目**时跑。
+        if (!fromCli.providers.length && spec.fallbackArgv) {
+          const fallbackLabel = `${opts.agentName} ${spec.fallbackArgv.join(" ")}`;
+          try {
+            const fallbackStdout = await opts.runCommand(
+              spec.fallbackArgv,
+              cliTimeoutMs,
+              spec.maxOutputBytes,
+              spec.stopWhen,
+              spec.env,
+            );
+            fromCli = parseModelCatalogOutput(opts.agentName, fallbackStdout);
+            opts.logger?.(`model catalog: ${fallbackLabel} -> ${fromCli.providers.length} provider(s)`);
+          } catch (fallbackErr) {
+            opts.logger?.(`model catalog: ${fallbackLabel} failed: ${describe(fallbackErr)}`);
+          }
+        }
         // 并集而不是覆盖：同一个 provider 既在配置里声明了清单、CLI 又回报了
         // 一份时（opencode 两条路都会命中），覆盖会把配置里那份**更完整**的
         // 清单缩成 CLI 那份子集。静态兜底（上面已并入）同理不被挤掉。

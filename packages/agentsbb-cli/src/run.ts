@@ -422,7 +422,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     // ACP 目录发现要直接 spawn 二进制（JSON-RPC 双向），runCommand 的一次性
     // stdout 语义不够用，所以把路径单独交给 loader。
     execPath: opts.agentExecPath,
-    runCommand: (argv, timeoutMs, maxOutputBytes, stopWhen) =>
+    runCommand: (argv, timeoutMs, maxOutputBytes, stopWhen, env) =>
       runAgentCommand({
         execPath: opts.agentExecPath,
         argv,
@@ -432,6 +432,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // dsh 的 --list-models 打完帧不退出（2026-11 实测）：命中判据就收工，
         // 不能等 EOF，否则只能等到超时、拿到一个空目录。
         ...(stopWhen ? { stopWhen } : {}),
+        // codearts 需要复刻官方 launcher 的环境才能读到已登录的账号配置。
+        ...(env ? { env } : {}),
       }),
     // 面板上的"当前默认"必须显示主人设的那个值（而不是 agent CLI 自己配置里的），
     // 否则用户改完再打开面板又看到旧值，等于告诉他"没生效"。
