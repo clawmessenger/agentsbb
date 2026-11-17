@@ -45,6 +45,8 @@ export interface DiscoverOpts {
   home?: string;
   env?: NodeJS.ProcessEnv;
   readFile?: (path: string) => string;
+  /** 当前任务工作目录，用来找项目级配置（deveco 的 `<cwd>/.deveco/`）。 */
+  cwd?: string;
 }
 
 export interface ProbeOpts {
@@ -706,14 +708,19 @@ const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfi
   codebuddy: parseCodebuddyProviderConfig,
   opencode: parseOpencodeConfig,
   // codearts / deveco 都是 opencode 血统：`provider.<id>.options.baseURL` +
-  // `provider.<id>.models`，parseOpencodeConfig 直接吃得下（本机 codearts
-  // `~/.codeartsdoer/codearts_cli.json` 实读有 6 个模型）。
+  // `provider.<id>.models`，parseOpencodeConfig 直接吃得下。deveco 的官方用户
+  // 配置在 `~/.config/deveco/deveco.jsonc`（Windows 同路径），见 configPaths。
   codearts: parseOpencodeConfig,
   deveco: parseOpencodeConfig,
   mcode: parseMcodeConfig,
 };
 
-function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): string[] {
+function configPaths(
+  agentName: string,
+  home: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
+): string[] {
   if (agentName === "openclaw") return [join(home, ".openclaw", "openclaw.json")];
   if (agentName === "codex") {
     const codexHome = env.CODEX_HOME ?? join(home, ".codex");
@@ -773,12 +780,29 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
     candidates.push(join(home, ".codeartsdoer", "codearts_cli.json"));
     return candidates;
   }
-  // deveco（华为 DevEco CodeGenie）：同为 opencode 血统，配置在 ~/.deveco。
+  // deveco（华为 DevEco Code）：同为 opencode 血统，但官方用户级配置路径是
+  // `~/.config/deveco/deveco.jsonc`（Windows 同样是 `<用户目录>/.config/deveco/`，
+  // 鸿蒙电脑才是 `~/.deveco/deveco.jsonc`）；项目级是 `<cwd>/.deveco/deveco.jsonc`。
+  // 1.3.47 只猜了 `~/.deveco/deveco.json[.jsonc]`，在 Windows 上永远读不到，
+  // 于是 CLI 列举为空时面板仍然是「暂未开放模型选择」。这里按官方优先级补齐。
   if (agentName === "deveco") {
     const candidates: string[] = [];
     if (env.DEVECO_CONFIG) candidates.push(env.DEVECO_CONFIG);
-    candidates.push(join(home, ".deveco", "deveco.json"));
+    // 项目级优先于用户级（DevEco 官方优先级）：同一台机器不同工程挂不同模型时，
+    // 面板必须显示当前工程实际会用的那一份。
+    if (cwd) {
+      candidates.push(join(cwd, ".deveco", "deveco.jsonc"));
+      candidates.push(join(cwd, ".deveco", "deveco.json"));
+    }
+    const xdg = env.XDG_CONFIG_HOME;
+    if (xdg) {
+      candidates.push(join(xdg, "deveco", "deveco.jsonc"));
+      candidates.push(join(xdg, "deveco", "deveco.json"));
+    }
+    candidates.push(join(home, ".config", "deveco", "deveco.jsonc"));
+    candidates.push(join(home, ".config", "deveco", "deveco.json"));
     candidates.push(join(home, ".deveco", "deveco.jsonc"));
+    candidates.push(join(home, ".deveco", "deveco.json"));
     return candidates;
   }
   // mcode（MiniMax Code）：~/.minimax/config.yaml，provider + custom_provider
@@ -802,7 +826,7 @@ export function discoverOpencodeConfigPath(opts: DiscoverOpts = {}): string | nu
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
   const readFile = opts.readFile ?? defaultReadFile;
-  for (const path of configPaths("opencode", home, env)) {
+  for (const path of configPaths("opencode", home, env, opts.cwd)) {
     try {
       readFile(path);
       return path;
@@ -979,7 +1003,7 @@ export function readAgentConfig(
   const home = opts.home ?? homedir();
   const env = opts.env ?? process.env;
   const readFile = opts.readFile ?? defaultReadFile;
-  for (const path of configPaths(agentName, home, env)) {
+  for (const path of configPaths(agentName, home, env, opts.cwd)) {
     let text: string;
     try {
       text = readFile(path);

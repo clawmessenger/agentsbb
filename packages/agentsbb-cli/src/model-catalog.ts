@@ -804,6 +804,14 @@ export interface ModelCatalogRequest {
   // replay would otherwise fire dozens of responses at once and trip
   // RongCloud's SEND_FREQUENCY_TOO_FAST (20604), losing all of them.
   timestamp?: number;
+  /**
+   * 「刷新」按钮 / 管理端「重新检测」下发的强制重枚举标志。
+   *
+   * 设备端的 5 分钟缓存对空目录同样生效，曾导致 CLI 升级完以后用户点刷新
+   * 仍拿到升级前缓存的空清单——看起来像修复没发布。带这个标志时必须绕过
+   * 缓存重新跑列举命令。旧设备不认这个键（解析器忽略未知字段），行为不变。
+   */
+  refresh?: boolean;
 }
 
 export function parseModelCatalogRequest(content: string): ModelCatalogRequest | null {
@@ -823,11 +831,14 @@ export function parseModelCatalogRequest(content: string): ModelCatalogRequest |
   if (timestamp !== undefined && (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp))) {
     return null;
   }
+  const refresh = record.refresh;
+  if (refresh !== undefined && typeof refresh !== "boolean") return null;
   return {
     msg_type: "discussion_model_catalog_request",
     protocolVersion: 2,
     requestId,
     ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(refresh === true ? { refresh: true } : {}),
   };
 }
 
@@ -941,6 +952,8 @@ export interface ModelCatalogLoaderOpts {
   // Reads the agent's own config (provider endpoints + configured default).
   // Defaults to the real readers; inject a stub to keep tests hermetic.
   readConfig?: (agentName: string | undefined) => AgentConfig | null;
+  /** 任务工作目录，用来读项目级 agent 配置（deveco 的 `<cwd>/.deveco/`）。 */
+  cwd?: string;
   // 主人给这台 agent 设置的默认模型（见 agent-default-model.ts）。它比 agent CLI
   // 自身的 default_model 更该被回显 —— 面板上"当前默认"显示的就是用户自己设的值。
   readAgentDefaultModel?: () => string | undefined;
@@ -953,8 +966,11 @@ export interface ModelCatalogLoaderOpts {
 }
 
 export interface ModelCatalogLoader {
-  /** Catalog for the current request; never rejects. */
-  load(): Promise<DiscussionModelCatalog>;
+  /**
+   * Catalog for the current request; never rejects.
+   * `force = true`（页面「刷新」/ 管理端「重新检测」）绕过 TTL 缓存重新枚举。
+   */
+  load(force?: boolean): Promise<DiscussionModelCatalog>;
   /** Kick off a background refresh so the first panel open is served warm. */
   warm(): void;
   /** Drop the cached catalog (call right after the default model is rewritten). */
@@ -972,6 +988,16 @@ export function redactSecrets(text: string): string {
 }
 
 const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
+
+/**
+ * 空目录的缓存寿命刻意短得多。
+ *
+ * 一次「空」可能只是 CLI 冷启动失败 / 配置还没写好 / 刚升级但 warm-up 在
+ * 旧代码上跑过。缓存满 5 分钟会让用户在修好之后连点刷新仍看到空态，误以为
+ * 修复没生效。15 秒足够挡住展开面板时的重复探测，又不会把一次瞬时失败固化。
+ * 显式的 force 请求完全绕过它。
+ */
+const EMPTY_CATALOG_TTL_MS = 15_000;
 
 /**
  * 配置里已经声明了模型清单时，给 CLI 列举的**短预算**。
@@ -1013,13 +1039,18 @@ function mergeCatalogGroups(grouped: GroupedProviders, catalog: DiscussionModelC
 // cold start, so a cache-warm path is required for anything beyond opencode.
 export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCatalogLoader {
   const spec = modelListSpec(opts.agentName);
-  const readConfig = opts.readConfig ?? ((name: string | undefined) => readAgentConfig(name));
+  const readConfig = opts.readConfig
+    ?? ((name: string | undefined) => readAgentConfig(name, { cwd: opts.cwd }));
   const probe = opts.probe ?? ((endpoint: ProviderEndpoint) => probeProviderModels(endpoint));
   const ttlMs = opts.ttlMs ?? DEFAULT_CACHE_TTL_MS;
   const now = opts.now ?? Date.now;
   let cached: DiscussionModelCatalog | null = null;
   let cachedAt = 0;
   let inflight: Promise<DiscussionModelCatalog> | null = null;
+  let inflightForce = false;
+  // 每次真正启动的刷新都拿到一个序号；强制刷新不能让此前那次慢刷新回过头
+  // 把自己的旧结果写回缓存（否则「刷新」按钮可能把刚枚举到的新目录冲掉）。
+  let refreshSeq = 0;
 
   const describe = (err: unknown): string => redactSecrets(err instanceof Error ? err.message : String(err));
 
@@ -1230,16 +1261,20 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
     return finalizeCatalog(grouped, defaultModel);
   };
 
-  const refresh = (): Promise<DiscussionModelCatalog> => {
-    if (inflight) return inflight;
+  const refresh = (force = false): Promise<DiscussionModelCatalog> => {
+    const seq = ++refreshSeq;
+    if (inflight && (!force || inflightForce)) return inflight;
     const startedAt = now();
+    inflightForce = force;
     inflight = resolveCatalog()
       .then((catalog) => {
-        cached = catalog;
-        cachedAt = now();
-        opts.logger?.(
-          `model catalog: ${opts.agentName} -> ${catalog.providers.length} provider(s) in ${cachedAt - startedAt}ms`,
-        );
+        if (seq === refreshSeq) {
+          cached = catalog;
+          cachedAt = now();
+          opts.logger?.(
+            `model catalog: ${opts.agentName} -> ${catalog.providers.length} provider(s) in ${now() - startedAt}ms`,
+          );
+        }
         return catalog;
       })
       .catch((err: unknown) => {
@@ -1249,16 +1284,28 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
         return cached ?? EMPTY_MODEL_CATALOG;
       })
       .finally(() => {
-        inflight = null;
+        // 只有最新那次刷新能清 inflight：旧刷新迟到时不能把新的在途请求抹掉。
+        if (seq === refreshSeq) {
+          inflight = null;
+          inflightForce = false;
+        }
       });
     return inflight;
   };
 
   return {
-    async load() {
+    async load(force = false) {
+      if (force) {
+        cached = null;
+        cachedAt = 0;
+        return refresh(true);
+      }
       if (cached) {
         const served = cached;
-        if (now() - cachedAt >= ttlMs) void refresh();
+        const effectiveTtl = served.providers.length === 0
+          ? Math.min(ttlMs, EMPTY_CATALOG_TTL_MS)
+          : ttlMs;
+        if (now() - cachedAt >= effectiveTtl) void refresh();
         return served;
       }
       return refresh();

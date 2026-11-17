@@ -1054,6 +1054,33 @@ describe("MessageDispatcher self-echo loop guard", () => {
     expect(body.requestId).toBe("req-1");
     expect(body.providers).toHaveLength(1);
   });
+
+  it("passes refresh=true through to the catalog loader", async () => {
+    const deps = makeDeps();
+    const loadModelCatalog = vi.fn(async () => ({
+      defaultModel: null,
+      providers: [{ id: "prov", name: "prov", models: [{ id: "m", name: "m" }] }],
+    }));
+    const dispatcher = new MessageDispatcher({ send: deps.send, selfUserId: "rc_node_self", loadModelCatalog });
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "user_1",
+        toUserId: "",
+        targetId: "user_1",
+        conversationType: 1,
+        content: JSON.stringify({
+          msg_type: "discussion_model_catalog_request",
+          protocolVersion: 2,
+          requestId: "req-refresh",
+          timestamp: Date.now(),
+          refresh: true,
+        }),
+      },
+      { runTurn: async () => "unused" },
+    );
+    expect(loadModelCatalog).toHaveBeenCalledWith(true);
+  });
 });
 
 describe("MessageDispatcher model catalog replay guards", () => {

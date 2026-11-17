@@ -468,6 +468,44 @@ describe("readAgentConfig", () => {
     ]);
   });
 
+  it("reads DevEco's official user config path (~/.config/deveco/deveco.jsonc)", () => {
+    const home = mkdtempSync(join(tmpdir(), "deveco-cfg-"));
+    const path = join(home, ".config", "deveco", "deveco.jsonc");
+    mkdirSync(join(home, ".config", "deveco"), { recursive: true });
+    // 官方文件带 $schema 和 JSONC 注释，parseOpencodeConfig 必须照单全收。
+    writeFileSync(path, JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      model: "quukk/glm-5.2",
+      provider: {
+        quukk: {
+          name: "Quukk AI",
+          options: { baseURL: "https://example.invalid/v1", apiKey: "sk-test" },
+          models: { "glm-5.2": { tool_call: true } },
+        },
+      },
+    }, null, 2).replace('"model"', '// user models\n  "model"'));
+
+    const config = readAgentConfig("deveco", { home, cwd: join(home, "empty-project") });
+    expect(config?.defaultModel).toBe("quukk/glm-5.2");
+    expect(config?.declaredModels?.quukk).toEqual(["glm-5.2"]);
+    expect(config?.endpoints[0].baseUrl).toBe("https://example.invalid/v1");
+  });
+
+  it("prefers a project-level .deveco/deveco.jsonc over the user config", () => {
+    const home = mkdtempSync(join(tmpdir(), "deveco-cfg-"));
+    const project = join(home, "project");
+    mkdirSync(join(home, ".config", "deveco"), { recursive: true });
+    mkdirSync(join(project, ".deveco"), { recursive: true });
+    writeFileSync(join(home, ".config", "deveco", "deveco.jsonc"), JSON.stringify({
+      model: "user/m",
+    }));
+    writeFileSync(join(project, ".deveco", "deveco.jsonc"), JSON.stringify({
+      model: "project/m",
+    }));
+
+    expect(readAgentConfig("deveco", { home, cwd: project })?.defaultModel).toBe("project/m");
+  });
+
   it("returns null when no opencode config exists", () => {
     const home = join("/", "home", "u");
     expect(readAgentConfig("opencode", {

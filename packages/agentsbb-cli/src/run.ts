@@ -419,6 +419,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   // Warm-up runs in the background so it never delays message dispatch.
   const catalogLoader = createModelCatalogLoader({
     agentName: opts.agentName,
+    // deveco 等项目级配置在 <cwd>/.deveco 下，必须与 agent 实际执行目录一致。
+    cwd: opts.cwd,
     // ACP 目录发现要直接 spawn 二进制（JSON-RPC 双向），runCommand 的一次性
     // stdout 语义不够用，所以把路径单独交给 loader。
     execPath: opts.agentExecPath,
@@ -487,7 +489,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
   const dispatcher = new MessageDispatcher({
     send: (toUserId, objectName, content) => opts.transport.sendMessage(toUserId, objectName, content),
     answeredTurns,
-    loadModelCatalog: () => catalogLoader.load(),
+    loadModelCatalog: (force) => catalogLoader.load(force),
     userModels,
     agentDefaultModel,
     onDefaultModelChanged: () => catalogLoader.invalidate(),

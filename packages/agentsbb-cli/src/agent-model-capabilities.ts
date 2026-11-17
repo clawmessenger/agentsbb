@@ -71,8 +71,9 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   codearts: { catalogSource: "cli", modelInjection: "argv" },
 
   // deveco：`deveco models` 每行首个 token 是 `provider/model`
-  // （deveco_models.go:20）+ `~/.deveco/*` 配置（同 opencode 血统，2026-11-17 补）；
-  // 注入 `--model`（deveco.go:105）。CLI 输出空时配置兜底。
+  // （deveco_models.go:20）+ 官方配置 `<cwd>/.deveco/deveco.jsonc` /
+  // `~/.config/deveco/deveco.jsonc`（同 opencode 血统）；注入 `--model`
+  // （deveco.go:105）。CLI 输出空时配置兜底。
   deveco: { catalogSource: "cli", modelInjection: "argv" },
 
   // openclaw：`openclaw models list --json` + 配置 + probe 并集（AGENT_MODEL_LIST /

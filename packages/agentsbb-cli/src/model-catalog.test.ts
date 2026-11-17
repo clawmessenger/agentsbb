@@ -147,6 +147,36 @@ describe("parseModelCatalogRequest", () => {
     });
   });
 
+  it("accepts the refresh flag sent by 刷新 / 重新检测", () => {
+    expect(parseModelCatalogRequest(JSON.stringify({
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId: "req-refresh",
+      refresh: true,
+    }))).toEqual({
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId: "req-refresh",
+      refresh: true,
+    });
+    expect(parseModelCatalogRequest(JSON.stringify({
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId: "req-refresh-off",
+      refresh: false,
+    }))).toEqual({
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId: "req-refresh-off",
+    });
+    expect(parseModelCatalogRequest(JSON.stringify({
+      msg_type: "discussion_model_catalog_request",
+      protocolVersion: 2,
+      requestId: "req-bad-refresh",
+      refresh: "yes",
+    }))).toBeNull();
+  });
+
   it("accepts a request without a timestamp and rejects a malformed one", () => {
     expect(parseModelCatalogRequest(JSON.stringify({
       msg_type: "discussion_model_catalog_request", protocolVersion: 2, requestId: "req-2",
@@ -738,6 +768,32 @@ describe("createModelCatalogLoader", () => {
 
     clock += 60_000;
     await loader.load();
+    expect(runCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("force-load bypasses a cached empty catalog (刷新按钮)", async () => {
+    const runCommand = vi.fn()
+      .mockResolvedValueOnce("")
+      .mockResolvedValueOnce("quukk/glm-5.2\n");
+    const loader = createModelCatalogLoader({
+      agentName: "deveco",
+      runCommand,
+      readConfig: noConfig,
+    });
+
+    const empty = await loader.load();
+    expect(empty.providers).toHaveLength(0);
+    expect(runCommand).toHaveBeenCalledTimes(1);
+
+    // without force the empty result is served from cache; with force it must
+    // re-run the discovery command and return the newly available models.
+    expect((await loader.load()).providers).toHaveLength(0);
+    expect(runCommand).toHaveBeenCalledTimes(1);
+
+    const refreshed = await loader.load(true);
+    expect(refreshed.providers).toEqual([
+      { id: "quukk", name: "quukk", models: [{ id: "glm-5.2", name: "glm-5.2" }] },
+    ]);
     expect(runCommand).toHaveBeenCalledTimes(2);
   });
 
