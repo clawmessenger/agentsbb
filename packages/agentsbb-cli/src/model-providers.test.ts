@@ -1,3 +1,5 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -5,6 +7,7 @@ import {
   parseCodebuddyProviderConfig,
   parseCodexConfig,
   parseHermesConfig,
+  parseMcodeConfig,
   parseModelIds,
   parseOpenclawConfig,
   parseOpencodeConfig,
@@ -554,5 +557,88 @@ describe("buildDeviceOpencodeConfig lean 回合", () => {
     expect(parsed.agent.build.tools).toEqual({ "*": false });
     expect(parsed.tools.read).toBe(false);
     expect(parsed.permission.bash).toBe("deny");
+  });
+});
+
+describe("parseMcodeConfig（mcode ~/.minimax/config.yaml）", () => {
+  // 2026-11-17 本机真机配置的结构（密钥换成占位，模型/键名保留）。
+  const YAML = [
+    "logLevel: info",
+    "defaultModel: custom_provider:quukkai/glm-5.2",
+    "provider:",
+    "  minimax:",
+    "    name: MiniMax",
+    "    options:",
+    "      apiKey: sk-xxx",
+    "      baseURL: https://agent.minimaxi.com/v1",
+    "    models:",
+    "      MiniMax-M3:",
+    "        name: M3",
+    "        limit:",
+    "          context: 512000",
+    "      MiniMax-M3.1-Flash:",
+    "        name: M3.1-Flash",
+    "custom_provider:",
+    "  quukkai:",
+    "    name: QuukkAI",
+    "    options:",
+    "      apiKey: sk-real",
+    "      baseURL: https://llmapi.quukk.com/v1",
+    "    models:",
+    "      glm-5.2:",
+    "        reasoning: true",
+    "        thinking_config:",
+    "          mode: switchable",
+    "      glm-5.3:",
+    "        reasoning: true",
+  ].join("\n");
+
+  it("strips custom_provider: from default and reads both provider namespaces", () => {
+    const cfg = parseMcodeConfig(YAML);
+    // 只看模型行（缩进 6），不把 limit/thinking_config 等子键当模型。
+    expect(cfg.defaultModel).toBe("quukkai/glm-5.2");
+    expect(cfg.declaredModels).toEqual({
+      minimax: ["MiniMax-M3", "MiniMax-M3.1-Flash"],
+      quukkai: ["glm-5.2", "glm-5.3"],
+    });
+    expect(cfg.endpoints).toEqual([
+      { id: "minimax", baseUrl: "https://agent.minimaxi.com/v1", apiKey: "sk-xxx" },
+      { id: "quukkai", baseUrl: "https://llmapi.quukk.com/v1", apiKey: "sk-real" },
+    ]);
+  });
+
+  it("degrades to empty config on junk", () => {
+    expect(parseMcodeConfig("not yaml at all")).toEqual({
+      endpoints: [], defaultModel: null,
+    });
+  });
+});
+
+describe("新增四家的 config 路径与能力登记", () => {
+  it("codearts / deveco / mcode 都有 config parser + path", () => {
+    const home = mkdtempSync(join(tmpdir(), "mcode-cfg-"));
+    // mcode: ~/.minimax/config.yaml
+    mkdirSync(join(home, ".minimax"), { recursive: true });
+    writeFileSync(join(home, ".minimax", "config.yaml"), [
+      "defaultModel: custom_provider:q/g",
+      "custom_provider:",
+      "  q:",
+      "    options:",
+      "      baseURL: https://example.invalid/v1",
+      "    models:",
+      "      g:",
+      "        reasoning: true",
+    ].join("\n"));
+    const cfg = readAgentConfig("mcode", { home });
+    expect(cfg?.defaultModel).toBe("q/g");
+    expect(cfg?.declaredModels?.q).toEqual(["g"]);
+  });
+
+  it("qwenpaw / mcode 的能力矩阵是 cli/config + argv（可发现且可注入）", async () => {
+    const { agentModelCapability } = await import("./agent-model-capabilities.js");
+    expect(agentModelCapability("qwenpaw")).toEqual({ catalogSource: "cli", modelInjection: "argv" });
+    expect(agentModelCapability("mcode")).toEqual({ catalogSource: "config", modelInjection: "argv" });
+    expect(agentModelCapability("deveco")).toEqual({ catalogSource: "cli", modelInjection: "argv" });
+    expect(agentModelCapability("codearts")).toEqual({ catalogSource: "cli", modelInjection: "argv" });
   });
 });

@@ -584,6 +584,118 @@ export function parseOpencodeConfig(text: string): AgentConfig {
   };
 }
 
+/**
+ * mcode（MiniMax Code）的 `~/.minimax/config.yaml` 解析（2026-11-17 真机）。
+ *
+ * 配置是 opencode 血统的 YAML，但没有 JSON 解析器可用（本包无 yaml 依赖），
+ * 这里按缩进手写解析。关心的三层：
+ *   `provider.<id>.options.{baseURL,apiKey}`  → endpoint
+ *   `provider.<id>.models` 下的键              → declaredModels[id]
+ *   `custom_provider.<id>`                     → 同上（自定义网关，本机 quukkai 就是）
+ *   `defaultModel: custom_provider:quukkai/glm-5.2` → 转成 `quukkai/glm-5.2`
+ *
+ * `custom_provider:` 前缀是 mcode 的内部命名空间，不是 wire 路由的一部分；
+ * 面板与 `-m provider/model` 都只认 `quukkai/glm-5.2`，必须剥掉。
+ */
+export function parseMcodeConfig(text: string): AgentConfig {
+  const endpoints: ProviderEndpoint[] = [];
+  const declaredModels: Record<string, string[]> = {};
+  let defaultModel: string | null = null;
+  // 当前 provider 块：namespace 为 provider / custom_provider，id 为 provider 名。
+  let namespace: string | null = null;
+  let providerId: string | null = null;
+  let section: "options" | "models" | null = null;
+  let sectionIndent = -1;
+
+  const flush = (): void => {
+    // 端点在 options 段收集，这里只负责清空状态。
+    providerId = null;
+    section = null;
+    sectionIndent = -1;
+  };
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = rawLine.length - rawLine.trimStart().length;
+
+    // 顶层 defaultModel / provider: / custom_provider:
+    if (indent === 0) {
+      flush();
+      namespace = null;
+      const dm = /^defaultModel\s*:\s*(\S+)\s*$/.exec(trimmed);
+      if (dm) {
+        const raw = dm[1].replace(/^["']|["']$/g, "");
+        // `custom_provider:quukkai/glm-5.2` → `quukkai/glm-5.2`
+        defaultModel = raw.replace(/^custom_provider:/, "");
+        continue;
+      }
+      if (/^provider\s*:\s*$/.test(trimmed)) { namespace = "provider"; continue; }
+      if (/^custom_provider\s*:\s*$/.test(trimmed)) { namespace = "custom_provider"; continue; }
+      namespace = null;
+      continue;
+    }
+
+    // provider 块下的 id（缩进 2）：`  quukkai:`
+    if (namespace && indent === 2) {
+      flush();
+      const idMatch = /^([A-Za-z0-9][A-Za-z0-9._-]*)\s*:\s*$/.exec(trimmed);
+      providerId = idMatch ? idMatch[1] : null;
+      section = null;
+      continue;
+    }
+
+    if (!namespace || !providerId) continue;
+
+    // options / models 段头（缩进 4）
+    if (indent === 4) {
+      if (/^options\s*:\s*$/.test(trimmed)) { section = "options"; sectionIndent = 4; continue; }
+      if (/^models\s*:\s*$/.test(trimmed)) { section = "models"; sectionIndent = 4; continue; }
+      section = null;
+    }
+
+    // options 段的 baseURL / apiKey（缩进 6）
+    if (section === "options" && indent > sectionIndent) {
+      const key = /^(baseURL|baseUrl|base_url|apiKey|api_key)\s*:\s*(\S+)\s*$/.exec(trimmed);
+      if (key) {
+        const value = key[2].replace(/^["']|["']$/g, "");
+        const existing = endpoints.find((e) => e.id === providerId);
+        if (key[1].toLowerCase().startsWith("baseurl")) {
+          if (existing) existing.baseUrl = value;
+          else endpoints.push({ id: providerId, baseUrl: value });
+        } else if (existing) {
+          existing.apiKey = value;
+        } else {
+          endpoints.push({ id: providerId, baseUrl: "", apiKey: value });
+        }
+      }
+      continue;
+    }
+
+    // models 段的模型名：**严格缩进 6**（`provider.<id>.models.<name>`）。
+    // 缩进 8+ 是模型的子键（limit / modalities / thinking_config / variants…），
+    // 用 `indent > sectionIndent` 会把它们误当模型 —— 面板出现
+    // `quukkai/thinking_config` 这种假条目。必须锁死层级。
+    if (section === "models" && indent === 6) {
+      const modelMatch = /^([A-Za-z0-9][A-Za-z0-9._:-]*)\s*:\s*$/.exec(trimmed);
+      if (modelMatch) {
+        const slug = modelMatch[1];
+        const list = declaredModels[providerId] ?? [];
+        if (!list.includes(slug)) list.push(slug);
+        declaredModels[providerId] = list;
+      }
+    }
+  }
+
+  // 丢掉没有 baseUrl 的残项（apiKey-only 的半截 provider 不能当端点用）。
+  const usable = endpoints.filter((e) => e.baseUrl);
+  return {
+    endpoints: usable,
+    defaultModel,
+    ...(Object.keys(declaredModels).length > 0 ? { declaredModels } : {}),
+  };
+}
+
 // --- per-agent wiring ------------------------------------------------------
 
 const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfig>> = {
@@ -593,6 +705,12 @@ const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfi
   qwen: parseQwenConfig,
   codebuddy: parseCodebuddyProviderConfig,
   opencode: parseOpencodeConfig,
+  // codearts / deveco 都是 opencode 血统：`provider.<id>.options.baseURL` +
+  // `provider.<id>.models`，parseOpencodeConfig 直接吃得下（本机 codearts
+  // `~/.codeartsdoer/codearts_cli.json` 实读有 6 个模型）。
+  codearts: parseOpencodeConfig,
+  deveco: parseOpencodeConfig,
+  mcode: parseMcodeConfig,
 };
 
 function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): string[] {
@@ -644,6 +762,31 @@ function configPaths(agentName: string, home: string, env: NodeJS.ProcessEnv): s
     }
     candidates.push(join(home, ".config", "opencode", "opencode.json"));
     candidates.push(join(home, ".config", "opencode", "opencode.jsonc"));
+    return candidates;
+  }
+  // codearts（华为 CodeArts Doer）：官方 launcher 的 OPENCODE_CONFIG 指向
+  // ~/.codeartsdoer/codearts_cli.json（opencode 血统，provider.models 里就是
+  // 已配置目录）。设备端之前没 parser 也没路径，面板一直空态。
+  if (agentName === "codearts") {
+    const candidates: string[] = [];
+    if (env.OPENCODE_CONFIG) candidates.push(env.OPENCODE_CONFIG);
+    candidates.push(join(home, ".codeartsdoer", "codearts_cli.json"));
+    return candidates;
+  }
+  // deveco（华为 DevEco CodeGenie）：同为 opencode 血统，配置在 ~/.deveco。
+  if (agentName === "deveco") {
+    const candidates: string[] = [];
+    if (env.DEVECO_CONFIG) candidates.push(env.DEVECO_CONFIG);
+    candidates.push(join(home, ".deveco", "deveco.json"));
+    candidates.push(join(home, ".deveco", "deveco.jsonc"));
+    return candidates;
+  }
+  // mcode（MiniMax Code）：~/.minimax/config.yaml，provider + custom_provider
+  // 两段都可能有网关；defaultModel 用 `custom_provider:<id>/<slug>` 记法。
+  if (agentName === "mcode") {
+    const candidates: string[] = [];
+    if (env.MCODE_CONFIG) candidates.push(env.MCODE_CONFIG);
+    candidates.push(join(home, ".minimax", "config.yaml"));
     return candidates;
   }
   return [];

@@ -325,14 +325,20 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("codearts", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
   });
 
-  it("mcode 走 exec + text（不再撞 interactive mode requires a TTY）", () => {
+  it("mcode 走 exec + text，--model provider/model（真机 --help 确认 session 级）", () => {
     expect(buildAgentArgs("mcode", "hi")).toEqual(["exec", "hi", "--output-format", "text"]);
-    expect(buildModelArgs("mcode", "quukk/glm-5.2")).toEqual([]);
+    expect(buildModelArgs("mcode", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
+    expect(buildAgentArgs("mcode", "hi", "quukk/glm-5.2")).toEqual([
+      "exec", "hi", "--output-format", "text", "--model", "quukk/glm-5.2",
+    ]);
   });
 
-  it("qwenpaw 走 task -i，模型不注入", () => {
+  it("qwenpaw 走 task -i，--model provider/model（headless -m override，不写 agent.json）", () => {
     expect(buildAgentArgs("qwenpaw", "hi")).toEqual(["task", "-i", "hi"]);
-    expect(buildModelArgs("qwenpaw", "quukk/glm-5.2")).toEqual([]);
+    expect(buildModelArgs("qwenpaw", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
+    expect(buildAgentArgs("qwenpaw", "hi", "quukk/glm-5.2")).toEqual([
+      "task", "-i", "hi", "--model", "quukk/glm-5.2",
+    ]);
   });
 
   it("zeroclaw 走 agent -a default，-p <provider> --model <id> 注入（真机 0.8.7 实测）", () => {
@@ -447,8 +453,8 @@ describe("splitModelRoute / buildModelArgs", () => {
   // 也不能把本来支持 `--model` 的 agent 一起误伤（qwen 就是易回归点 ——
   // 它在设备端没有 argv 策略，但 `--model` 是真实支持的参数）。
   it("only renders model flags for agents that actually accept them", () => {
-    // 无策略 → 不注入
-    expect(buildModelArgs("mcode", "m1")).toEqual([]);
+    // mcode 有 argv 策略且真机确认 --model session 级生效（2026-11-17）
+    expect(buildModelArgs("mcode", "m1")).toEqual(["--model", "m1"]);
     // 有策略 → 按各家形状注入
     expect(buildModelArgs("codex", "p/m")).toEqual(["-c", "model_provider=p", "-m", "m"]);
     expect(buildModelArgs("opencode", "p/m")).toEqual(["--model", "p/m"]);

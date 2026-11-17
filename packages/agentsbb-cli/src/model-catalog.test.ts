@@ -16,6 +16,7 @@ import {
   parseGrokModelsList,
   parseKimiProviderListJson,
   parseOmpModelsJson,
+  parseQwenpawModelsList,
   parseZeroclawModelsList,
   parseModelCatalogOutput,
   parseModelCatalogRequest,
@@ -1304,15 +1305,14 @@ describe("createModelCatalogLoader with static fallback catalogs", () => {
     expect(catalog.defaultModel).toBeNull();
   });
 
-  // 能力闸门的负向测试：injection 'none' 的 agent 即使将来有人往
+  // 能力闸门的负向测试：未知 agent（能力矩阵 UNKNOWN = none）即使将来有人往
   // STATIC_CATALOGS 里塞了清单，也不许漏出来；也没有任何列举命令可跑。
   //
-  // 注意这两位与「catalogSource: acp」的 agent（traecli/kiro/qoder/dim/
-  // reasonix）不是一类：那些能通过 ACP 握手拿到真实目录，只有这两位既没有
-  // 目录来源、也没有注入通道。zeroclaw 已于 2026-11-17 接上原生目录 + argv
-  // 注入（models list / agent -p --model 真机实测），不在此列。
+  // 2026-11-17 起 qwenpaw / mcode / zeroclaw 均已接上真实目录 + argv 注入
+  // （qwenpaw models list、mcode config.yaml、zeroclaw models list 真机实测），
+  // 不再属于「无能力」一类。保留未知 agent 作为闸门底线。
   it("never serves a catalog for agents that cannot inject a model", async () => {
-    for (const agentName of ["qwenpaw", "mcode"]) {
+    for (const agentName of ["totally-unknown-agent"]) {
       const runCommand = vi.fn();
       const loader = createModelCatalogLoader({
         agentName,
@@ -1577,5 +1577,63 @@ describe("createModelCatalogLoader codearts/deveco/cursor-agent listing", () => 
     expect(catalog.providers[0].models.map((model) => model.id))
       .toEqual(["auto", "composer-2-fast"]);
     expect(catalog.defaultModel).toBe("cursor/composer-2-fast");
+  });
+});
+
+describe("parseQwenpawModelsList（qwenpaw models list）", () => {
+  // 2026-11-17 真机 2.x 输出的关键片段（provider 段 + 模型行 + 默认槽）。
+  const LIST = [
+    "=== Providers ===",
+    "────────────────────────────────────────────",
+    "  ModelScope (modelscope)",
+    "────────────────────────────────────────────",
+    "  base_url        : https://api-inference.modelscope.cn/v1",
+    "  models          :",
+    "    - Qwen3.5-122B-A10B (qwen3.5-122b-a10b)",
+    "    - GLM-5 (glm-5)",
+    "────────────────────────────────────────────",
+    "  QuukkAI (quukk) [custom]",
+    "────────────────────────────────────────────",
+    "  base_url        : https://llmapi.quukk.com/v1",
+    "  models          :",
+    "    - GLM5.2 (glm-5.2) [user-added]",
+    "    - GLM5.3 (glm-5.3) [user-added]",
+    "    - GLM5.2 (glm-5.2) [duplicate]",
+    "════════════════════════════════════════════",
+    "  Active Model Slot",
+    "════════════════════════════════════════════",
+    "  LLM             : quukk / glm-5.2",
+  ].join("\n");
+
+  it("groups by provider section, reads (id), dedupes, and picks the active default", () => {
+    const catalog = parseQwenpawModelsList(LIST);
+    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+    const byId = (id: string) => catalog.providers.find((p) => p.id === id)!;
+    // 模型行里的 `(id)` 必须是模型 id，不能被误认成 provider 段头。
+    expect(byId("quukk").models.map((m) => m.id)).toEqual(["glm-5.2", "glm-5.3"]);
+    expect(byId("modelscope").models.map((m) => m.id)).toEqual([
+      "glm-5", "qwen3.5-122b-a10b",
+    ]);
+    expect(byId("quukk").models[0].name).toBe("GLM5.2");
+  });
+
+  it("does not let a model line become a provider (real MiniMax-M2.7 case)", () => {
+    const catalog = parseQwenpawModelsList([
+      "  MiniMax (minimax)",
+      "  models :",
+      "    - MiniMax M2.7 Highspeed (MiniMax-M2.7-highspeed)",
+      "    - MiniMax M2.5 (legacy) (MiniMax-M2.5)",
+    ].join("\n"));
+    expect(catalog.providers).toHaveLength(1);
+    expect(catalog.providers[0].id).toBe("minimax");
+    // finalizeCatalog 按 id 字母序（MiniMax-M2.5 < MiniMax-M2.7-highspeed）。
+    expect(catalog.providers[0].models.map((m) => m.id)).toEqual([
+      "MiniMax-M2.5", "MiniMax-M2.7-highspeed",
+    ]);
+  });
+
+  it("degrades to empty on junk", () => {
+    expect(parseQwenpawModelsList("no catalog here").providers).toEqual([]);
+    expect(parseModelCatalogOutput("qwenpaw", "no catalog").providers).toEqual([]);
   });
 });

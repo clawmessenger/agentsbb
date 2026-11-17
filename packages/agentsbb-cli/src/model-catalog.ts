@@ -181,6 +181,17 @@ const AGENT_MODEL_LIST: Readonly<Record<string, ModelListSpec>> = {
   // session/set_model 会写持久配置」——但设备端走 **argv 注入**，绕开了 ACP
   // 这条限制（`agent -p ... --model ...` 2026-11-17 实测生效）。两者不矛盾。
   zeroclaw: { argv: ["models", "list"], timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
+  // qwenpaw（Python venv CLI）：`qwenpaw models list` 列出所有 provider 及其
+  // 配置模型（2026-11-17 真机 2.x 实测 exit 0）：
+  //   ── QuukkAI (quukk) [custom]
+  //     models :
+  //       - GLM5.2 (glm-5.2) [user-added]
+  //   ── Active Model Slot
+  //     LLM : quukk / glm-5.2
+  // 括号里是 provider/id 路由，可直接给 `task -m` 注入。Go 侧只看了 ACP 的
+  // session/set_model（会写 agent.json 有副作用）就判空目录——但 headless
+  // 的 `-m` 是 session 级 override、不落盘，与 ACP 是两条独立通道。
+  qwenpaw: { argv: ["models", "list"], timeoutMs: 25_000, maxOutputBytes: 512 * 1024 },
   // cursor-agent：`--list-models`，输出 `Available models` 头 + `<id> - <label>`
   // 行（server/pkg/agent/models.go:2604 discoverCursorModels / parseCursorModels）。
   "cursor-agent": { argv: ["--list-models"], timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
@@ -704,12 +715,68 @@ export function parseZeroclawModelsList(stdout: string): DiscussionModelCatalog 
   return catalogFromRoutes(routes, null);
 }
 
+/**
+ * `qwenpaw models list` 的目录解析（2026-11-17 真机 2.x 实测）。
+ *
+ * 输出按 provider 分段，段头 `  Name (id) [custom]`，其下 `models :` 后
+ * 每行 `  - Label (model-id) [user-added]`。括号里是 `provider/id` 路由。
+ * 尾部 `Active Model Slot` 段的 `LLM : quukk / glm-5.2` 给默认模型
+ * （注意 ` / ` 两边有空格，要拼回单斜杠）。
+ * 无 api_key 的内置 provider（openrouter/modelscope 等）也上屏——模型本身
+ * 可选，选了能不能跑取决于用户是否配 key，与目录是否该显示无关。
+ */
+export function parseQwenpawModelsList(stdout: string): DiscussionModelCatalog {
+  const lines = stripAnsiCodes(stdout).split(/\r?\n/).slice(0, MAX_LINES_SCANNED);
+  const routes: string[] = [];
+  const names = new Map<string, string>();
+  const seen = new Set<string>();
+  let provider = "";
+  let defaultModel: string | null = null;
+  let inActiveSlot = false;
+  for (const raw of lines) {
+    const line = raw.trim();
+    // 模型行必须先判：`- Label (id) [tag]`。段头正则与它形状相似（都是
+    // `文字 (id)`），若不先挡掉 `-` 开头，模型 `MiniMax M2.7 Highspeed
+    // (MiniMax-M2.7-highspeed)` 会被误认成 provider 段头（真机踩过）。
+    const modelLine = /^-\s+(.+?)\s+\(([A-Za-z0-9][A-Za-z0-9._:-]*)\)(?:\s+\[[^\]]*\])?$/.exec(line);
+    if (modelLine && provider) {
+      const route = `${provider}/${modelLine[2]}`;
+      if (!ROUTE_RE.test(route) || seen.has(route)) continue;
+      seen.add(route);
+      routes.push(route);
+      const label = modelLine[1].trim();
+      if (label) names.set(route, label.slice(0, 500));
+      continue;
+    }
+    // 段头：`QuukkAI (quukk) [custom]`（排除 `-` 开头的模型行）。
+    const header = /^(?!-)([^\s(][^(]*?)\s+\(([A-Za-z0-9][A-Za-z0-9._-]*)\)(?:\s+\[[^\]]*\])?$/.exec(line);
+    if (header) {
+      provider = header[2];
+      inActiveSlot = false;
+      continue;
+    }
+    if (/^active model slot/i.test(line)) { inActiveSlot = true; provider = ""; continue; }
+    // 默认模型：`LLM : quukk / glm-5.2`
+    const active = /^LLM\s*:\s*([A-Za-z0-9][\w.-]*)\s*\/\s*([A-Za-z0-9][\w.:-]*)/i.exec(line);
+    if (active && inActiveSlot) {
+      const route = `${active[1]}/${active[2]}`;
+      if (ROUTE_RE.test(route)) defaultModel = route;
+    }
+  }
+  // 默认模型必须在目录里，否则 finalizeCatalog 会丢弃它（与 omp 的契约一致）。
+  if (defaultModel && !seen.has(defaultModel) && ROUTE_RE.test(defaultModel)) {
+    routes.push(defaultModel);
+  }
+  return catalogFromRoutes(routes, defaultModel, names);
+}
+
 export function parseModelCatalogOutput(
   agentName: string | undefined,
   stdout: string,
 ): DiscussionModelCatalog {
   if (agentName === "omp") return parseOmpModelsJson(stdout) ?? EMPTY_MODEL_CATALOG;
   if (agentName === "zeroclaw") return parseZeroclawModelsList(stdout);
+  if (agentName === "qwenpaw") return parseQwenpawModelsList(stdout);
   if (agentName === "openclaw") {
     const json = parseOpenclawModelListJson(stdout);
     if (json && json.providers.length > 0) return json;

@@ -281,15 +281,13 @@ export function buildModelArgs(name: string, model: string | undefined): string[
   // stdin 里拼装（runAgentTurn 的 dsh 专用分支），argv 里没有 --model 这个
   // 旗标——这里返回空，模型信息由 stdin 命令携带。
   if (name === "dsh") return [];
-  // B 类第二批（2026-11-10）：mcode / qwenpaw / dim / reasonix 的模型选择
-  // 走各家自己的账户或配置文件，我们的 provider/model 路由它们并不认识：
-  // qwenpaw 的 -m 要的是 `anthropic/claude-sonnet-4-5` 形的它家路由，dim 走 ACP
-  // set_model（见 acp-turn）。没有证据就不注入，模型跟随各家默认配置。
-  // zeroclaw 已有专门的 argv 注入分支（见上方），不在此列。
-  if (
-    name === "mcode" || name === "qwenpaw"
-    || name === "dim" || name === "reasonix"
-  ) return [];
+  // mcode / qwenpaw 已在 2026-11-17 真机确认 headless 入口支持 session 级
+  // --model provider/model（mcode exec --model「override for this Run only」，
+  // qwenpaw task -m「Model override e.g. anthropic/claude-sonnet-4-5」），
+  // 两者都走下面通用 fallback 的 `["--model", model]`，不再在此拦截。
+  // zeroclaw 有专门的 -p/--model 分支（见上方）。
+  // 仍不注入的：dim / reasonix（会话模型走 ACP 或各家账户态，argv 无可靠参数）。
+  if (name === "dim" || name === "reasonix") return [];
   return ["--model", model];
 }
 
@@ -685,8 +683,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // mcode（Minimax Code）：`mcode exec [prompt]` 官方自述「Run one prompt
   // without starting the TUI」；不带 --output-format 时默认 text。裸 `mcode`
   // 在无 TTY 下直接拒绝（"interactive mode requires a TTY"）。
-  mcode: (prompt) => [
+  mcode: (prompt, model) => [
     "exec", prompt, "--output-format", "text",
+    // `mcode exec --model provider/model`（官方「override for this Run only」），
+    // 真机 --help 确认；--model 加在 exec 子命令后，不是顶层。
+    ...buildModelArgs("mcode", model),
   ],
   // qwenpaw（QwenPaw，Python venv CLI）：`qwenpaw task -i <instruction>` 是
   // 官方 headless 单任务入口（task --help：Run a single task instruction
@@ -696,8 +697,11 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // ⚠️ 中文经 .cmd shim + cmd.exe 的 %* 透传本身是 UTF-16 安全的，但 Python
   // 在 Windows 管道上的 stdout 默认编码是 locale（GBK），回复正文会整体乱码
   // —— agentRuntimeEnv 给 qwenpaw 注入 PYTHONUTF8=1 强制 UTF-8 输出。
-  qwenpaw: (prompt) => [
+  qwenpaw: (prompt, model) => [
     "task", "-i", prompt,
+    // `qwenpaw task -m provider/model`（官方「Model override」session 级，
+    // 与 ACP 的 set_model 写 agent.json 是两条路）；真机 2.x --help 确认。
+    ...buildModelArgs("qwenpaw", model),
   ],
   // dim（DimAgent）：`dim exec [prompt]` 官方一次性入口；裸 `dim` 是 TUI，
   // 且在未信任目录直接退出（"not a trusted folder"，设备 workdir 需先跑一次

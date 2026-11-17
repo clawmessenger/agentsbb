@@ -64,15 +64,15 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   // 该变量根本不会被设置，选了等于没选。
   codebuddy: { catalogSource: "config", modelInjection: "env" },
 
-  // codearts：`codearts models --verbose`（与 opencode 同源输出），注入
-  // `--model <id>`（codearts.go:86 `args = append(args, "--model", opts.Model)`）。
-  // 旧注释写「Go 走 ACP + 设备端禁用注入」，两条都已过时且与 Go 现状相反。
+  // codearts：`codearts models --verbose`（与 opencode 同源输出）+ opencode 血统
+  // 的 `~/.codeartsdoer/codearts_cli.json`（2026-11-17 补 config parser，本机实读
+  // 6 个模型），两路并集。注入 `--model <id>`（codearts.go:86）。CLI 因缺 AK/SK
+  // 失败时 config 仍能撑起面板 —— 这正是之前「有配置却空态」的根因。
   codearts: { catalogSource: "cli", modelInjection: "argv" },
 
   // deveco：`deveco models` 每行首个 token 是 `provider/model`
-  // （deveco_models.go:20）；注入 `--model`（deveco.go:105，与 codearts 同款）。
-  // 它确实"凭据为 0 时注入只会把没登录的报错提前"，但那是账号问题，
-  // 不是参数不被支持 —— 有凭据的机器上模型选择是生效的。
+  // （deveco_models.go:20）+ `~/.deveco/*` 配置（同 opencode 血统，2026-11-17 补）；
+  // 注入 `--model`（deveco.go:105）。CLI 输出空时配置兜底。
   deveco: { catalogSource: "cli", modelInjection: "argv" },
 
   // openclaw：`openclaw models list --json` + 配置 + probe 并集（AGENT_MODEL_LIST /
@@ -154,10 +154,16 @@ export const AGENT_MODEL_CAPABILITIES: Readonly<Record<string, AgentModelCapabil
   // （agents.ts:191-199）。
   qwen: { catalogSource: "config", modelInjection: "argv" },
 
-  // qwenpaw / mcode：ACP set_model 不支持 session 粒度（会写 agent 级持久配置）
-  // 且无 CLI 目录命令（models.go:298-309、325-331、433-452）。
-  qwenpaw: { catalogSource: "none", modelInjection: "none" },
-  mcode: { catalogSource: "none", modelInjection: "none" },
+  // qwenpaw：Go 判空是因为 ACP session/set_model 会写 agent.json（有副作用），
+  // 但 headless 入口 `task -m provider/model` 是 session 级 override、不落盘，
+  // 且 `qwenpaw models list` 报完整目录（2026-11-17 真机实测）。两条独立通道。
+  qwenpaw: { catalogSource: "cli", modelInjection: "argv" },
+
+  // mcode：`~/.minimax/config.yaml` 里 provider.models / custom_provider.models
+  // 就是已配置目录；`mcode exec -m provider/model` 官方自述「override for this
+  // Run only」（2026-11-17 真机 --help 确认）。Go 的 ACP set_model 限制同样
+  // 不适用于 headless argv。
+  mcode: { catalogSource: "config", modelInjection: "argv" },
 
   // zeroclaw：Go 侧因 ACP session/new 不报目录 + set_model 会写持久配置而判空
   // （models.go:325-331）——但设备端另有 **argv 注入** 通道：
