@@ -122,6 +122,53 @@ describe("MessageDispatcher single chat", () => {
     expect(parsed.content).toBe("ok");
   });
 
+  it("passes the entry agent (content.opsAgent) to the ops scope hook", async () => {
+    // C 端从「opencode - 运维」面板发消息时带上 opsAgent：同机所有运维入口
+    // 共用一个 ops 账号，融云对端丢掉的入口信息只能靠这个消息字段补回来。
+    const deps = makeDeps();
+    const seen: Array<{ text: string; entry?: string }> = [];
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      scopeOpsTurnText: (text, entryAgent) => {
+        seen.push({ text, entry: entryAgent });
+        return `【运维对象】${entryAgent ?? "未指定"}\n\n${text}`;
+      },
+    });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user_1",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({ content: "获取版本号", opsAgent: "opencode" }),
+      },
+      { runTurn: async () => "ok" },
+    );
+    expect(seen).toEqual([{ text: "获取版本号", entry: "opencode" }]);
+  });
+
+  it("ignores a non-string opsAgent instead of failing the turn", async () => {
+    const deps = makeDeps();
+    const seen: Array<string | undefined> = [];
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      scopeOpsTurnText: (text, entryAgent) => { seen.push(entryAgent); return text; },
+    });
+    await dispatcher.handle(
+      {
+        objectName: "RC:TxtMsg",
+        fromUserId: "user_1",
+        toUserId: "rc_node_x",
+        targetId: "rc_node_x",
+        conversationType: 1,
+        content: JSON.stringify({ content: "获取版本号", opsAgent: 123 }),
+      },
+      { runTurn: async () => "ok" },
+    );
+    expect(seen).toEqual([undefined]);
+  });
+
   it("leaves the prompt untouched when no ops scope hook is wired", async () => {
     const deps = makeDeps();
     const seen: string[] = [];

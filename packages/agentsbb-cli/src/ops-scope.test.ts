@@ -57,6 +57,34 @@ describe("resolveOpsScope", () => {
     expect(resolveOpsScope("", agents)).toEqual({ ambiguous: [] });
     expect(resolveOpsScope("openclaw", [])).toEqual({ ambiguous: [] });
   });
+
+  it("入口 agent 兜底：从 opencode 运维面板发「获取版本号」不再被判未指定", () => {
+    // 消息里没有任何 agent 名，但 C 端知道用户是从谁的运维面板进来的。
+    expect(resolveOpsScope("获取版本号", agents, "opencode")).toEqual({
+      target: "opencode",
+      ambiguous: [],
+    });
+  });
+
+  it("入口 agent 大小写/空白容错，统一成清单里的规范写法", () => {
+    expect(resolveOpsScope("获取版本号", agents, " OpenClaw ").target).toBe("openclaw");
+  });
+
+  it("显式点名优先于入口提示：同一段对话里改问另一个智能体", () => {
+    // 用户在 opencode 运维面板里说「看看 codex」——本轮真实意图是 codex，
+    // 入口只是默认值，不能把用户钉死在入口那个对象上。
+    expect(resolveOpsScope("看看 codex", [...agents, "codex"], "opencode").target).toBe("codex");
+  });
+
+  it("入口名不在本机清单里 → 回到未指定（宁可反问，也不能换对象）", () => {
+    expect(resolveOpsScope("获取版本号", agents, "某个改过名的设备")).toEqual({ ambiguous: [] });
+  });
+
+  it("多个显式点名时仍判未确定，入口提示不参与消歧", () => {
+    const r = resolveOpsScope("openclaw 和 qwen 都掉线了", agents, "opencode");
+    expect(r.target).toBeUndefined();
+    expect(r.ambiguous.sort()).toEqual(["openclaw", "qwen"]);
+  });
 });
 
 describe("opsScopeHeader", () => {

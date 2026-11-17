@@ -63,14 +63,42 @@ export interface OpsScopeResolution {
  *
  * 只认「点名的 agent」，不做语义猜测：用户说「帮我看看为什么掉线」而没有
  * 名字时，返回空 —— 交给提示词反问，而不是让模型自己挑一个动手。
+ *
+ * `entryAgent` 是**入口提示**：C 端从「<agent> - 运维」这个入口发消息时随消息
+ * 带上的 agent 名（content.opsAgent）。per-agent 运维账号退役后，同机所有运维
+ * 入口共用一个 ops 账号，入口信息在融云私聊层就丢了 —— 用户在 opencode 的运维
+ * 面板里说「获取版本号」，消息本身没有任何 agent 名，只会被判成「未指定」然后
+ * 反问「你要操作哪个智能体」，看起来像提示词没生效，其实是上下文没带过来。
+ *
+ * 优先级：**用户显式点名 > 入口提示**。同一段对话里说「顺便看看 codex」时，
+ * 显式点名才是本轮真实意图；入口只在该轮没有点名时兜底。
  */
-export function resolveOpsScope(text: string, agents: readonly string[]): OpsScopeResolution {
+export function resolveOpsScope(
+  text: string,
+  agents: readonly string[],
+  entryAgent?: string,
+): OpsScopeResolution {
   const names = normalizeAgentNames(agents);
-  if (!text || names.length === 0) return { ambiguous: [] };
-  const hits = names.filter((name) => mentionPattern(name).test(text));
+  if (names.length === 0) return { ambiguous: [] };
+  const hits = text ? names.filter((name) => mentionPattern(name).test(text)) : [];
   if (hits.length === 1) return { target: hits[0], ambiguous: [] };
   if (hits.length > 1) return { ambiguous: hits };
+  const entry = normalizeEntryAgent(entryAgent, names);
+  if (entry) return { target: entry, ambiguous: [] };
   return { ambiguous: [] };
+}
+
+/**
+ * 把入口 agent 名对齐到本机绑定清单里的**规范写法**（大小写/空白容错）。
+ *
+ * 不匹配就返回空：入口名可能是显示名（用户自定义设备名），不能因为它不在
+ * 清单里就换一个对象操作 —— 宁可回到「反问」。
+ */
+function normalizeEntryAgent(entry: string | undefined, names: readonly string[]): string {
+  const raw = (entry ?? "").trim();
+  if (!raw) return "";
+  const key = raw.toLowerCase();
+  return names.find((name) => name.toLowerCase() === key) ?? "";
 }
 
 /** scope.json 的位置：机器级 ops 的 workdir 根（per-agent 子目录里不放）。 */

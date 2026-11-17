@@ -186,7 +186,7 @@ export interface DispatcherDeps {
    * 返回注入后的 prompt；返回 null 表示本轮跳过（不加抬头）。省略 = 不是
    * 机器级 ops，行为与之前完全一致。
    */
-  scopeOpsTurnText?: (text: string) => string | null;
+  scopeOpsTurnText?: (text: string, entryAgent?: string) => string | null;
   // 设备详情页「系统健康状态 / 会话列表」的数据来源（见 device-status.ts）。
   // 会话表来自 agent-sessions：sessionKey → agent 会话 id。用**函数**而不是对象，
   // 因为 dispatcher 在 run.ts 里先于 agentSessions 构造（同一份快照要等它建好）。
@@ -633,9 +633,15 @@ export class MessageDispatcher {
         return;
       }
       let text = "";
+      // 入口提示：C 端从「<agent> - 运维」那个入口发的消息会带上它
+      // （见 ops-scope.ts 的 resolveOpsScope entryAgent）。per-agent 运维账号
+      // 退役后同机所有入口共用一个 ops 账号，融云对端信息丢了，只有这个消息
+      // 字段还记得「用户是从谁的运维面板进来的」。
+      let entryAgent: string | undefined;
       try {
-        const parsed = JSON.parse(msg.content) as { content?: unknown };
+        const parsed = JSON.parse(msg.content) as { content?: unknown; opsAgent?: unknown };
         text = typeof parsed.content === "string" ? parsed.content : "";
+        entryAgent = typeof parsed.opsAgent === "string" ? parsed.opsAgent : undefined;
       } catch {
         return;
       }
@@ -671,7 +677,7 @@ export class MessageDispatcher {
       // 智能体，没有这条抬头，模型根本无从判断用户说的是哪一个。抬头格式
       // 明确标注「系统注入」，用户原话原样跟在后面，不会被改写。
       // useModel 等命令分支已在上面截走，不会走到这里。
-      const scopedPrompt = this.deps.scopeOpsTurnText?.(text) ?? null;
+      const scopedPrompt = this.deps.scopeOpsTurnText?.(text, entryAgent) ?? null;
       // 私聊也走流式：web 端 chat_stream 帧先逐帧渲染，完成后 command_result
       // / 卡片兜底。sendStream 缺失（测试）时退回整包回复。
       await this.runStreamedTurn({

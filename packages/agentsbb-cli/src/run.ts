@@ -500,8 +500,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
     // ops 不传，仍以进程级 AGENTSBB_OPS_SCOPE 为准。
     ...(opts.opsBoundAgents
       ? {
-          scopeOpsTurnText: (text: string): string => {
-            const resolution = resolveOpsScope(text, opts.opsBoundAgents ?? []);
+          scopeOpsTurnText: (text: string, entryAgent?: string): string => {
+            const resolution = resolveOpsScope(text, opts.opsBoundAgents ?? [], entryAgent);
             // 命令层在模型执行 `agentsbb agent ...` 时读这份文件；写失败只降级
             // 为「命令层不知道本轮对象」（会拒绝启停），不会放行越权。
             void writeOpsScope(resolution.target ?? "").catch((err: unknown) => {
