@@ -120,3 +120,32 @@ func TestPickOpsNodeIgnoresNonOpsRows(t *testing.T) {
 		t.Fatalf("want nil, got %+v", got)
 	}
 }
+
+// 设备列表下发：per-agent 运维退役后（默认关闭），即便库里有存量
+// "<agentRC>_ops" 行也绝不能下发 ops_rongcloud_id —— 那是没有进程应答的
+// 孤儿账号，C 端运维会话连上去就永远不回。这正是线上「小久」现场：
+// 一整批 per-agent ops 存量行 + 唯一在跑的机器级 rc_node_3300776275_ops。
+func TestPerAgentOpsRecordForRetiredByDefault(t *testing.T) {
+	opsByAgentRC := map[string]string{
+		"rc_node_3300776275_opencode": "rc_node_3300776275_opencode_ops",
+		"deveco_3300776275":           "deveco_3300776275_ops",
+	}
+
+	// 默认关闭：不下发，前端回落到机器级 om_rongcloud_id。
+	if rc, ok := perAgentOpsRecordFor("rc_node_3300776275_opencode", opsByAgentRC, false); ok {
+		t.Fatalf("retired per-agent ops must not be emitted, got %q", rc)
+	}
+	if rc, ok := perAgentOpsRecordFor("deveco_3300776275", opsByAgentRC, false); ok {
+		t.Fatalf("retired per-agent ops must not be emitted, got %q", rc)
+	}
+
+	// 回退开关打开：恢复旧行为，下发该 agent 的专属对端。
+	if rc, ok := perAgentOpsRecordFor("deveco_3300776275", opsByAgentRC, true); !ok || rc != "deveco_3300776275_ops" {
+		t.Fatalf("with switch on want deveco_3300776275_ops, got %q ok=%v", rc, ok)
+	}
+
+	// 开关打开但该 agent 没有 per-agent 行：依然不下发。
+	if rc, ok := perAgentOpsRecordFor("grok_3300776275", opsByAgentRC, true); ok {
+		t.Fatalf("no per-agent row must emit nothing, got %q", rc)
+	}
+}

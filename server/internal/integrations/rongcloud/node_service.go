@@ -744,7 +744,10 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 		}
 		// per-agent 运维节点存在时下发专属对端：新前端优先用它开运维会话，
 		// 每个智能体的运维聊天记录在融云侧就是两条独立私聊。
-		if opsRC, ok := opsByAgentRC[n.RongcloudUserID]; ok && opsRC != "" {
+		// per-agent 运维已退役（2026-11，默认关闭，见 perAgentOpsEnabled）：存量行
+		// 没有进程应答，下发会让孩子端运维会话连到孤儿账号永不回复，见
+		// perAgentOpsRecordFor 的注释。
+		if opsRC, ok := perAgentOpsRecordFor(n.RongcloudUserID, opsByAgentRC, s.perAgentOpsEnabled.Load()); ok {
 			record["ops_rongcloud_id"] = opsRC
 			record["has_om_capability"] = true
 		}
@@ -2080,6 +2083,27 @@ func classifyOpsRCUser(rcUserID string, agentRCs map[string]bool) (owner string,
 		return base, true
 	}
 	return "", false
+}
+
+// perAgentOpsRecordFor 决定设备列表是否为这个 agent 下发 ops_rongcloud_id
+// （per-agent 专属运维对端）。
+//
+// per-agent 运维 2026-11 起退役：CLI 不再请求、服务端默认停建（见
+// perAgentOpsEnabled）。但存量 "<agentRC>_ops" 行还在库里，且没有进程应答 ——
+// 一旦下发，C 端运维会话（前端优先用 ops_rongcloud_id）会把消息发给孤儿账号，
+// 表现就是「运维助手在线却永远不回」，而管理端走机器级 ops 一切正常。
+//
+// 所以默认（enabled=false）一律不下发，让前端回落到机器级 om_rongcloud_id
+// （每机唯一在跑的运维进程）。只有显式打开回退开关时才恢复旧行为。
+func perAgentOpsRecordFor(agentRC string, opsByAgentRC map[string]string, enabled bool) (string, bool) {
+	if !enabled {
+		return "", false
+	}
+	rc, ok := opsByAgentRC[agentRC]
+	if !ok || rc == "" {
+		return "", false
+	}
+	return rc, true
 }
 
 // ensureAgentNode creates (or reuses) the rongcloud user + node + device
