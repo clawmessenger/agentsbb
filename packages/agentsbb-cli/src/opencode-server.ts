@@ -603,6 +603,27 @@ export async function runServerSession(opts: RunServerSessionOpts): Promise<RunS
       ...(usage ? { usage } : {}),
     };
   } catch (err) {
+    // 放弃本轮时必须让 opencode 自己也停下来。
+    //
+    // 只 destroy 本地 HTTP 请求**不会**取消生成：opencode 会继续把那一条跑到
+    // 模型自己说完，而它每个会话只允许 1 条并发 —— 这一条不结束，后面每一条
+    // 请求就排在它后面永远等不到响应。2026-11-17 现场就是这样：一条运维消息
+    // 超时 600s 之后，用户下一条「获取版本号」挂了 10 分钟以上，管理端也一起
+    // 哑（设备端日志停在 `im in`，既没有 stream 收尾也没有新帧）。
+    //
+    // abortServerSession 是「让 opencode 自己中止」，比杀进程干净；失败只记
+    // 日志（进程可能已经没了），不能盖住真正的失败原因。
+    if (timedOut || overflow || opts.signal?.aborted) {
+      const abandonedSession = state.sessionID;
+      if (abandonedSession) {
+        void abortServerSession(opts.baseUrl, abandonedSession).catch((abortErr: unknown) => {
+          console.error(
+            "opencode abort session failed:",
+            abortErr instanceof Error ? abortErr.message : abortErr,
+          );
+        });
+      }
+    }
     if (timedOut) throw new Error(`agent turn timeout after ${opts.timeoutMs}ms`);
     if (opts.signal?.aborted) throw new Error("agent turn aborted");
     throw err;

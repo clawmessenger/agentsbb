@@ -399,6 +399,38 @@ const TERMINAL_RESEND_GAP_MS = 600;
 export const PRIVATE_TURN_TIMEOUT_MS = 600_000;
 
 /**
+ * 「停滞」判定：**已经产出过正文**之后，连续这么久没有任何新进展
+ * （正文增量 / 思考增量 / 工具步骤都算进展），就判定这一轮卡死了。
+ *
+ * 为什么需要它：外层墙钟 600s 是按「运维要跑长命令」定的，但最常见的卡死形态
+ * 不是长任务，而是**模型说了半句之后彻底不动**（2026-11-17 现场：运维回了一句
+ * 「要操作哪个智能体」就挂住，前端 3 分钟就提示「可能卡住」，却要等到 10 分钟
+ * 才收尾，用户看到的是「一句话说完还在转圈」）。
+ *
+ * 只对「已产出正文」生效：从头到尾没输出的是真长任务（装依赖、重启服务），
+ * 那种继续由 600s 墙钟兜，不在这里误杀。
+ */
+export const PRIVATE_TURN_STALL_MS = 240_000;
+
+/**
+ * 停滞守卫的判定（纯函数，便于单测）。
+ *
+ * 只在「已经产出过正文、且长时间没有任何新进展」时返回 true —— 从头到尾没
+ * 输出的是长任务（装依赖、重启服务），继续由 600s 墙钟兜，不在这里误杀。
+ */
+export function shouldAbortStalledTurn(input: {
+  aborted: boolean;
+  terminalSent: boolean;
+  producedText: boolean;
+  idleMs: number;
+  stallMs?: number;
+}): boolean {
+  if (input.aborted || input.terminalSent) return false;
+  if (!input.producedText) return false;
+  return input.idleMs >= (input.stallMs ?? PRIVATE_TURN_STALL_MS);
+}
+
+/**
  * 私聊超时占位文案（修复③）：群聊有服务端 relayTurnFailedNote 兜底，私聊
  * 完全由设备端执行 —— 超时后必须回一条明确占位，发送方 UI 才能落定。
  */
@@ -1052,6 +1084,12 @@ export class MessageDispatcher {
     let terminalSent = false;
     /** 轮次开始时刻：日志里打 elapsed，用来回答「这一轮到底跑了多久」。 */
     const turnStartedAt = Date.now();
+    /** 最近一次「有进展」的时刻（正文/思考/工具步骤都算）。见 PRIVATE_TURN_STALL_MS。 */
+    let lastProgressAt = turnStartedAt;
+    /** 本轮是否已经产出过正文：停滞守卫只在这种「说了话之后」才生效。 */
+    let producedText = false;
+    /** 最新正文快照：停滞守卫收尾时要把已经输出的内容一起带走（不能吞掉）。 */
+    let latestText = "";
     /** 超时占位只发一次（内层失败路径与外层兜底都可能触发）。 */
     let timeoutNoticeSent = false;
     /**
@@ -1102,6 +1140,39 @@ export class MessageDispatcher {
             );
           }
         }, PRIVATE_TURN_TIMEOUT_MS)
+      : null;
+    // 停滞守卫（仅私聊）：已经产出正文、之后连续 PRIVATE_TURN_STALL_MS 没有任何
+    // 新进展 —— 这是「模型说了半句就卡住」的典型形态，比 600s 墙钟早得多收尾。
+    // 判据只看「有没有进展」，不看总时长：运维跑长命令时工具步骤会持续上报，
+    // 不停推进的轮次不会被这里掐掉。
+    const stallTimer: ReturnType<typeof setInterval> | null = ctx.conversationType === 1
+      ? setInterval(() => {
+          try {
+            if (controller.signal.aborted || terminalSent) return;
+            const idleMs = Date.now() - lastProgressAt;
+            if (!shouldAbortStalledTurn({
+              aborted: controller.signal.aborted,
+              terminalSent,
+              producedText,
+              idleMs,
+            })) return;
+            terminalSent = true;
+            console.error(
+              `private turn stall guard fired: conv=${ctx.conversationId} req=${ctx.requestMessageId}`
+              + ` idle=${Math.round(idleMs / 1000)}s elapsed=`
+              + `${Math.round((Date.now() - turnStartedAt) / 1000)}s — aborting`,
+            );
+            // 已经输出的正文一起带走：用户至少能看到模型说到哪了。
+            void emit(seq, "failed", latestText, undefined, "turn_timeout");
+            sendTimeoutNoticeIfPrivate("turn_timeout");
+            controller.abort();
+          } catch (err) {
+            console.error(
+              "private turn stall guard failed:",
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }, 15_000)
       : null;
     try {
       // 流式心跳：**所有服务端按序派发的轮次**都从轮次一开始发，不分流式/降级
@@ -1216,8 +1287,14 @@ export class MessageDispatcher {
         );
       };
       const sendDelta = async (delta: string, reasoningDelta?: string, activity?: ActivityStep[]) => {
+        // 任何一路增量都算「这一轮还在推进」（见 PRIVATE_TURN_STALL_MS）。
+        if (delta || reasoningDelta || (activity && activity.length > 0)) {
+          lastProgressAt = Date.now();
+        }
         if (controller.signal.aborted) return;
         snapshot += delta;
+        latestText = snapshot;
+        if (snapshot.trim().length > 0) producedText = true;
         if (reasoningDelta) {
           reasoningSnapshot += reasoningDelta;
           const at = activeReasoningEntry();
@@ -1437,6 +1514,10 @@ export class MessageDispatcher {
       // 私聊兜底墙钟随轮次结束撤掉：正常完成/内层超时先收尾，它就不该再响。
       if (privateGuardTimer !== null) {
         clearTimeout(privateGuardTimer);
+      }
+      // 停滞守卫同理：轮次结束就撤，晚到的一次检查只会重复收尾。
+      if (stallTimer !== null) {
+        clearInterval(stallTimer);
       }
       // 心跳随轮次结束：终帧/取消/失败之后都不再发。
       if (pingTimer !== null) {

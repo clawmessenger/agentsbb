@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
-import { MessageDispatcher, planReadReceipt, resolveTurnVenue, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
+import { MessageDispatcher, planReadReceipt, resolveTurnVenue, shouldAbortStalledTurn, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
 import type { PermissionSnapshot } from "./agent-permissions.js";
 import { createAnsweredTurnStore } from "./answered-turns.js";
 import { TurnIncompleteError } from "./turn-error.js";
@@ -3054,4 +3054,28 @@ describe("chat_stream 终帧补发", () => {
     expect(completed[0].text).toBe(completed[1].text)
     expect(completed[0].stream_id).toBe(completed[1].stream_id)
   })
+});
+
+// 停滞守卫（2026-11-17 现场）：运维回了半句之后彻底不动，前端 3 分钟就提示
+// 「可能卡住」，设备端却要等到 600s 墙钟 —— 用户看到「一句话说完还在转圈」。
+// 判据必须是「已产出正文 + 长时间无进展」，不是「总时长超了」。
+describe("shouldAbortStalledTurn", () => {
+  const base = { aborted: false, terminalSent: false, producedText: true, idleMs: 0 };
+
+  it("已产出正文、停滞达到阈值 → 收尾", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000 })).toBe(true);
+  });
+
+  it("刚有进展（正文/思考/工具步骤）时不触发", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 30_000 })).toBe(false);
+  });
+
+  it("还没产出正文的长任务照跑：装依赖、重启服务不能被误杀", () => {
+    expect(shouldAbortStalledTurn({ ...base, producedText: false, idleMs: 500_000 })).toBe(false);
+  });
+
+  it("已收尾或已中止时不再重复触发", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 999_999, terminalSent: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 999_999, aborted: true })).toBe(false);
+  });
 });

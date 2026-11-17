@@ -182,6 +182,8 @@ interface MockOptions {
   sessionStatus?: number;
   messageStatus?: number;
   abortCalls?: { count: number };
+  /** 延迟多久才回 message（模拟「还在生成」的长回合）。 */
+  messageDelayMs?: number;
 }
 
 async function startMockServe(options: MockOptions): Promise<string> {
@@ -214,16 +216,18 @@ async function startMockServe(options: MockOptions): Promise<string> {
           res.end(JSON.stringify({ message: "upstream boom" }));
           return;
         }
-        // 像真 serve 一样：先建 part、再逐字推 delta、最后 idle。
-        for (const part of parts) {
-          sseRes?.write(`event: message.part.updated\ndata: ${JSON.stringify({ properties: { sessionID: "ses_test", part: { id: part.id, type: part.type } } })}\n\n`);
-          for (const ch of part.text) {
-            sseRes?.write(`event: message.part.delta\ndata: ${JSON.stringify({ properties: { sessionID: "ses_test", partID: part.id, field: "text", delta: ch } })}\n\n`);
+        setTimeout(() => {
+          // 像真 serve 一样：先建 part、再逐字推 delta、最后 idle。
+          for (const part of parts) {
+            sseRes?.write(`event: message.part.updated\ndata: ${JSON.stringify({ properties: { sessionID: "ses_test", part: { id: part.id, type: part.type } } })}\n\n`);
+            for (const ch of part.text) {
+              sseRes?.write(`event: message.part.delta\ndata: ${JSON.stringify({ properties: { sessionID: "ses_test", partID: part.id, field: "text", delta: ch } })}\n\n`);
+            }
           }
-        }
-        sseRes?.write(`event: session.idle\ndata: ${JSON.stringify({ properties: { sessionID: "ses_test" } })}\n\n`);
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ parts: [{ id: "t1", type: "text", text: replyText }] }));
+          sseRes?.write(`event: session.idle\ndata: ${JSON.stringify({ properties: { sessionID: "ses_test" } })}\n\n`);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ parts: [{ id: "t1", type: "text", text: replyText }] }));
+        }, options.messageDelayMs ?? 0);
       });
       return;
     }
@@ -286,6 +290,50 @@ describe("runServerSession", () => {
     // 把 timeoutMs 压到 1ms：POST 还没回来就被中止。
     await expect(runServerSession({ baseUrl, prompt: "p", timeoutMs: 1 }))
       .rejects.toThrow(/agent turn timeout/);
+  });
+
+  // 只 destroy 本地 HTTP 请求不会取消生成：serve 会继续把这一条跑到模型自己
+  // 说完，而它每个会话只允许 1 条并发 —— 这一条不结束，后面每一条都排队等死
+  // （2026-11-17 现场：一条运维消息超时后，整机运维哑了 20 分钟以上）。
+  it("超时后必须让 serve 自己中止本轮，否则会话被占死", async () => {
+    const abortCalls = { count: 0 };
+    const baseUrl = await startMockServe({
+      parts: [{ id: "t1", type: "text", text: "很慢".repeat(20) }],
+      replyText: "x",
+      abortCalls,
+    });
+    await expect(runServerSession({ baseUrl, prompt: "p", timeoutMs: 1 }))
+      .rejects.toThrow(/agent turn timeout/);
+    // abort 是 fire-and-forget，等一次 HTTP 往返落定。
+    for (let i = 0; i < 50 && abortCalls.count === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(abortCalls.count).toBe(1);
+  });
+
+  it("外部中止（chat_stop / 停滞守卫）同样要让 serve 停生成", async () => {
+    const abortCalls = { count: 0 };
+    const baseUrl = await startMockServe({
+      parts: [{ id: "t1", type: "text", text: "写一半" }],
+      replyText: "写一半",
+      abortCalls,
+      messageDelayMs: 2_000,
+    });
+    const controller = new AbortController();
+    const pending = runServerSession({
+      baseUrl,
+      prompt: "p",
+      timeoutMs: 30_000,
+      signal: controller.signal,
+    });
+    // 让会话先建起来，再模拟用户点「停止生成」。
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    await expect(pending).rejects.toThrow(/agent turn aborted/);
+    for (let i = 0; i < 50 && abortCalls.count === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(abortCalls.count).toBe(1);
   });
 });
 
