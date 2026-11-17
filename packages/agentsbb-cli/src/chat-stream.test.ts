@@ -164,9 +164,13 @@ describe("stream-json 解析器", () => {
     expect(agentSupportsReasoning("agy")).toBe(true);
     // C/D 类不在名单：C 类走「缓冲末尾整段」模式，D 类无思考数据源。
     expect(agentSupportsReasoning("openclaw")).toBe(false);
-    expect(agentSupportsReasoning("grok")).toBe(false);
     expect(agentSupportsReasoning("dim")).toBe(false);
     expect(agentSupportsReasoning(undefined)).toBe(false);
+    // 2026-11-17 实测接入（streaming-json / stream-json）：grok、mcode、reasonix
+    // 都有思考增量通道，名单里必须有它们，否则 stdout 不按 JSONL 解析。
+    expect(agentSupportsReasoning("grok")).toBe(true);
+    expect(agentSupportsReasoning("mcode")).toBe(true);
+    expect(agentSupportsReasoning("reasonix")).toBe(true);
   });
 
   // ── qwen（Qwen Code 0.25.3）───────────────────────────────────────────────

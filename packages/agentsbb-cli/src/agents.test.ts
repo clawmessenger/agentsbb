@@ -89,8 +89,17 @@ describe("KNOWN_AGENT_CLIS", () => {
 describe("buildAgentArgs", () => {
   it("claude uses print mode with stream-json and --model", () => {
     expect(buildAgentArgs("claude", "hi", "sonnet-4")).toEqual([
-      "-p", "hi", "--output-format", "stream-json", "--verbose", "--model", "sonnet-4",
+      "-p", "hi", "--output-format", "stream-json", "--verbose",
+      "--include-partial-messages", "--model", "sonnet-4",
     ]);
+  });
+
+  // 不带 --include-partial-messages 时 stream_event 只有壳事件：本机 2.1.325
+  // 实测 0 条 thinking_delta / text_delta —— 思考卡片空、正文整段才落地。
+  it("claude 必须带 --include-partial-messages，思考流与逐字正文才有数据源", () => {
+    const args = buildAgentArgs("claude", "hi");
+    expect(args).toContain("--include-partial-messages");
+    expect(args[args.indexOf("--output-format") + 1]).toBe("stream-json");
   });
 
   it("codex uses exec subcommand with --json and -m", () => {
@@ -165,7 +174,9 @@ describe("buildAgentArgs", () => {
   });
 
   it("omits model flags when no model is given", () => {
-    expect(buildAgentArgs("claude", "hi")).toEqual(["-p", "hi", "--output-format", "stream-json", "--verbose"]);
+    expect(buildAgentArgs("claude", "hi")).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    ]);
     expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi", "--json", "--skip-git-repo-check"]);
     expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi", "--format", "json", "--thinking"]);
     expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "--json", "-m", "hi"]);
@@ -238,11 +249,13 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("codebuddy", "hi")).toEqual([
       "-p", "hi",
       "--output-format", "stream-json", "--verbose",
+      "--include-partial-messages",
       "--port", "0",
     ]);
     expect(buildAgentArgs("codebuddy", "hi", "quukk/glm-5.2")).toEqual([
       "-p", "hi",
       "--output-format", "stream-json", "--verbose",
+      "--include-partial-messages",
       "--port", "0",
     ]);
   });
@@ -325,11 +338,11 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("codearts", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
   });
 
-  it("mcode 走 exec + text，--model provider/model（真机 --help 确认 session 级）", () => {
-    expect(buildAgentArgs("mcode", "hi")).toEqual(["exec", "hi", "--output-format", "text"]);
+  it("mcode 走 exec + stream-json，--model provider/model（真机 --help 确认 session 级）", () => {
+    expect(buildAgentArgs("mcode", "hi")).toEqual(["exec", "hi", "--output-format", "stream-json"]);
     expect(buildModelArgs("mcode", "quukk/glm-5.2")).toEqual(["--model", "quukk/glm-5.2"]);
     expect(buildAgentArgs("mcode", "hi", "quukk/glm-5.2")).toEqual([
-      "exec", "hi", "--output-format", "text", "--model", "quukk/glm-5.2",
+      "exec", "hi", "--output-format", "stream-json", "--model", "quukk/glm-5.2",
     ]);
   });
 
@@ -360,8 +373,8 @@ describe("buildAgentArgs", () => {
     expect(buildModelArgs("dim", "quukk/glm-5.2")).toEqual([]);
   });
 
-  it("grok 走 -p/--single（plain 正文），-m 注入连字符模型 id", () => {
-    expect(buildAgentArgs("grok", "hi")).toEqual(["-p", "hi"]);
+  it("grok 走 -p + streaming-json（思考与正文都是增量），-m 注入连字符模型 id", () => {
+    expect(buildAgentArgs("grok", "hi")).toEqual(["-p", "hi", "--output-format", "streaming-json"]);
     // 目录用斜杠路由（wire 要求），注入用 CLI 的连字符 id（2026-11 实测
     // `grok models` 输出 `quukk-glm-5.2`）。转换是严格双射：`/` ⇄ `-`，
     // 所以 `grok/4.7` 注入回 CLI 认的 `grok-4.7`（不做前缀白名单猜测）。
@@ -370,11 +383,13 @@ describe("buildAgentArgs", () => {
     // 无斜杠的裸 id 原样透传（splitModelRoute 返回 null 时不做改写）
     expect(buildModelArgs("grok", "grok-4.7")).toEqual(["-m", "grok-4.7"]);
     expect(buildModelArgs("grok", undefined)).toEqual([]);
-    expect(buildAgentArgs("grok", "hi", "quukk/glm-5.2")).toEqual(["-p", "hi", "-m", "quukk-glm-5.2"]);
+    expect(buildAgentArgs("grok", "hi", "quukk/glm-5.2")).toEqual([
+      "-p", "hi", "--output-format", "streaming-json", "-m", "quukk-glm-5.2",
+    ]);
   });
 
-  it("reasonix 走 -p + text（不再把 usage help 当回复）", () => {
-    expect(buildAgentArgs("reasonix", "hi")).toEqual(["-p", "hi", "--output-format", "text"]);
+  it("reasonix 走 -p + stream-json（不再把 usage help 当回复，也不再只等整包正文）", () => {
+    expect(buildAgentArgs("reasonix", "hi")).toEqual(["-p", "hi", "--output-format", "stream-json"]);
     expect(buildModelArgs("reasonix", "quukk/glm-5.2")).toEqual([]);
   });
 
@@ -423,6 +438,7 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("codex", "a".repeat(8001), "gpt-5")).toEqual([]);
     expect(buildAgentArgs("claude", "a".repeat(8000))).toEqual([
       "-p", "a".repeat(8000), "--output-format", "stream-json", "--verbose",
+      "--include-partial-messages",
     ]);
   });
 });
@@ -1521,6 +1537,97 @@ describe("runAgentTurn", () => {
     }
   });
 
+  // grok / mcode / reasonix 的端到端（headless 回退路）：思考要进 onReasoningChunk、
+  // 正文要落到终值。三家都是 2026-11-17 真机抓包形状。
+  it("grok：streaming-json 的 thought/text 分别落到思考与正文，终值来自增量拼接", async () => {
+    const fixture = createEchoAgentScript("grok", {
+      stdoutText: [
+        '{"type":"available_commands","tools":[]}',
+        '{"type":"thought","data":"想"}',
+        '{"type":"text","data":"好"}',
+        '{"type":"text","data":"的"}',
+        '{"type":"end","sessionId":"01a1e8a0-6291-7ad1-a346-d39f38e8fa57"}',
+      ].join("\n") + "\n",
+    });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "grok",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("好的");
+      expect(reasoning.join("")).toBe("想");
+      expect(chunks.join("")).toBe("好的");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("mcode：item 增量上屏，exec.completed.result.output 是权威终值", async () => {
+    const fixture = createEchoAgentScript("mcode", {
+      stdoutText: [
+        '{"type":"item.started","item":{"id":"m:reasoning","type":"reasoning","contentDelta":"想"}}',
+        '{"type":"item.updated","item":{"id":"m:message","type":"agent_message","contentDelta":"好的"}}',
+        '{"type":"item.completed","item":{"id":"m:message","type":"agent_message","content":"好的"}}',
+        '{"type":"exec.completed","result":{"output":"好的"}}',
+      ].join("\n") + "\n",
+    });
+    try {
+      const reasoning: string[] = [];
+      const chunks: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "mcode",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: (c) => { chunks.push(c); },
+      });
+      expect(out).toBe("好的");
+      expect(reasoning.join("")).toBe("想");
+      // 快照（item.completed / exec.completed）按前缀换算吸收，不重复上屏
+      expect(chunks.join("")).toBe("好的");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("reasonix：kind=reasoning/text 是增量，result 是权威终值", async () => {
+    const fixture = createEchoAgentScript("reasonix", {
+      stdoutText: [
+        '{"kind":"turn_status","status":"queued"}',
+        '{"kind":"reasoning","text":"想"}',
+        '{"kind":"text","text":"好"}',
+        '{"kind":"message","text":"好的","reasoning":"想"}',
+        '{"type":"result","subtype":"success","result":"好的"}',
+      ].join("\n") + "\n",
+    });
+    try {
+      const reasoning: string[] = [];
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "reasonix",
+        prompt: "hi",
+        timeoutMs: 30_000,
+        // reasonix 默认路由是 ACP（acp 子命令）；这里钉的是 ACP 起不来时的
+        // headless 回退路，所以显式关掉。
+        disableAcp: true,
+        onReasoningChunk: (c) => { reasoning.push(c); },
+        onChunk: () => {},
+      });
+      expect(out).toBe("好的");
+      // message 快照里的 reasoning 不得二次上屏
+      expect(reasoning.join("")).toBe("想");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   // traecli / qodercli：exec --json 与 stream-json 的 thought 字段待装机实测
   // （报告三点存疑之二）→ 宽松匹配分支。fixture 按「字段名候选」构造，
   // 断言宽松匹配命中且不误吞正文。
@@ -1541,6 +1648,33 @@ describe("runAgentTurn", () => {
     expect(parseStreamJsonLine('{"type":"assistant","thought":""}')).toBeNull();
     expect(parseStreamJsonLine('{"type":"assistant","thought":{"extra":1}}')).toBeNull();
     expect(parseStreamJsonLine('{"type":"assistant"}')).toBeNull();
+  });
+
+  // grok / mcode / reasonix：2026-11-17 真机抓包形状（分别为 streaming-json
+  // 与 stream-json）。此前它们跑 plain / text，思考 0 字、正文整段才落地。
+  it("grok：thought/data 进思考通道，text/data 进正文通道", () => {
+    expect(parseStreamJsonLine('{"type":"thought","data":"想"}')).toEqual({ reasoning: "想" });
+    expect(parseStreamJsonLine('{"type":"text","data":"好的"}')).toEqual({ text: "好的" });
+    expect(parseStreamJsonLine('{"type":"available_commands","tools":[]}')).toBeNull();
+    expect(parseStreamJsonLine('{"type":"end","sessionId":"01a1e8a0-6291-7ad1-a346-d39f38e8fa57"}')).toBeNull();
+  });
+
+  it("mcode：item 增量走 contentDelta，exec.completed 才是权威全文", () => {
+    expect(parseStreamJsonLine('{"type":"item.updated","item":{"id":"a:reasoning","type":"reasoning","contentDelta":"想"}}'))
+      .toEqual({ reasoning: "想" });
+    expect(parseStreamJsonLine('{"type":"item.updated","item":{"id":"a:message","type":"agent_message","contentDelta":"好的"}}'))
+      .toEqual({ text: "好的" });
+    expect(parseStreamJsonLine('{"type":"exec.completed","result":{"output":"好的"}}'))
+      .toEqual({ text: "好的" });
+    // item.completed 的 content 是快照（正文已由增量上屏），不当增量再发一次
+    expect(parseStreamJsonLine('{"type":"item.completed","item":{"type":"agent_message","content":"好的"}}'))
+      .toBeNull();
+  });
+
+  it("reasonix：kind 判型（reasoning / text 是增量），message 快照不重复上屏", () => {
+    expect(parseStreamJsonLine('{"kind":"reasoning","text":"想"}')).toEqual({ reasoning: "想" });
+    expect(parseStreamJsonLine('{"kind":"text","text":"好的"}')).toEqual({ text: "好的" });
+    expect(parseStreamJsonLine('{"kind":"message","text":"好的","reasoning":"想"}')).toBeNull();
   });
 
   // 这一组钉的是 **headless 回退路**（ACP 起不来时走的就是它），所以显式

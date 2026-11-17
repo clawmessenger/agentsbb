@@ -399,6 +399,11 @@ const STREAM_JSON_AGENTS = new Set([
   "claude", "codex", "opencode", "hermes", "qwen",
   "cursor-agent", "codebuddy", "pi", "omp", "kimi",
   "traecli", "qodercli", "qoderclicn", "dsh", "agy",
+  // 2026-11-17 实测接入（--help + 真机事件抓包都验过）：
+  // grok `streaming-json`、mcode `stream-json`、reasonix `stream-json`。
+  // ⚠️ 这个名字集合同时决定「stdout 是否按 JSONL 解析」：漏加会让 JSONL
+  // 整段当正文上屏（比没有思考更糟），改 argv 时必须同步加。
+  "grok", "mcode", "reasonix",
 ]);
 
 export function agentSupportsReasoning(name: string | undefined): boolean {
@@ -412,6 +417,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     // stream-json：逐行 JSON 事件流（thinking_delta / text_delta 可解析，
     // 同时是思考流数据源）。--verbose 是 stream-json 的前置要求。
     "--output-format", "stream-json", "--verbose",
+    // ⚠️ --include-partial-messages 是思考流与逐字正文的**唯一**开关：
+    // 不带它时 stream_event 只有 message_start / message_stop 这类壳事件，
+    // thinking_delta 与 text_delta 都不上报（2026-11-17 本机 2.1.325 实测：
+    // 带它 9 条 thinking_delta + 1 条 text_delta，不带则 0 条）。
+    // 少这一个参数，web 端就只剩「转圈 → 整段蹦出」，思考卡片永远是空的。
+    "--include-partial-messages",
     // 会话续接：同一个群/单聊/讨论组里的下一轮接在上一条会话后面（见
     // agent-sessions.ts）。id 由上一轮的 result/system.init 事件带回来。
     ...(ctx?.resumeSessionId ? ["--resume", ctx.resumeSessionId] : []),
@@ -529,6 +540,10 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   codebuddy: (prompt, _model, _sessionKey, ctx) => [
     "-p", prompt,
     "--output-format", "stream-json", "--verbose",
+    // 同 claude：codebuddy 是 Claude Code 分支，--include-partial-messages
+    // （--help 实机确认存在）才吐 thinking_delta / text_delta；不带只有整段
+    // assistant 消息，思考与逐字正文都拿不到。
+    "--include-partial-messages",
     // ⚠️ 不能带 --input-format stream-json（上游 daemon 同款参数在这里是坑）：
     // 它把 stdin 当「流式输入消息」消费，而设备的 stdin 在 spawn 后立即关闭 ——
     // 空 stdin 让 codebuddy 静默 exit 0、一个事件都不吐（2026-11-10 实测：
@@ -684,7 +699,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // without starting the TUI」；不带 --output-format 时默认 text。裸 `mcode`
   // 在无 TTY 下直接拒绝（"interactive mode requires a TTY"）。
   mcode: (prompt, model) => [
-    "exec", prompt, "--output-format", "text",
+    // stream-json：官方 --help 的取值是 text / json / stream-json。实测
+    // 0.7.6（2026-11-17）事件形状：
+    //   {"type":"item.started","item":{"id":"…:reasoning","type":"reasoning","contentDelta":"Th"}}
+    //   {"type":"item.updated","item":{…,"contentDelta":"…"}}   ← 思考/正文增量
+    //   {"type":"item.completed","item":{…,"content":"全文"}}   ← 快照
+    //   {"type":"exec.completed","result":{"output":"全文"}}    ← 权威全文
+    // 用 text 时思考全丢、正文一次性落地（web 端只看到转圈）。
+    "exec", prompt, "--output-format", "stream-json",
     // `mcode exec --model provider/model`（官方「override for this Run only」），
     // 真机 --help 确认；--model 加在 exec 子命令后，不是顶层。
     ...buildModelArgs("mcode", model),
@@ -714,6 +736,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // exits），默认 --output-format plain 即纯正文。裸 `grok [PROMPT]` 是 TUI。
   grok: (prompt, model) => [
     "-p", prompt,
+    // streaming-json：实测 1.0.77（2026-11-17）逐行事件流——
+    //   {"type":"thought","data":"The"}    ← 思考增量
+    //   {"type":"text","data":"好的"}       ← 正文增量
+    //   {"type":"end","sessionId":"…"}      ← 收尾（无 result 全文）
+    // 默认 plain 只给最后一坨正文：思考 0 字、正文一次性落地。
+    // 注意 partial 只对 streaming-messages-json 生效（实测会告警并忽略），
+    // streaming-json 本身已经是增量。
+    "--output-format", "streaming-json",
     // 模型选择：`-m` 收连字符 id（`quukk-glm-5.2`），由 buildModelArgs 的 grok
     // 分支从 wire 路由转换而来（2026-11 实测 `grok models` 的输出形状）。
     ...buildModelArgs("grok", model),
@@ -723,7 +753,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 是 TUI；无参数时它打印 usage help —— 2026-11-10 现场 reasonix/zeroclaw
   // 的「回复」就是这份 help。
   reasonix: (prompt) => [
-    "-p", prompt, "--output-format", "text",
+    "-p", prompt,
+    // stream-json：实测 2.58.1（2026-11-17）逐行事件流——
+    //   {"kind":"reasoning","text":"用户"}  ← 思考增量
+    //   {"kind":"text","text":"好的"}        ← 正文增量
+    //   {"kind":"message","text":"好的"}     ← 快照
+    //   {"type":"result","result":"好的"}    ← claude 形收尾
+    // 旧策略给 --output-format text，正文与思考都只能等最后一坨。
+    "--output-format", "stream-json",
   ],
   // zeroclaw（ZeroClaw，Rust）：`agent` 子命令是唯一的对话入口，且**必须**
   // 带 `-a/--agent <alias>`（没有默认 agent，缺别名直接打 usage help 退出）
@@ -1416,6 +1453,8 @@ export function isTextSnapshotLine(line: string): boolean {
   const event = parsed as Record<string, unknown>;
   if (event.v === DSH_PROTOCOL_VERSION) return event.type === "result";
   if (event.type === "result" && typeof event.result === "string") return true;
+  // mcode：exec.completed.result.output 是整轮权威全文（增量已逐条上屏）
+  if (event.type === "exec.completed") return true;
   if (event.type === "assistant") {
     const content = (event.message as Record<string, unknown> | undefined)?.content;
     return Array.isArray(content);
@@ -1566,6 +1605,25 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     return null;
   }
 
+  // --- mcode（Minimax Code，exec --output-format stream-json）---
+  // 实测 0.7.6（2026-11-17）：item.started / item.updated 带 contentDelta（增量），
+  // item.completed 带 content（整段快照，跳过不比，交给 exec.completed 兜底）。
+  // 思考与正文共用一个 item 结构，靠 item.type 区分（reasoning / agent_message）。
+  if (event.type === "item.started" || event.type === "item.updated") {
+    const item = event.item as Record<string, unknown> | undefined;
+    const delta = typeof item?.contentDelta === "string" ? item.contentDelta : "";
+    if (!delta) return null;
+    if (item?.type === "reasoning") return { reasoning: delta };
+    if (item?.type === "agent_message") return { text: delta };
+    return null;
+  }
+  if (event.type === "exec.completed") {
+    const result = event.result as Record<string, unknown> | undefined;
+    // 权威全文。消费端按快照前缀换算吸收，已流出的增量不会重复上屏。
+    if (typeof result?.output === "string" && result.output) return { text: result.output };
+    return null;
+  }
+
   // --- pi / omp：message_update.assistantMessageEvent ---
   // 上游 pi.go:545-559：thinking_delta / text_delta 的增量都在 delta 字段。
   if (event.type === "message_update") {
@@ -1621,6 +1679,31 @@ export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
     // 正文提取由 extractStreamJsonFinalText 的 agy 分支拿 result.response，
     // 这里不产出增量（终态事件；过程流的正文已由 step_update 增量上屏）。
     return null;
+  }
+
+  // --- reasonix（-p --output-format stream-json）---
+  // 实测 2.58.1（2026-11-17）：kind 判型（reasoning / text 都是增量），
+  // message 是整段快照（跳过，末尾还有 claude 形 result 兜底）。
+  if (event.kind === "reasoning" && typeof event.text === "string" && event.text) {
+    return { reasoning: event.text };
+  }
+  if (event.kind === "text" && typeof event.text === "string" && event.text) {
+    return { text: event.text };
+  }
+  // message 是整轮快照（text + reasoning 都在里面）：正文交给结尾的 result，
+  // 思考已由增量上屏；不在这里再吐一遍，否则思考会重复。
+  if (event.kind === "message") return null;
+
+  // --- grok（-p --output-format streaming-json）---
+  // 实测 1.0.77（2026-11-17）：{"type":"thought"|"text","data":"…"} 都是增量，
+  // 没有 part / text 字段（与 hermes / opencode 同名 type 靠 data 区分），
+  // 收尾 end 帧不带正文。放在 hermes 之前：先按 data 认领，再让位给别的族。
+  if (event.type === "thought" && typeof event.data === "string" && event.data) {
+    return { reasoning: event.data };
+  }
+  if (event.type === "text" && typeof event.data === "string" && event.data
+    && event.part === undefined && typeof event.text !== "string") {
+    return { text: event.data };
   }
 
   // --- 宽松思考匹配（traecli exec --json / qodercli stream-json）---
@@ -1720,6 +1803,10 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
   // pi/omp 的 message_update.assistantMessageEvent.delta 是增量（无 result 帧，
   // 终值就是增量拼接）。
   const piDeltas: string[] = [];
+  // grok streaming-json 没有 result 帧：{"type":"text","data":…} 增量拼起来才是终值。
+  const grokDeltas: string[] = [];
+  // mcode 的权威全文在 exec.completed.result.output（增量只是过程）。
+  let mcodeResult: string | undefined;
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) continue;
@@ -1771,6 +1858,18 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
       const inner = event.assistantMessageEvent as Record<string, unknown> | undefined;
       if (inner?.type === "text_delta" && typeof inner.delta === "string" && inner.delta) {
         piDeltas.push(inner.delta);
+      }
+    }
+    // grok：{"type":"text","data":…} 增量（thought 帧不是正文）
+    if (event.type === "text" && typeof event.data === "string" && event.data
+      && event.part === undefined && typeof event.text !== "string") {
+      grokDeltas.push(event.data);
+    }
+    // mcode：exec.completed.result.output 是整轮权威全文
+    if (event.type === "exec.completed") {
+      const result = event.result as Record<string, unknown> | undefined;
+      if (typeof result?.output === "string" && result.output.trim()) {
+        mcodeResult = result.output;
       }
     }
     if (event.event === "result") {
@@ -1831,6 +1930,13 @@ export function extractStreamJsonFinalText(raw: string): string | undefined {
     const pi = piDeltas.join("");
     if (pi.trim().length > 0) return pi;
   }
+  // grok：无 result 帧同上。
+  if (grokDeltas.length > 0) {
+    const gk = grokDeltas.join("");
+    if (gk.trim().length > 0) return gk;
+  }
+  // mcode：权威全文优先于增量拼接。
+  if (mcodeResult !== undefined && mcodeResult.trim().length > 0) return mcodeResult;
   const joined = texts.join("\n").trim();
   return joined.length > 0 ? joined : undefined;
 }
