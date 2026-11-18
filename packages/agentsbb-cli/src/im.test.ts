@@ -3079,3 +3079,86 @@ describe("shouldAbortStalledTurn", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 999_999, aborted: true })).toBe(false);
   });
 });
+
+describe("MessageDispatcher 新开会话", () => {
+  const privateMsg = (text: string) => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user-1",
+    toUserId: "node-a",
+    targetId: "node-a",
+    conversationType: 1,
+    content: JSON.stringify({ content: text }),
+  });
+
+  it("只清这个私聊对端的会话，且绝不花一轮 agent", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const cleared: string[] = [];
+    await dispatcher.handle(privateMsg("新开会话"), {
+      runTurn: async () => {
+        throw new Error("「新开会话」不能进 agent：它该做的是清会话，不是回答");
+      },
+      clearSession: (key) => cleared.push(key),
+    });
+    // 键必须只覆盖这一个对端：用户 A 让 agent 重开，不该影响用户 B 的会话。
+    expect(cleared).toEqual(["cm-private-user-1"]);
+    expect(deps.sent).toHaveLength(1);
+    expect(JSON.parse(deps.sent[0].content).content).toContain("新会话");
+  });
+
+  it("服务端下发的 reset_session 清掉该会话 id 的所有形态", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const seen: string[] = [];
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "server_node",
+        toUserId: "node-a",
+        targetId: "node-a",
+        conversationType: 1,
+        content: JSON.stringify({
+          request_id: "reset-1",
+          service: "discussion",
+          action: "reset_session",
+          params: { conversation_id: "group_9", venue: "group" },
+        }),
+      },
+      {
+        runTurn: async () => {
+          throw new Error("reset_session 不该开一轮 agent");
+        },
+        clearSessionsForConversation: (id) => {
+          seen.push(id);
+          return 2;
+        },
+      },
+    );
+    expect(seen).toEqual(["group_9"]);
+    // 重置没有回执：服务端是广播式下发，不回包也不会有人等。
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("reset_session 缺会话 id 时安全忽略", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let called = 0;
+    await dispatcher.handle(
+      {
+        objectName: "command",
+        fromUserId: "server_node",
+        toUserId: "node-a",
+        targetId: "node-a",
+        conversationType: 1,
+        content: JSON.stringify({
+          request_id: "reset-2",
+          service: "discussion",
+          action: "reset_session",
+          params: {},
+        }),
+      },
+      { runTurn: async () => "", clearSessionsForConversation: () => { called += 1; return 0 } },
+    );
+    expect(called).toBe(0);
+  });
+});

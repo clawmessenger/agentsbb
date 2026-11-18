@@ -16,6 +16,7 @@ import {
   extractOpenclawEnvelopeDetails,
   extractOpenclawReply,
   extractStreamJsonFinalText,
+  extractSessionId,
   hardStopPartialText,
   grokCliModelId,
   grokRouteFromCliModelId,
@@ -135,6 +136,30 @@ describe("buildAgentArgs", () => {
     ]);
     // 不带键时参数形状不变（老行为、老测试）
     expect(buildAgentArgs("openclaw", "hi", "m1")).not.toContain("--session-key");
+  });
+
+  // grok / kimi 原来只跑一次性回合，续接参数没接 —— 会话表里存了 id 却从不使用，
+  // 表现为「每句话都像换了个新对话」。两家都实测过（2026-11-18）：带上一轮的 id
+  // 能答出上一轮记住的数字，且回同一个 id。
+  it("grok 带 --resume 续接该会话（-c 是「本目录最近一条」，会串台）", () => {
+    const sid = "01a1ecef-3b98-7070-b2eb-ee7b5c22607a";
+    expect(buildAgentArgs("grok", "hi", undefined, undefined, { resumeSessionId: sid })).toEqual([
+      "-p", "hi", "--output-format", "streaming-json", "--resume", sid,
+    ]);
+    expect(buildAgentArgs("grok", "hi")).not.toContain("--resume");
+  });
+
+  it("kimi 带 --session 续接该会话", () => {
+    const sid = "session_43b264e7-a286-439d-8685-a0f77eb4af58";
+    expect(buildAgentArgs("kimi", "hi", undefined, undefined, { resumeSessionId: sid })).toEqual([
+      "-p", "hi", "--output-format", "stream-json", "--session", sid,
+    ]);
+    expect(buildAgentArgs("kimi", "hi")).not.toContain("--session");
+  });
+
+  it("grok 的 sessionId 是 camelCase 收尾帧，必须能取到（取不到则续接静默失效）", () => {
+    expect(extractSessionId('{"type":"end","stopReason":"end_turn","sessionId":"01a1ecef-3b98-7070-b2eb-ee7b5c22607a"}'))
+      .toBe("01a1ecef-3b98-7070-b2eb-ee7b5c22607a");
   });
 
   it("不支持会话键的 agent 忽略它（opencode/hermes 每轮本就是新会话）", () => {

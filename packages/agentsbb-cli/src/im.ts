@@ -45,6 +45,7 @@ import {
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
 import { formatUseModelAck, parseUseModelCommand, routeInCatalog, type UseModelCommand } from "./use-model.js";
+import { isNewSessionCommand, newSessionAck } from "./session-command.js";
 import type { UserModelStore } from "./user-models.js";
 import type { AgentDefaultModelStore } from "./agent-default-model.js";
 import {
@@ -286,6 +287,23 @@ export interface TurnRunner {
     sessionKey?: string,
     opts?: TurnOptions,
   ) => Promise<string>;
+  /**
+   * 忘掉某个会话键的 agent 会话 id：下一轮从新会话开始（用户发「新开会话」时用）。
+   *
+   * 只清映射、不删 agent 自己的会话文件 —— 各家把会话存在自己的目录里，删了
+   * 就再也找不回来，而用户要的是「这段对话从这里重新开始」，不是「销毁历史」。
+   * 可选：测试里的假 TurnRunner 不实现也不影响其它路径。
+   */
+  clearSession?: (sessionKey: string) => void;
+  /**
+   * 忘掉**同一个会话 id** 在所有形态（单聊/群聊/聊天室/讨论组）下的会话，
+   * 返回清掉的条数。
+   *
+   * 群聊/讨论组里用户发「新开会话」时由服务端下发：房间里既有闲聊中继的
+   * cm-chatroom-<id>，也有正式圆桌的 cm-discussion-<id>，只清一种会出现
+   * 「闲聊是新的、讨论还记着旧的」。
+   */
+  clearSessionsForConversation?: (conversationId: string) => number;
 }
 
 // 一轮 your_turn 的会话形态。三种场合共用同一条 IM 命令：//   - group    普通群组（融云 group）闲聊的按序中继，服务端提示词就是
@@ -702,6 +720,23 @@ export class MessageDispatcher {
         await this.handleUseModelCommand(msg.fromUserId, useModel);
         return;
       }
+      // 「新开会话」：用户要这段私聊从新会话重新开始。
+      //
+      // 必须在进 agent 之前截住 —— 放行的话这句会被当成问题问给 agent，
+      // 而 agent 正好带着它该忘掉的那段上下文，答一句「好的我记住了」，
+      // 会话却一点没变（用户视角：说了没用）。
+      // 只清「这个私聊对端」这一条键：用户 A 让 agent 重开，不该影响用户 B。
+      if (isNewSessionCommand(text)) {
+        const key = turnSessionKey("private", msg.fromUserId);
+        turns.clearSession?.(key);
+        const agent = this.deps.agentName || this.deps.permissionNodeId || "agent";
+        await this.deps.send(
+          msg.fromUserId,
+          "RC:TxtMsg",
+          JSON.stringify({ content: newSessionAck("private", agent) }),
+        );
+        return;
+      }
       // 机器级运维助手：把「本轮运维对象」钉在消息上（见 ops-scope.ts）。
       //
       // 这里确实拼进了 prompt —— 与「行为规范只走指令层」的惯例不同，因为
@@ -783,6 +818,25 @@ export class MessageDispatcher {
       }
       if (cmd.action === ROLE_RECOMMEND_ACTION) {
         await this.handleRoleRecommend(msg, cmd, turns);
+        return;
+      }
+      // 服务端下发的「新开会话」：群聊/讨论组里用户发的指令由服务端识别，
+      // 它清完自己的中继历史后给每个成员节点私发这一条，负责 agent 侧那一半。
+      //
+      // 清的是「这个会话 id 下的所有形态」（cm-chatroom-<id> 与
+      // cm-discussion-<id> 一起），否则会出现「群里闲聊是新的、圆桌讨论还
+      // 记着旧的」。幂等：没有记录时清 0 条，不报错。
+      if (cmd.action === "reset_session") {
+        const p = (cmd.params ?? {}) as Record<string, unknown>;
+        const convId = ["conversation_id", "chatroom_id", "chatroomId", "group_id", "groupId"]
+          .map((key) => p[key])
+          .find((value): value is string => typeof value === "string" && value.length > 0) ?? "";
+        if (!convId) {
+          console.warn("im in: reset_session without conversation id, ignored");
+          return;
+        }
+        const cleared = turns.clearSessionsForConversation?.(convId) ?? 0;
+        console.log(`im in: reset_session conversation=${convId} cleared=${cleared}`);
         return;
       }
       if (cmd.action !== "your_turn") {

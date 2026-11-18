@@ -662,6 +662,21 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // 只有私聊轮次非空 —— 绝不拼进 prompt。
         ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
       })),
+    // 用户发「新开会话」：只清「会话键 → agent 会话 id」的映射，下一轮没有
+    // resumeSessionId 自然就是新会话。agent 自己的会话文件保持原样（历史不销毁）。
+    clearSession: (sessionKey) => {
+      agentSessions.clear(sessionKey);
+      console.log(`session reset: ${sessionKey}`);
+    },
+    // 群聊/讨论组的新开会话：同一个会话 id 下所有形态一起清（闲聊中继
+    // cm-chatroom-<id> 与正式圆桌 cm-discussion-<id> 都在里面）。
+    clearSessionsForConversation: (conversationId) => {
+      const suffix = `-${conversationId}`;
+      const keys = Object.keys(agentSessions.snapshot()).filter((key) => key.endsWith(suffix));
+      for (const key of keys) agentSessions.clear(key);
+      console.log(`session reset: conversation=${conversationId} cleared=${keys.length}`);
+      return keys.length;
+    },
   };
   const queue = new SessionQueue({
     concurrencyPerConversation: 1,

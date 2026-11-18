@@ -598,8 +598,12 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // 全链路复用 stream-json 管线（Kimi Code 是 Claude Code 协议族的实现，
   // 事件形状同构，claude 分支直接消化）。仍不注入 --model（它的 -m 只认自家
   // 别名，见 buildModelArgs 的 kimi 分支）。
-  kimi: (prompt, model) => [
+  kimi: (prompt, model, _sessionKey, ctx) => [
     "-p", prompt, "--output-format", "stream-json",
+    // 会话续接：`-S/--session <id>`（2026-11-18 实测 2.5.2：带上
+    // `session_x` 能答出上一轮记住的数字，meta 事件回同一个 session_id）。
+    // 不用 `-c`：那是「本目录最近一条」，同机多会话会串台。
+    ...(ctx?.resumeSessionId ? ["--session", ctx.resumeSessionId] : []),
     // 模型选择：`-m` 收 provider/model alias（见 buildModelArgs 的 kimi 分支，
     // 2026-11 用 `kimi provider list --json` 实测确认）。
     ...buildModelArgs("kimi", model),
@@ -734,7 +738,7 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // grok（xAI Grok Build）：`-p/--single <PROMPT>` 官方 headless 单轮
   // （grok --help：Single-turn prompt. Prints the response to stdout and
   // exits），默认 --output-format plain 即纯正文。裸 `grok [PROMPT]` 是 TUI。
-  grok: (prompt, model) => [
+  grok: (prompt, model, _sessionKey, ctx) => [
     "-p", prompt,
     // streaming-json：实测 1.0.77（2026-11-17）逐行事件流——
     //   {"type":"thought","data":"The"}    ← 思考增量
@@ -744,6 +748,10 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     // 注意 partial 只对 streaming-messages-json 生效（实测会告警并忽略），
     // streaming-json 本身已经是增量。
     "--output-format", "streaming-json",
+    // 会话续接：`-r/--resume <id>`（2026-11-18 实测 1.0.77：第二轮带上一轮的
+    // sessionId 能答出上一轮记住的数字，end 事件回同一个 id）。`-c` 是「本目录
+    // 最近一条」，多会话共用一个 cwd 时会串台，不能用。
+    ...(ctx?.resumeSessionId ? ["--resume", ctx.resumeSessionId] : []),
     // 模型选择：`-m` 收连字符 id（`quukk-glm-5.2`），由 buildModelArgs 的 grok
     // 分支从 wire 路由转换而来（2026-11 实测 `grok models` 的输出形状）。
     ...buildModelArgs("grok", model),
@@ -1481,6 +1489,9 @@ export function isTextSnapshotLine(line: string): boolean {
  *   · claude / qwen / codebuddy / hermes：`{"type":"system","subtype":"init",
  *     "session_id":"…"}`；末尾 result 事件带同一个值；
  *   · opencode：`sessionID`（`--format json` 的 step / part 事件）；
+ *   · grok：`{"type":"end","sessionId":"…"}`（streaming-json 的收尾帧，camelCase
+ *     的 sessionId —— 少写一个大小写就永远是 null，续接静默失效）；
+ *   · kimi：`{"role":"meta","type":"session.resume_hint","session_id":"session_…"}`；
  *   · codex：`{"type":"thread.started","thread_id":"…"}`（本轮不启用续接，
  *     但 id 照收，打开时不用再改解析）。
  *
@@ -1498,7 +1509,7 @@ export function extractSessionId(line: string): string | null {
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const event = parsed as Record<string, unknown>;
-  for (const key of ["session_id", "sessionID", "thread_id", "threadId"]) {
+  for (const key of ["session_id", "sessionID", "sessionId", "thread_id", "threadId"]) {
     const value = event[key];
     if (isSessionId(value)) return value;
   }
