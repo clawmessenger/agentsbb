@@ -400,6 +400,12 @@ func (h *chatroomRelayHub) StartRelay(ctx context.Context, chatroomRCID, request
 	// allMembers 是参与接力的成员全集（顺序即接龙顺序）。定向只从它里面挑
 	// 子集，绝不新增、绝不重排。
 	allMembers := relayMembersFor(memberRows)
+	// 「新开会话」：用户要求这个房间从新会话重新聊。拦在中继之前 —— 放行的话
+	// 这句会被当成话题交给成员，agent 带着它该忘掉的上下文答一句「好的」，
+	// 会话却一点没变。成员校验已在上面做过（陌生人不能重置别人的房间）。
+	if isNewSessionCommandText(text) {
+		return h.resetRoomSessions(ctx, chatroomRCID, "chatroom", allMembers)
+	}
 	// 讨论组 vs 聊天室用哪个开关：这个房间**有讨论行**就是讨论组（allow_discussion），
 	// 没有就是普通聊天室（allow_chatroom）。判定口径与下面取议题用的是同一次查询，
 	// 不额外多打一次库。

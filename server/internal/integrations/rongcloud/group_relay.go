@@ -41,6 +41,11 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		return errRelayResult(403, "仅群成员可以发起对话")
 	}
 	speakers := relayMembersFromGroup(aiMembers)
+	// 「新开会话」：同上（聊天室路径），在权限闸门之前拦 —— 重置是「清记忆」，
+	// 不是「发言」，没有 allow_group 的成员也该被清（它以后可能被打开）。
+	if isNewSessionCommandText(text) {
+		return h.resetRoomSessions(ctx, groupID, "group", speakers)
+	}
 	// 权限闸门（迁移 607）：allow_group=false 的 agent 不参与群聊接力。
 	// 一次批量查询就够（按 rc id），不按成员逐个查 —— 群成员数 × 每条消息都查
 	// 一次会把「有人说话」变成一串 N+1。
