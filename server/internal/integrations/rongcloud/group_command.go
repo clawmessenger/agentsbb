@@ -3,6 +3,7 @@ package rongcloud
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -405,16 +406,48 @@ func dedupeUserIDs(values []string) []string {
 }
 
 // containsAgentNode reports whether the member list already includes an agent
-// node. Node RongCloud ids are namespaced rc_node_<machineKey>[_<agent>] (see
-// node_service.go), so the prefix is the cheap, DB-free check the create path
-// needs.
+// node. This is the cheap, DB-free check the create path needs to decide
+// whether to seed a fallback agent.
+//
+// 节点融云 id 有两代形状（与 CLI 的 isPeerAgentUserId 同源，见
+// packages/agentsbb-cli/src/agent-permissions.ts）：
+//   - 机器节点 / 旧注册的 agent 节点：`rc_node_<机器号>[_<agent>]`；
+//   - 2026-11-10 起 agent 节点注册为 `<agent>_<机器号>`（`pi_3300776275`）；
+//   - 远古 openclaw 平台账号：`claw_<id>`。
+//
+// 真人的融云 userId 是纯数字，两种形状都不会命中。只认 `rc_node_` 前缀的旧
+// 判据在这里翻过车：勾了新格式 agent 建群，containsAgentNode 返回 false，
+// fallback 照样把一个没人选的 agent（旧格式 opencode 节点）塞进每个新群。
 func containsAgentNode(userIDs []string) bool {
 	for _, id := range userIDs {
-		if strings.HasPrefix(id, "rc_node_") {
+		if isAgentNodeUserID(id) {
 			return true
 		}
 	}
 	return false
+}
+
+// agentNodeTailRe matches `<agent>_<机器号>`：字母开头，结尾是下划线 + 6 位以上
+// 字母数字（机器号既有纯数字 3300776275，也有字母数字混合 1ziviig73i；真人
+// userId 是纯数字不会命中）。与 CLI isPeerAgentUserId（agent-permissions.ts）
+// 同源 —— 那边的尾巴只认数字，这台机器号字典里有字母数字混合的形状，这里
+// 放宽到 [A-Za-z0-9]；新 id 形状出现时两边都要同步改，否则建群兜底就会像
+// 2026-11-18 那样静默加错人。
+var agentNodeTailRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9@._-]*_[A-Za-z0-9]{6,}$`)
+
+// isAgentNodeUserID reports whether one RongCloud user id looks like an agent
+// node (any of the three shapes above). Keep in sync with the CLI's
+// isPeerAgentUserId.
+func isAgentNodeUserID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	lower := strings.ToLower(id)
+	if strings.HasPrefix(lower, "rc_node_") || strings.HasPrefix(lower, "claw_") {
+		return true
+	}
+	return agentNodeTailRe.MatchString(id)
 }
 
 // containsUserID reports whether id is in the list. Used to guarantee the group

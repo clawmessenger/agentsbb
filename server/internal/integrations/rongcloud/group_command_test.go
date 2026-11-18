@@ -458,6 +458,88 @@ func TestGroupCreateSkipsFallbackWhenAnAgentIsSelected(t *testing.T) {
 	}
 }
 
+// 2026-11-18 生产事故回归：agent 节点 2026-11-10 起注册为 `<agent>_<机器号>`
+// （pi_3300776275），旧的 rc_node_ 前缀判据认不出来，建群时 fallback 把没人
+// 勾选的旧格式 opencode 节点（rc_node_3300776275_opencode）塞进了每一个新群。
+func TestGroupCreateSkipsFallbackWhenANewFormatAgentIsSelected(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	stub := newGroupMirrorStub()
+	stub.fallback, stub.fallbackOK = "rc_node_3300776275_opencode", true
+	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "143047",
+		Content:    `{"request_id":"r1","service":"group","action":"create","params":{"groupName":"测试1","memberIds":["pi_3300776275","deveco_3300776275"]}}`,
+	}
+	if err := handler.handleCommand(context.Background(), msg); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+	creates := rec.calls("/group/create.json")
+	if len(creates) != 1 {
+		t.Fatalf("create calls = %d", len(creates))
+	}
+	if got := creates[0]["userId"]; got != "143047,pi_3300776275,deveco_3300776275" {
+		t.Errorf("userId = %q, want exactly the picked members (no fallback agent appended)", got)
+	}
+}
+
+func TestGroupCreateSkipsFallbackForLegacyOpenclawSelection(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	stub := newGroupMirrorStub()
+	stub.fallback, stub.fallbackOK = "rc_node_machine1_opencode", true
+	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "user-7",
+		Content:    `{"request_id":"r1","service":"group","action":"create","params":{"groupName":"G","memberIds":["claw_oc5yj7nusm"]}}`,
+	}
+	if err := handler.handleCommand(context.Background(), msg); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+	creates := rec.calls("/group/create.json")
+	if len(creates) != 1 {
+		t.Fatalf("create calls = %d", len(creates))
+	}
+	if got := creates[0]["userId"]; got != "user-7,claw_oc5yj7nusm" {
+		t.Errorf("userId = %q, a legacy openclaw account counts as an agent", got)
+	}
+}
+
+func TestIsAgentNodeUserID(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		// 新格式 agent 节点
+		{"pi_3300776275", true},
+		{"codebuddy_3300776275", true},
+		{"qwenpaw_1ziviig73i", true},
+		// 机器节点 / 旧注册节点 / 远古 openclaw
+		{"rc_node_3300776275", true},
+		{"rc_node_3300776275_opencode", true},
+		{"RC_NODE_3300776275_hermes", true},
+		{"claw_oc5yj7nusm", true},
+		// 真人：纯数字，绝不命中
+		{"143047", false},
+		{"user-7", false},
+		// 形状不够：没有下划线尾巴 / 机器号不足 6 位 / 数字开头
+		{"pi", false},
+		{"pi_12345", false},
+		{"1ziviig73i", false},
+		{"", false},
+		{"   ", false},
+	}
+	for _, tc := range cases {
+		if got := isAgentNodeUserID(tc.id); got != tc.want {
+			t.Errorf("isAgentNodeUserID(%q) = %v, want %v", tc.id, got, tc.want)
+		}
+	}
+}
+
 func TestGroupCreateRequiresAName(t *testing.T) {
 	rec, srv := newGroupTestServer(t)
 	defer srv.Close()
