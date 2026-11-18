@@ -795,8 +795,11 @@ export class MessageDispatcher {
         // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
         // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
         turnOptions: gate.behaviorPrompt ? { behaviorPrompt: gate.behaviorPrompt } : {},
+        // 运维入口 agent：随流帧与整包回包带回去，web 端据此把回复归属到
+        // 对应 agent 的运维面板（会话按入口 agent 分桶的另一半）。
+        opsAgent: entryAgent,
         turns,
-        fallback: (out) => this.deliverAgentReply(msg.fromUserId, out),
+        fallback: (out) => this.deliverAgentReply(msg.fromUserId, out, entryAgent),
       });
       return;
     }
@@ -1056,6 +1059,12 @@ export class MessageDispatcher {
     /** your_turn 轮的派发者（服务端系统节点）：流式心跳的收件人。 */
     yourTurnFrom?: string;
     /**
+     * 运维入口 agent（可选）：随流帧 `ops_agent` 与整包回包信封带回去，web 端
+     * 据此把回复归属到对应 agent 的运维面板（同机所有面板共用一条融云私聊，
+     * 不带标记的话回复没法归属）。缺省 = 非运维轮。
+     */
+    opsAgent?: string;
+    /**
      * 是否为这一轮发流式心跳。true 用于服务端**按序派发**的轮次（闲聊中继与
      * 讨论组）：服务端按心跳续期该轮 deadline，缺了它长思考轮会被固定墙钟判超时。
      */
@@ -1093,6 +1102,7 @@ export class MessageDispatcher {
         ...(activity && activity.length > 0 ? { activity } : {}),
         ...(timeline && timeline.length > 0 ? { timeline } : {}),
         ...(errorCode ? { errorCode } : {}),
+        ...(opts.opsAgent ? { opsAgent: opts.opsAgent } : {}),
       });
       // 融云单条消息 ~9KB 上限：超限帧切 wire 分块（web 端重组器还原）。
       // 帧是全量快照（text+reasoning 同帧），不再按 1800 字符切片多帧。
@@ -2212,10 +2222,13 @@ export class MessageDispatcher {
 
   // Agent replies containing fenced ```html blocks become preview cards;
   // plain text goes out as the usual RC:TxtMsg bubble.
-  private async deliverAgentReply(toUserId: string, out: string): Promise<void> {
+  private async deliverAgentReply(toUserId: string, out: string, opsAgent?: string): Promise<void> {
     const { blocks, rest } = extractHtmlFence(out);
     if (blocks.length === 0) {
-      await this.deps.send(toUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
+      // opsAgent：运维轮的回复信封带上入口 agent（web 端按它归属面板）。
+      await this.deps.send(toUserId, "RC:TxtMsg", JSON.stringify(
+        opsAgent ? { content: out, opsAgent } : { content: out },
+      ));
       return;
     }
     const cardId = `card-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

@@ -50,6 +50,12 @@ export interface ChatStreamFrameInput {
   /** 思考流全量快照（可选）：agent 的 thinking/reasoning 过程文本。 */
   reasoning?: string;
   /**
+   * 运维入口 agent（可选，snake_case `ops_agent` 上帧）。机器级 ops 服务同机
+   * 所有智能体，web 端每个 agent 的运维面板是独立会话（融云对端只有一条
+   * 私聊），靠这个标记把流式帧归属到正确的面板；缺省 = 非运维轮。
+   */
+  opsAgent?: string;
+  /**
    * 过程流全量快照（可选）：agent 本轮调用过的工具步骤（联网搜索、执行命令、
    * 读写文件…）。与 text/reasoning 同一套快照语义，web 端渲染成气泡里的
    * 「过程」面板。没有过程可展示时整字段省略。
@@ -95,6 +101,7 @@ export function buildChatStreamFrame(input: ChatStreamFrameInput): string {
     text: input.text,
   };
   if (input.reasoning) payload.reasoning = input.reasoning;
+  if (input.opsAgent) payload.ops_agent = input.opsAgent;
   if (input.activity && input.activity.length > 0) payload.activity = compactActivityForFrame(input.activity);
   if (input.timeline && input.timeline.length > 0) payload.timeline = input.timeline;
   if (input.errorCode) payload.error_code = input.errorCode;

@@ -2448,6 +2448,37 @@ describe("会话形态判定与隔离（群聊不得被当成讨论组）", () =
     })
     expect(cleared).toEqual(["cm-private-user_a#opencode"])
   })
+
+  // web 端每个 agent 的运维面板是独立会话（融云对端只有一条机器级私聊），
+  // 流帧与整包回包必须带 ops_agent / opsAgent，否则回复没法归属到面板。
+  it("运维轮的流帧与整包回包都带入口 agent 标记", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "诊断一下", opsAgent: "codearts" }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m, _d, _s, _sessionKey?: string) => "codearts 正常",
+    })
+    expect(deps.streams.length).toBeGreaterThan(0)
+    for (const frame of deps.streams) {
+      expect(frame.content).toContain('"ops_agent":"codearts"')
+    }
+    // 失败帧同样要带标记：runTurnStreamed 抛错时走 emit(failed) 路径。
+    const { deps: deps2 } = relayDeps()
+    const dispatcher2 = new MessageDispatcher(deps2)
+    await dispatcher2.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "诊断一下", opsAgent: "codearts" }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async () => { throw new Error("boom") },
+    })
+    const failedFrames = deps2.streams.filter((item) => item.content.includes('"status":"failed"'))
+    expect(failedFrames.length).toBeGreaterThan(0)
+    expect(failedFrames.every((item) => item.content.includes('"ops_agent":"codearts"'))).toBe(true)
+  })
 })
 
 // agent 把产物写进工作目录、stdout 却是空的，是「生成个文件」这类请求的常态。
