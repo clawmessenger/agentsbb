@@ -815,6 +815,17 @@ const ENVELOPE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 // 真止损：读到这个量级说明 agent 在喷日志/输出结果，这一轮不可能再有用，
 // 直接掐进程并以 output_truncated 失败收尾（绝不假装答完）。
 const HARD_OUTPUT_BYTES = 16 * 1024 * 1024;
+// stream-json 轮次**不做字节硬止损**（timeout 才是它的真止损）。
+//
+// 2026-11-18 现场：pi `--mode json` 的 v3 事件里，每条 message_update 都内嵌
+// **全量累计 message 快照**（增量只有 1 个字，快照却随轮次线性长大）——一轮
+// 正常的群聊回答 stdout 就有 26MB，轻松越过 16MB 硬止损。进程被掐时多半还在
+// 思考阶段、正文增量为零，partialText 便落到「streamedText || stdout」的
+// stdout 分支：512KB 原始 JSONL 作为失败帧正文发进群，用户看到的就是
+// 「超长 JSON 消息」。而对 stream-json 来说，原始字节本来就只留 512KB（缓冲
+// 截断后解析照旧），真正需要防的「喷日志」由 timeout 兜底 —— 字节量在这里
+// 不是「这轮没用了」的信号，是协议自身的冗余。
+const STREAM_JSON_HARD_OUTPUT_BYTES = Number.POSITIVE_INFINITY;
 
 function isWindowsScript(execPath: string): boolean {
   return process.platform === "win32" && /\.(cmd|bat)$/i.test(execPath);
@@ -1549,6 +1560,23 @@ function looksLikeEventStream(raw: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * 硬止损（output_truncated）的 partialText：优先带「已解析出的正文增量」。
+ *
+ * 增量为空时，事件流型的 stdout **绝不能**当正文兜底——那是协议残骸不是回答
+ * （2026-11-18 现场：512KB 原始 JSONL 被发进群，用户看到超长 JSON 消息）。
+ * 纯文本 stdout（agent 没走事件流、直接打印的半截回答）仍照旧透传。
+ */
+export function hardStopPartialText(
+  streamedText: string,
+  stdout: string,
+  streamJsonMode: boolean,
+): string {
+  const trimmed = streamedText.trim();
+  if (trimmed) return trimmed;
+  return streamJsonMode && looksLikeEventStream(stdout) ? "" : stdout;
 }
 
 export function parseStreamJsonLine(line: string): StreamJsonDelta | null {
@@ -2427,9 +2455,10 @@ function logFsRestrictionOnce(
 
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const hardLimit = opts.hardOutputBytes ?? HARD_OUTPUT_BYTES;
   // stream-json 的 JSONL 冗余大（事件元数据 + 思考流），64KB 会截断长回答。
   const streamJsonTurn = opts.onReasoningChunk !== undefined || agentSupportsReasoning(opts.agentName);
+  const hardLimit = opts.hardOutputBytes
+    ?? (streamJsonTurn ? STREAM_JSON_HARD_OUTPUT_BYTES : HARD_OUTPUT_BYTES);
   const bufferLimit = opts.maxOutputBytes ?? (streamJsonTurn
     ? STREAM_JSON_MAX_OUTPUT_BYTES
     : emitsJsonEnvelope(opts.agentName) ? ENVELOPE_MAX_OUTPUT_BYTES : DEFAULT_MAX_OUTPUT_BYTES);
@@ -2803,10 +2832,15 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         if (hardStopped) {
           // 硬上限触发：后半轮没读到，已产出的正文一并带出去（终帧还能显示
           // 用户刚才看到的那半句），但终态必须是失败。
+          //
+          // ⚠️ partialText 绝不能落到事件流的原始 stdout 上（2026-11-18 现场：
+          // pi 思考阶段被掐，正文增量为空，`streamedText || stdout` 把 512KB
+          // 原始 JSONL 当失败正文发进群——用户看到的就是超长 JSON 消息）。
+          // 事件流型 stdout 的「正文」只能来自增量/快照解析，提取不到就交空串。
           if (activity && activity.finish()) emitActivity();
           reject(new TurnIncompleteError(
             "output_truncated",
-            streamedText.trim() || stdout,
+            hardStopPartialText(streamedText, stdout, streamJsonMode),
             `agent stdout exceeded ${hardLimit} bytes`,
           ));
           return;

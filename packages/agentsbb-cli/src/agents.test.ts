@@ -16,6 +16,7 @@ import {
   extractOpenclawEnvelopeDetails,
   extractOpenclawReply,
   extractStreamJsonFinalText,
+  hardStopPartialText,
   grokCliModelId,
   grokRouteFromCliModelId,
   KNOWN_AGENT_CLIS,
@@ -2014,6 +2015,80 @@ describe("runAgentTurn", () => {
         hardOutputBytes: 2_048,
         onReasoningChunk: () => {},
       })).rejects.toMatchObject({ code: "output_truncated" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  // 2026-11-18 现场：pi `--mode json` 的每条 message_update 都内嵌全量累计
+  // message 快照，stdout O(n²) 膨胀（一轮群聊回答实测 26MB），在思考阶段就
+  // 越过旧 16MB 硬止损被掐。正文增量为零时 partialText 曾落到原始 stdout
+  // （512KB JSONL），被当失败正文发进群——用户看到的就是「超长 JSON 消息」。
+  // 两道闸：① stream-json 默认不做字节硬止损（见 STREAM_JSON_HARD_OUTPUT_BYTES）；
+  // ② 真被硬止损（显式传 hardOutputBytes）时，事件流 stdout 绝不进 partialText。
+  it("硬止损：pi 事件流在思考阶段被掐（无正文增量）时 partialText 交空串", async () => {
+    const thinking = Array.from({ length: 40 }, (_, i) =>
+      JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: `想${i}` } }),
+    ).join("\n");
+    const stdoutText = [
+      '{"type":"session","version":3,"id":"s","cwd":"C:\\\\x"}',
+      '{"type":"agent_start"}',
+      '{"type":"turn_start"}',
+      thinking,
+    ].join("\n") + "\n";
+    const fixture = createEchoAgentScript("pi", { stdoutText });
+    try {
+      await expect(runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "pi",
+        prompt: "p",
+        timeoutMs: 30_000,
+        hardOutputBytes: 256,
+      })).rejects.toMatchObject({ code: "output_truncated", partialText: "" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("hardStopPartialText：正文增量优先；事件流 stdout 不兜底；纯文本照旧透传", () => {
+    expect(hardStopPartialText("  正文  ", '{"type":"x"}', false)).toBe("正文");
+    expect(hardStopPartialText("", '{"type":"session","version":3}\n{"type":"agent_start"}', true)).toBe("");
+    expect(hardStopPartialText("", "半截纯文本回答", true)).toBe("半截纯文本回答");
+    expect(hardStopPartialText("", '{"type":"session"}', false)).toBe('{"type":"session"}');
+  });
+
+  // pi 的 stdout 会越过 512KB 原始缓冲上限：超限后解析照旧（capped → 以增量
+  // 拼接为终值），正文完整交付，这正是 stream-json 不做字节硬止损的前提。
+  it("pi：stdout 超过原始缓冲上限后解析照旧，正文完整交付", async () => {
+    const msg = (text: string) =>
+      JSON.stringify({ role: "assistant", content: [{ type: "text", text }] });
+    const lines = [
+      '{"type":"session","version":3,"id":"s","cwd":"C:\\\\x"}',
+      '{"type":"agent_start"}',
+      '{"type":"turn_start"}',
+    ];
+    let acc = "";
+    for (let i = 0; i < 800; i += 1) {
+      acc += `第${i}句。`;
+      lines.push(JSON.stringify({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: `第${i}句。` },
+        message: msg(acc),
+      }));
+    }
+    const stdoutText = lines.join("\n") + "\n";
+    expect(stdoutText.length).toBeGreaterThan(512 * 1024);
+    const fixture = createEchoAgentScript("pi", { stdoutText });
+    try {
+      const out = await runAgentTurn({
+        execPath: fixture.agentPath,
+        agentName: "pi",
+        prompt: "p",
+        timeoutMs: 60_000,
+      });
+      expect(out).toContain("第0句。");
+      expect(out).toContain("第399句。");
+      expect(out.length).toBeLessThan(6000);
     } finally {
       fixture.cleanup();
     }
