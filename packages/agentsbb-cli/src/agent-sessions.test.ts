@@ -150,6 +150,14 @@ describe("会话失效的自愈判据", () => {
     expect(isStaleSessionError(
       new Error("Error: thread/resume failed: no rollout found for thread id " + SID),
     )).toBe(true);
+    // grok 1.0.77 实测原文（--resume 一个不存在的 id → exit 1）
+    expect(isStaleSessionError(
+      new Error('{"type":"error","message":"No saved copy of session ' + SID + ' was found remotely."}'),
+    )).toBe(true);
+    // kimi 2.5.2 实测原文（--session 一个不存在的 id → exit 1）
+    expect(isStaleSessionError(
+      new Error('error: failed to run prompt: Session "session_' + SID + '" not found.'),
+    )).toBe(true);
   });
 
   it("普通失败不误判（否则会把 agent 的活重跑两遍）", () => {

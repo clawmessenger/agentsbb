@@ -57,7 +57,10 @@ export function isStaleSessionError(err: unknown): boolean {
   if (!message) return false;
   // `no rollout found` 是 codex 0.144 的原话（实测：thread/resume 找不到该
   // thread 的 rollout 记录），不能漏 —— 漏了 codex 在群里会每轮都拿死 id 起步。
-  return /no rollout found|no conversation found|no saved session|session (?:id )?(?:.* )?not found|not found.*session id|unknown session|invalid session|session .* (?:does not exist|has expired)/i
+  // `no saved copy of session` 是 grok 的原话（2026-11-18 实测：--resume 一个不
+  // 存在的 id → exit 1 + 这句）；`session "…" not found` 是 kimi 的原话。
+  // 漏掉任何一句，对应 agent 在这个群/私聊里会永久带着死 id、每轮都失败。
+  return /no rollout found|no conversation found|no saved session|no saved copy of session|session (?:id )?(?:.* )?not found|not found.*session id|unknown session|invalid session|session .* (?:does not exist|has expired)/i
     .test(message);
 }
 
