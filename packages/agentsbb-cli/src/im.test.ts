@@ -3162,3 +3162,48 @@ describe("MessageDispatcher 新开会话", () => {
     expect(called).toBe(0);
   });
 });
+
+describe("MessageDispatcher 群聊/讨论组的新开会话（广播）", () => {
+  const roomMsg = (text: string, conversationType: number) => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user-1",
+    toUserId: "group-9",
+    targetId: "group-9",
+    conversationType,
+    content: JSON.stringify({ content: text }),
+  });
+
+  it.each([3, 4])("conversationType=%i 的广播指令清掉这个房间的所有形态", async (ct) => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const seen: string[] = [];
+    await dispatcher.handle(roomMsg("新开会话", ct), {
+      runTurn: async () => {
+        throw new Error("群广播永远不该开 agent（会全员抢答）");
+      },
+      clearSessionsForConversation: (id) => {
+        seen.push(id);
+        return 1;
+      },
+    });
+    expect(seen).toEqual(["group-9"]);
+    // 静默：N 个成员各回一句会把房间刷屏。
+    expect(deps.sent).toHaveLength(0);
+  });
+
+  it("普通群消息仍然只是观察，不动会话", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let called = 0;
+    await dispatcher.handle(roomMsg("新开一个项目吧", 3), {
+      runTurn: async () => {
+        throw new Error("群广播不该开 agent");
+      },
+      clearSessionsForConversation: () => {
+        called += 1;
+        return 0;
+      },
+    });
+    expect(called).toBe(0);
+  });
+});

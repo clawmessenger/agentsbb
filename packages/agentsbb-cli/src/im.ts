@@ -679,6 +679,28 @@ export class MessageDispatcher {
         const kind = msg.conversationType === 3 ? "group"
           : msg.conversationType === 4 ? "chatroom"
           : `unknown(${String(msg.conversationType)})`;
+        // 「新开会话」在群聊/讨论组里是**广播**，不是私聊提问：每个成员节点都会
+        // 收到同一条，各自清掉自己在**这个房间**的会话，正好是我们要的语义。
+        //
+        // 为什么不交给服务端统一下发（服务端确实也会发 reset_session）：
+        // 讨论进行中（可插话态）用户消息不走 relayMessage/relayGroupMessage，
+        // 服务端那两条入口根本拦不到 —— 只有设备侧的广播是**所有路径都会经过**的
+        // 那一处。两条路都留着：服务端清自己的中继历史，设备清 agent 会话。
+        //
+        // 静默处理、不回执：N 个成员各回一句「已开新会话」会把房间刷屏。
+        const broadcastText = (() => {
+          try {
+            const parsed = JSON.parse(msg.content) as { content?: unknown };
+            return typeof parsed.content === "string" ? parsed.content : "";
+          } catch {
+            return "";
+          }
+        })();
+        if (broadcastText && isNewSessionCommand(broadcastText)) {
+          const cleared = turns.clearSessionsForConversation?.(msg.targetId) ?? 0;
+          console.log(`im in: ${kind} new-session command room=${msg.targetId} cleared=${cleared}`);
+          return;
+        }
         console.log(`im in: observing ${kind} broadcast (only private messages are prompts)`);
         return;
       }
