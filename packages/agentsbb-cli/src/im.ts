@@ -708,7 +708,8 @@ export class MessageDispatcher {
       // 入口提示：C 端从「<agent> - 运维」那个入口发的消息会带上它
       // （见 ops-scope.ts 的 resolveOpsScope entryAgent）。per-agent 运维账号
       // 退役后同机所有入口共用一个 ops 账号，融云对端信息丢了，只有这个消息
-      // 字段还记得「用户是从谁的运维面板进来的」。
+      // 字段还记得「用户是从谁的运维面板进来的」。管理端运维对话（服务端
+      // 代理）从 2026-11-18 起也带同一字段（`{content, opsAgent}` 信封）。
       let entryAgent: string | undefined;
       try {
         const parsed = JSON.parse(msg.content) as { content?: unknown; opsAgent?: unknown };
@@ -718,6 +719,14 @@ export class MessageDispatcher {
         return;
       }
       if (!text) return;
+      // 运维会话按入口 agent 分桶：`cm-private-<对端>#<agent>`。同机所有 agent
+      // 共用一个机器级 ops 账号，若都挤在 `cm-private-<对端>` 一条会话里，
+      // 「codearts - 运维」和「opencode - 运维」会互相看见对方的诊断上下文
+      // （2026-11-18 现场实锤）。分桶只在带了入口提示时生效 —— 普通私聊
+      // 没有 opsAgent，键保持原样，存量会话不受影响。
+      const privateSessionKey = entryAgent && entryAgent.trim()
+        ? `${turnSessionKey("private", msg.fromUserId)}#${entryAgent.trim().toLowerCase()}`
+        : turnSessionKey("private", msg.fromUserId);
       // 私聊闸门（allowPrivate）。
       //
       // 为什么必须在设备端：服务端**没有私聊派发点**，私聊这条 RC:TxtMsg 是 CLI
@@ -747,10 +756,11 @@ export class MessageDispatcher {
       // 必须在进 agent 之前截住 —— 放行的话这句会被当成问题问给 agent，
       // 而 agent 正好带着它该忘掉的那段上下文，答一句「好的我记住了」，
       // 会话却一点没变（用户视角：说了没用）。
-      // 只清「这个私聊对端」这一条键：用户 A 让 agent 重开，不该影响用户 B。
+      // 只清「这个私聊对端」这一条键（运维入口带 opsAgent 时是该 agent 的
+      // 分桶键）：用户 A 让 agent 重开，不该影响用户 B，也不该影响同机
+      // 其他 agent 的运维会话。
       if (isNewSessionCommand(text)) {
-        const key = turnSessionKey("private", msg.fromUserId);
-        turns.clearSession?.(key);
+        turns.clearSession?.(privateSessionKey);
         const agent = this.deps.agentName || this.deps.permissionNodeId || "agent";
         await this.deps.send(
           msg.fromUserId,
@@ -778,9 +788,10 @@ export class MessageDispatcher {
         // per-user 模型：这个人自己选过的就用他的，没选过则跟随节点默认；
         // 选过但已失效（provider 下架 / 旧客户端写进内部名）会被清掉并回退。
         model: await this.resolveTurnModel(msg.fromUserId),
-        // 私聊按对端分桶：不给键的话 openclaw 会把私聊也塞进主会话，和群聊、
-        // 讨论组共享一串上下文。
-        sessionKey: turnSessionKey("private", msg.fromUserId),
+        // 私聊按对端分桶；运维入口再按入口 agent 细分（privateSessionKey）。
+        // 不给键的话 openclaw 会把私聊也塞进主会话，和群聊、讨论组共享一串
+        // 上下文。
+        sessionKey: privateSessionKey,
         // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
         // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
         turnOptions: gate.behaviorPrompt ? { behaviorPrompt: gate.behaviorPrompt } : {},

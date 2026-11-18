@@ -2392,6 +2392,62 @@ describe("会话形态判定与隔离（群聊不得被当成讨论组）", () =
     })
     expect(seenKey).toBe("cm-private-user_a")
   })
+
+  // 2026-11-18 现场：同机所有 agent 的运维抽屉共享一条会话 —— codearts 与
+  // opencode 的运维对话互相看见对方的诊断上下文。带了入口提示（opsAgent，
+  // C 端运维入口与管理端运维对话都会带）就必须按「对端 + 入口 agent」分桶；
+  // 普通私聊没有这个字段，键保持原样，存量会话不受影响。
+  it("运维私聊按入口 agent 分桶", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    let seenKey: string | undefined
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "诊断一下", opsAgent: "codearts" }),
+    }, {
+      runTurn: async () => { throw new Error("should use streamed variant") },
+      runTurnStreamed: async (_p: string, _m, _d, _s, sessionKey?: string) => {
+        seenKey = sessionKey
+        return "好的"
+      },
+    })
+    expect(seenKey).toBe("cm-private-user_a#codearts")
+  })
+
+  it("运维入口 agent 名做 trim + 小写归一，不同写法落到同一桶", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const keys: string[] = []
+    for (const opsAgent of [" CodeArts ", "codearts"]) {
+      await dispatcher.handle({
+        objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+        conversationType: 1, content: JSON.stringify({ content: "hi", opsAgent }),
+      }, {
+        runTurn: async () => { throw new Error("should use streamed variant") },
+        runTurnStreamed: async (_p: string, _m, _d, _s, sessionKey?: string) => {
+          keys.push(sessionKey ?? "")
+          return "ok"
+        },
+      })
+    }
+    expect(keys[0]).toBe(keys[1])
+    expect(keys[0]).toBe("cm-private-user_a#codearts")
+  })
+
+  it("运维入口下的「新开会话」只清该 agent 的分桶键", async () => {
+    const { deps } = relayDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const cleared: string[] = []
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg", fromUserId: "user_a", toUserId: "", targetId: "node_self",
+      conversationType: 1, content: JSON.stringify({ content: "新开会话", opsAgent: "opencode" }),
+    }, {
+      runTurn: async () => { return "ignored" },
+      runTurnStreamed: async () => { throw new Error("reset must not reach the agent") },
+      clearSession: (sessionKey: string) => { cleared.push(sessionKey) },
+    })
+    expect(cleared).toEqual(["cm-private-user_a#opencode"])
+  })
 })
 
 // agent 把产物写进工作目录、stdout 却是空的，是「生成个文件」这类请求的常态。

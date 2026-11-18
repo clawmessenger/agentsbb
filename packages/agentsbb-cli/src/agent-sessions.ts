@@ -13,6 +13,9 @@ import { stateHome } from "./paths.js";
 // private / group / chatroom，所以：
 //   · 同一个群，对不同 agent 各有各的会话（key 相同但存在不同节点的文件里）；
 //   · 群聊、单聊、讨论组互不串台（venue 不同）。
+//   · 机器级 ops 的运维私聊还会按入口 agent 细分成
+//     `cm-private-<对端>#<agent>`（im.ts 的 privateSessionKey）：同机所有
+//     agent 共用一个 ops 账号，不分桶的话所有运维面板共享一条会话。
 //
 // 值是该 agent 原生的会话 id（claude --resume / qwen -r / opencode -s ……），
 // 由每轮的事件流带回来（见 agents.ts 的 StreamJsonDelta.sessionId）。
