@@ -11,6 +11,14 @@ type textContent struct {
 	Content string `json:"content"`
 }
 
+// opsTextContent 是运维对话私聊的信封：在 textContent 上多带 opsAgent（入口
+// 提示，见 encodeOpsTextContent）。设备端对未知字段宽容，老 CLI 读不到
+// opsAgent 只是退回共享会话，不会报错。
+type opsTextContent struct {
+	Content  string `json:"content"`
+	OpsAgent string `json:"opsAgent,omitempty"`
+}
+
 // isCommandMessage returns true if the objectName indicates a command message.
 func isCommandMessage(objectName string) bool {
 	return objectName == objectNameCommand

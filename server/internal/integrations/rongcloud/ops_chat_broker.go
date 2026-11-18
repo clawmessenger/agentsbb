@@ -54,14 +54,18 @@ const (
 )
 
 // OpsChatSender 把一条 RC:TxtMsg 私聊放到线上，返回融云的 msgUID。
+// opsAgent 是入口提示（用户从哪个智能体的运维面板进来），发送时以
+// `{content, opsAgent}` 信封带给设备端 —— 设备端用它做运维会话按 agent 分桶。
 // 由 channel 层在凭据解析完成后绑定；未绑定时一切请求快速失败。
-type OpsChatSender func(ctx context.Context, toUserID, text string) (msgUID string, err error)
+type OpsChatSender func(ctx context.Context, toUserID, text, opsAgent string) (msgUID string, err error)
 
 // OpsChatSnapshot 是轮询接口返回的那一份状态，字段与管理端契约一一对应。
 type OpsChatSnapshot struct {
 	RequestID string `json:"request_id"`
 	NodeID    string `json:"node_id"`
 	OpsPeerID string `json:"ops_peer_id"`
+	// 入口 agent（运维面板所属的智能体键）；空 = 未指定（老管理端）。
+	OpsAgent  string `json:"ops_agent,omitempty"`
 	Status    string `json:"status"`
 	Reply     string `json:"reply"`
 	ElapsedMs int64  `json:"elapsed_ms"`
@@ -72,6 +76,7 @@ type opsChatRecord struct {
 	requestID string
 	nodeID    string
 	opsPeerID string
+	opsAgent  string
 	msgUID    string
 	text      string
 	createdAt time.Time
@@ -115,7 +120,7 @@ func (b *OpsChatBroker) BindSender(send OpsChatSender) {
 // 预留记录必须发生在 send 之前：设备回包可能比 HTTP 返回还快，先发后登记会让
 // 第一条 chat_stream 帧在 webhook 侧找不到 pending 而被放走。
 func (b *OpsChatBroker) Start(
-	ctx context.Context, nodeID, opsPeerID, text string,
+	ctx context.Context, nodeID, opsPeerID, opsAgent, text string,
 ) (requestID string, code string) {
 	if opsPeerID == "" || strings.TrimSpace(text) == "" {
 		return "", OpsChatCodeUnavailable
@@ -127,6 +132,7 @@ func (b *OpsChatBroker) Start(
 		requestID: requestID,
 		nodeID:    nodeID,
 		opsPeerID: opsPeerID,
+		opsAgent:  strings.TrimSpace(opsAgent),
 		text:      text,
 		createdAt: now,
 		expiresAt: now.Add(OpsChatDefaultTimeoutSeconds * time.Second),
@@ -150,7 +156,7 @@ func (b *OpsChatBroker) Start(
 		b.settle(requestID, "failed", "", OpsChatCodeUnavailable)
 		return "", OpsChatCodeUnavailable
 	}
-	msgUID, err := send(ctx, opsPeerID, text)
+	msgUID, err := send(ctx, opsPeerID, text, rec.opsAgent)
 	if err != nil {
 		b.logger.Warn("ops chat: send failed", "request_id", requestID, "peer", opsPeerID, "error", err)
 		b.settle(requestID, "failed", "", OpsChatCodeSendFailed)
@@ -188,6 +194,7 @@ func (b *OpsChatBroker) Get(requestID string) (OpsChatSnapshot, bool) {
 		RequestID: rec.requestID,
 		NodeID:    rec.nodeID,
 		OpsPeerID: rec.opsPeerID,
+		OpsAgent:  rec.opsAgent,
 		Status:    rec.status,
 		Reply:     rec.reply,
 		ElapsedMs: end.Sub(rec.createdAt).Milliseconds(),

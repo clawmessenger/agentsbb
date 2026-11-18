@@ -97,7 +97,12 @@ func (h *Handler) ClawAdminOpsChatSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := h.clawAdminOpsChatContextOf(r, rec)
-	requestID, code := h.OpsChat.Start(r.Context(), rec.NodeID, ctx.OpsPeerID, text)
+	// 入口 agent = 该节点自己的 agent 键（ai_type，如 codearts/opencode）。
+	// 设备端靠它把运维会话按 agent 分桶并注入【运维对象】：同机所有 agent
+	// 共用同一个机器级 ops 对端，不带它的话所有面板共享一条会话（2026-11-18
+	// 现场：codearts 与 opencode 的运维抽屉互相看见对方的诊断上下文）。
+	// peer_kind=agent 的回落路径也带上：设备端按「对端+agent」分桶同样成立。
+	requestID, code := h.OpsChat.Start(r.Context(), rec.NodeID, ctx.OpsPeerID, rec.AIType, text)
 	if code != "" {
 		status := http.StatusServiceUnavailable
 		if code == rongcloud.OpsChatCodeBusy {

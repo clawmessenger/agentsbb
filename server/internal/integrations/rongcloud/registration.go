@@ -83,10 +83,13 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 		// 运维对话走的是普通文本私聊，不是 command 通道：设备端 CLI 的
 		// handle() 认 RC:TxtMsg，runStreamedTurn 收尾必回一条全文文本。
 		// msgUID 要留下来和 chat_stream 帧的 request_message_id 对上。
+		// 内容用 {content, opsAgent} 信封：opsAgent 让设备端把运维会话按
+		// 「对端 + 入口 agent」分桶，并注入【运维对象】抬头（同机所有 agent
+		// 共用一个 ops 账号，没有它设备端无从知道这轮在替谁运维）。
 		if deps.OpsChat != nil {
 			systemNodeID := creds.SystemNodeID
-			deps.OpsChat.BindSender(func(ctx context.Context, toUserID, text string) (string, error) {
-				return client.sendPrivateMessage(ctx, systemNodeID, toUserID, objectNameText, encodeTextContent(text))
+			deps.OpsChat.BindSender(func(ctx context.Context, toUserID, text, opsAgent string) (string, error) {
+				return client.sendPrivateMessage(ctx, systemNodeID, toUserID, objectNameText, encodeOpsTextContent(text, opsAgent))
 			})
 		}
 		var discussionRuntime *discussionRuntime
