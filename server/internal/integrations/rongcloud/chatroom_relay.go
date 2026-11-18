@@ -865,8 +865,25 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	if t := strings.TrimSpace(s.userText); t != "" {
 		opening = "\n\n用户起的头：" + t
 	}
+	// 用户消息在指令层的回响：起头只出现一次（且在上下文段之前），成员轮到
+	// 发言时往往已经读了满满一段接龙上文，一句话的锚点压不过几百字的「接着
+	// 聊」惯性 —— 线上实锤（2026-11-18）：用户插话「查看下各自的版本号」，
+	// 前两位成员照样顺着上文的咖啡接龙往下聊，没人理用户的请求。所以除了
+	// 开头段，**轮次指令里必须再点名一次**用户这条消息是什么。
+	anchor := ""
+	if t := strings.TrimSpace(s.userText); t != "" {
+		anchor = relayClipToRoom(t, 60)
+	}
 	// 本轮要做的事：接住谁的话。第一位（只有用户起头可接）是「开接」。
-	turn := "\n\n现在轮到你开接：顺着用户起的头说下去，说完把话头留给下一位。"
+	turn := ""
+	if anchor != "" {
+		turn = fmt.Sprintf(
+			"\n\n现在轮到你开接：优先回应用户刚发的这条消息——「%s」。这是用户此刻真正的诉求，比延续之前的闲聊重要；回应完把话头留给下一位。",
+			anchor,
+		)
+	} else {
+		turn = "\n\n现在轮到你开接：顺着用户起的头说下去，说完把话头留给下一位。"
+	}
 	if hasPrev {
 		if prev.silent {
 			// 上一位空手（「生成个文件」这类任务 stdout 近空是常态）：没有话可接，
@@ -880,6 +897,15 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 			turn = fmt.Sprintf(
 				"\n\n现在轮到你：请接住「%s」刚才的话往下说（赞同、补充、追问、反驳都行），说完把话头留给下一位；不要重复别人已经说过的内容。",
 				prev.roleName,
+			)
+		}
+		// 接住上一位 ≠ 可以无视用户：锚点在指令层重复一遍，并给出优先级。
+		// 第一位开接的完整指令在上面 anchor 分支里已经点名；这里是第二位起的
+		// 提醒 —— 用户的话如果还没人正面回应，接它优先于继续接龙。
+		if anchor != "" {
+			turn += fmt.Sprintf(
+				"（提醒：用户这一轮刚说过「%s」——如果还没人正面回应它，请优先接它，不要只顾着延续之前的话题。）",
+				anchor,
 			)
 		}
 	}

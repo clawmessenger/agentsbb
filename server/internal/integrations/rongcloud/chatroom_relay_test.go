@@ -796,6 +796,49 @@ func TestBuildPrompt_PointsAtPreviousSpeaker(t *testing.T) {
 	}
 }
 
+// 2026-11-18 线上实锤回归：用户在接龙进行中插话「查看下各自的版本号」，锚点
+// 只在开头段出现一次，轮次指令仍只说「接住上一位」，前两位成员顺着上文闲聊
+// 跑题，没人理用户的请求。指令层必须把用户这条消息再点名一次并给出优先级。
+func TestBuildPrompt_UserInterjectionAnchorReachesTurnInstruction(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "roomAnchor",
+		userText:     "查看下各自的版本号",
+		isGroup:      true,
+		totalRounds:  1,
+		members: []relayMember{
+			{rcID: "rc_a", roleName: "A"},
+			{rcID: "rc_b", roleName: "B"},
+		},
+	}
+	// 第一位（无历史可接）：指令必须点名用户的消息并声明优先级。
+	first := hub.buildPrompt(s, s.members[0])
+	if !strings.Contains(first, "现在轮到你开接") {
+		t.Fatalf("first speaker keeps the 开接 anchor: %q", first)
+	}
+	if !strings.Contains(first, "查看下各自的版本号") || !strings.Contains(first, "优先回应用户刚发的这条消息") {
+		t.Fatalf("first speaker must be told to answer the user's fresh message: %q", first)
+	}
+
+	// 第二位：照旧接住上一位，但必须带上「用户的话还没人回应就优先接它」提醒。
+	s.replies = []relayReply{{roleName: "A", content: "我先开接：大家聊聊咖啡吧"}}
+	second := hub.buildPrompt(s, s.members[1])
+	if !strings.Contains(second, "请接住「A」刚才的话往下说") {
+		t.Fatalf("second speaker still follows the chain: %q", second)
+	}
+	if !strings.Contains(second, "用户这一轮刚说过「查看下各自的版本号」") {
+		t.Fatalf("second speaker must carry the user-anchor reminder: %q", second)
+	}
+
+	// 无用户起头（理论上少见）：锚点段与提醒整段省略，不出现空锚点。
+	s.userText = "  "
+	s.replies = nil
+	noAnchor := hub.buildPrompt(s, s.members[0])
+	if strings.Contains(noAnchor, "提醒：用户这一轮刚说过") || strings.Contains(noAnchor, "\n\n用户起的头：") {
+		t.Fatalf("empty opening must not render an anchor: %q", noAnchor)
+	}
+}
+
 // 多轮接龙：第二轮的第一位接的是**上一轮收尾那位**，不是从头重来；同时用户原话
 // 只作为「起头」出现一次，不再写成「用户刚在群里发言」那种与事实相反的话。
 func TestBuildPrompt_RoundTwoFollowsPreviousRoundTail(t *testing.T) {
