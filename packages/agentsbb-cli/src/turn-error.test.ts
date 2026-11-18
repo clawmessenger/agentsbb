@@ -54,6 +54,20 @@ describe("classifyTurnError", () => {
     for (const raw of cases) expect(classifyTurnError(raw)).toBe("model_unavailable");
   });
 
+  // 现场（2026-11-18，群聊「暗号」一轮，opencode/big-pickle）：上游供应商内容
+  // 安全拦截，opencode 抛 "Provider blocked the response"（AI SDK finishReason
+  // 归一为 content-filter），整轮零输出。误被兜底成 agent_failed，前端文案
+  // 误导成「进程异常退出」。真实含义是供应商拦截 —— 换说法/换模型，不是查设备。
+  it("供应商内容安全拦截归 provider_blocked，不落 agent_failed 兜底", () => {
+    const cases = [
+      "opencode session failed: Provider blocked the response",
+      "provider blocked the response",
+      "{\"finishReason\":\"content_filter\"}",
+      "response was content filtered by the provider",
+    ];
+    for (const raw of cases) expect(classifyTurnError(raw)).toBe("provider_blocked");
+  });
+
   it("纯限流（429 但不含额度语义）", () => {
     expect(classifyTurnError("HTTP 429 Too Many Requests")).toBe("model_rate_limited");
   });

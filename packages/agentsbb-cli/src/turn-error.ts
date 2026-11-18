@@ -30,6 +30,12 @@ export type TurnErrorCode =
   /** 上游没有这个模型的可用服务：网关没给它配渠道，或服务方临时过载（503）。
    *  动作是**换模型**（或稍后重试），换 key、充值都没用。 */
   | "model_unavailable"
+  /** 上游供应商内容安全拦截了这轮响应（AI SDK 的 finishReason=content-filter，
+   *  opencode 抛 "Provider blocked the response"）。进程没崩、重试同一段内容
+   *  大概率还是被拦：动作是**换个说法重试或换模型**。
+   *  2026-11-18 现场：群聊「暗号」游戏一轮，opencode(big-pickle) 整轮零输出失败，
+   *  误被兜底成 agent_failed，前端文案误导成「进程异常退出」。 */
+  | "provider_blocked"
   /** 本轮跑超时被我们自己掐掉。 */
   | "turn_timeout"
   /** 会话队列满（1 在执行 + 1 排队），这条消息被直接丢弃。
@@ -83,6 +89,16 @@ const UNAVAILABLE_PATTERNS: readonly RegExp[] = [
   /\b503\b.*\b(?:upstream|gateway|distributor)\b/i,
 ];
 
+// 上游供应商的内容安全拦截。opencode（AI SDK）在 finishReason 归一为
+// content-filter 时抛 "Provider blocked the response"（opencode.exe 内实测：
+// `ue.reason.normalized==="content-filter"` → fN("Provider blocked the response")）；
+// 其他运行时可能透出 "content_filter" / "content filtered" 字样。这类失败
+// **重试同一段内容没用**，文案要指向「换个说法或换模型」。
+const PROVIDER_BLOCKED_PATTERNS: readonly RegExp[] = [
+  /provider blocked/i,
+  /content[_ -]?filte(?:r|red)/i,
+];
+
 const AUTH_PATTERNS: readonly RegExp[] = [
   /invalid api key/i,
   /incorrect api key/i,
@@ -133,6 +149,7 @@ export function classifyTurnError(raw: string): TurnErrorCode {
   if (/agent turn aborted/i.test(text)) return "agent_failed";
   if (matchesAny(text, QUOTA_PATTERNS)) return "model_quota_exhausted";
   if (matchesAny(text, BALANCE_PATTERNS)) return "model_balance_exhausted";
+  if (matchesAny(text, PROVIDER_BLOCKED_PATTERNS)) return "provider_blocked";
   if (matchesAny(text, UNAVAILABLE_PATTERNS)) return "model_unavailable";
   if (matchesAny(text, AUTH_PATTERNS)) return "model_auth_failed";
   if (matchesAny(text, TIMEOUT_PATTERNS)) return "turn_timeout";
@@ -151,6 +168,7 @@ export function describeTurnError(code: TurnErrorCode): string {
     case "model_auth_failed": return "模型鉴权失败（key 无效/无权限）";
     case "model_rate_limited": return "模型请求被限流";
     case "model_unavailable": return "该模型在上游没有可用的服务渠道（未开通或临时过载）";
+    case "provider_blocked": return "上游供应商内容安全拦截了这轮响应";
     case "turn_timeout": return "本轮执行超时";
     case "agent_busy": return "上一个任务还在执行，本条消息被丢弃";
     case "output_truncated": return "设备端输出超出上限被截断，本轮没有答完";
