@@ -26,7 +26,7 @@ import {
 } from "./agent-permissions.js";
 import { DEFAULT_SERVER_URL, machineId, defaultAnsweredTurnsPath, defaultProcessedUidsPath, defaultUpgradeInflightPath } from "./config.js";
 import { stateHome } from "./paths.js";
-import { agentNameFromRcUser, ensureOpencodeInstalled, opsScopeAgentName, OPS_AGENT_NAME, OPS_TURN_TIMEOUT_MS, setupOpsWorkdir } from "./ops.js";
+import { agentNameFromRcUser, ensureOpencodeInstalled, opsScopeAgentName, OPS_AGENT_NAME, setupOpsWorkdir } from "./ops.js";
 import { readOpsScopeSync } from "./ops-scope.js";
 import {
   ALLOW_DUPLICATE_SUPERVISOR_ENV,
@@ -1272,11 +1272,11 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         return;
       }
       // The built-in ops agent runs on the local opencode CLI (auto-installed
-      // when missing); it is never skipped by PATH discovery and runs with a
-      // longer turn timeout and its own ops workdir (AGENTS.md system prompt).
+      // when missing); it is never skipped by PATH discovery and runs with
+      // its own ops workdir (AGENTS.md system prompt). No wall-clock turn
+      // timeout: long maintenance commands run until the stall guard fires.
       let agentExecPath: string;
       let agentName: string;
-      let turnTimeoutMs: number | undefined;
       let cwd: string | undefined;
       let ensureRuntime: (() => Promise<void>) | undefined;
       // 机器级 ops 的可运维对象（见下方 --ops-agents）；非 ops 或 per-agent
@@ -1309,7 +1309,6 @@ export function buildProgram(opts: BuildProgramOpts): Command {
         );
         agentExecPath = opencode.path;
         agentName = "opencode";
-        turnTimeoutMs = OPS_TURN_TIMEOUT_MS;
         cwd = workdir;
         // opencode is the one runtime this CLI knows how to install, so it is
         // the one that can be repaired by 「一键唤醒」 (see runtime-recovery.ts).
@@ -1344,7 +1343,6 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           agentIdentity: cmdOpts.agent,
           model: cmdOpts.model,
           stdout: opts.stdout,
-          turnTimeoutMs,
           cwd,
           processedUidsPath: defaultProcessedUidsPath(creds.nodeId),
           answeredTurnsPath: defaultAnsweredTurnsPath(creds.nodeId),

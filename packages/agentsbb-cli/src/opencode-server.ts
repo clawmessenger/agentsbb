@@ -323,7 +323,8 @@ export interface RunServerSessionOpts {
   password?: string;
   prompt: string;
   model?: string;
-  timeoutMs: number;
+  /** 墙钟超时；不传 = 无总时长上限（卡死由调用方的停滞守卫收尾）。 */
+  timeoutMs?: number;
   signal?: AbortSignal;
   onText?: (delta: string) => void;
   onReasoning?: (delta: string) => void;
@@ -536,10 +537,13 @@ export async function runServerSession(opts: RunServerSessionOpts): Promise<RunS
 
     // 3) 发消息。这个请求要一直挂到本轮结束（实测 800 字长文 113 秒）。
     const model = toRequestModel(opts.model);
-    timer = setTimeout(() => {
-      timedOut = true;
-      abort.abort();
-    }, opts.timeoutMs);
+    // 墙钟只在显式给 timeoutMs 时才设：常规对话轮无总时长上限（停滞守卫收尾）。
+    if (opts.timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        abort.abort();
+      }, opts.timeoutMs);
+    }
     const replied = await requestJson(
       opts.baseUrl,
       "POST",

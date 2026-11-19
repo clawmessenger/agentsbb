@@ -67,7 +67,8 @@ export interface RunV2SessionOpts {
   prompt: string;
   /** `provider/model` 或 `provider/model#variant`。 */
   model?: string;
-  timeoutMs: number;
+  /** 墙钟超时；不传 = 无总时长上限（卡死由调用方的停滞守卫收尾）。 */
+  timeoutMs?: number;
   signal?: AbortSignal;
   onText?: (delta: string) => void;
   onReasoning?: (delta: string) => void;
@@ -334,11 +335,14 @@ export async function runV2Session(opts: RunV2SessionOpts): Promise<RunV2Session
   try {
     // 超时从**第一件事**就开始计。原实现把 timer 挂在 SSE 建连成功之后，于是
     // `POST /api/session` / `GET /api/event` 的响应头迟迟不来时整轮没有任何时间
-    // 上界 —— 上层没有看门狗，表现是设备端永久「正在思考」（M1）。
-    timer = setTimeout(() => {
-      timedOut = true;
-      abort.abort();
-    }, opts.timeoutMs);
+    // 上界。墙钟只在显式给 timeoutMs 时才设：常规对话轮无总时长上限（停滞
+    // 守卫收尾）；角色推荐等短回合仍显式传入。
+    if (opts.timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        abort.abort();
+      }, opts.timeoutMs);
+    }
 
     const model = toV2ModelRef(opts.model);
     const created = await v2Request(
@@ -574,8 +578,9 @@ export async function runV2Session(opts: RunV2SessionOpts): Promise<RunV2Session
     }
 
     // 双保险：deadline 与上面的 timer 同一起点、同一时长，哪怕 timer 被什么
-    // 东西清掉了（或被 fake timer 吃掉）这里仍会收场。
-    const deadline = startedAt + opts.timeoutMs;
+    // 东西清掉了（或被 fake timer 吃掉）这里仍会收场。未传 timeoutMs 时不判
+    // 墙钟（NaN 比较恒 false，但显式判空更清楚）。
+    const deadline = opts.timeoutMs !== undefined ? startedAt + opts.timeoutMs : Number.POSITIVE_INFINITY;
     while (!done) {
       if (abort.signal.aborted) break;
       if (streamClosed) break;

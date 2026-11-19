@@ -3144,8 +3144,9 @@ describe("chat_stream 终帧补发", () => {
 });
 
 // 停滞守卫（2026-11-17 现场）：运维回了半句之后彻底不动，前端 3 分钟就提示
-// 「可能卡住」，设备端却要等到 600s 墙钟 —— 用户看到「一句话说完还在转圈」。
-// 判据必须是「已产出正文 + 长时间无进展」，不是「总时长超了」。
+// 「可能卡住」——判据必须是「无进展」，不是「总时长超了」。
+// 2026-11-19 取消固定墙钟后它是唯一的收尾判据，分两档：产出正文后的停滞用
+// 短窗口（240s），全程零产出的僵死（serve 悬挂）用长窗口（600s）。
 describe("shouldAbortStalledTurn", () => {
   const base = { aborted: false, terminalSent: false, producedText: true, idleMs: 0 };
 
@@ -3157,8 +3158,12 @@ describe("shouldAbortStalledTurn", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 30_000 })).toBe(false);
   });
 
-  it("还没产出正文的长任务照跑：装依赖、重启服务不能被误杀", () => {
+  it("还没产出正文、但仍在窗口内的长任务照跑：装依赖、重启服务不能被误杀", () => {
     expect(shouldAbortStalledTurn({ ...base, producedText: false, idleMs: 500_000 })).toBe(false);
+  });
+
+  it("全程零产出、连续 600s 无任何进展（serve 悬挂）→ 收尾兜底", () => {
+    expect(shouldAbortStalledTurn({ ...base, producedText: false, idleMs: 600_000 })).toBe(true);
   });
 
   it("已收尾或已中止时不再重复触发", () => {

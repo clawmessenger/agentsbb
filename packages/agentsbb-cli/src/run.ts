@@ -342,12 +342,10 @@ export interface ConnectTransportOpts {
   transport: IMTransport;
 }
 
-// 单轮 agent 的默认上限。120s 对深思考的运行时不够：hermes 的长思考轮实测
-// 会跑过 3 分钟（reasoning 上万字），被掐断时服务端收到的是一条失败回包，
-// 于是下一位立刻接棒 —— 用户看到的就是「上一位还在思考，下一位已经开口」。
-// 取 300s 与服务端中继保底（relayTurnTimeoutFloor）同一量级，避免两端任意
-// 一侧先放弃；真正的兜底仍由服务端超时负责。
-export const DEFAULT_TURN_TIMEOUT_MS = 300_000;
+// （原 DEFAULT_TURN_TIMEOUT_MS = 300s 已删：常规对话轮不再有固定墙钟，
+//  长任务只要还在推进（正文/思考/工具步骤任一路有增量）就一直跑；
+//  卡死轮次的收尾由 im.ts 的无进展停滞守卫负责。只有角色推荐这类
+//  「调用方在等」的短回合仍显式传 timeoutMs。）
 
 export interface StartRunLoopOpts extends ConnectTransportOpts {
   agentExecPath: string;
@@ -619,9 +617,9 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ...(opts.agentIdentity ? { agentIdentity: opts.agentIdentity } : {}),
         prompt,
         model: modelForTurn(model),
-        // 推荐这类短回合自带 timeoutMs（必须短于调用方的等待窗口）；其余回合
-        // 沿用设备级默认（300s）。
-        timeoutMs: turnOpts?.timeoutMs ?? opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+        // 墙钟超时只在调用方显式给时才设（角色推荐这类短回合）；常规对话轮
+        // 不传 = 无总时长上限，卡死由停滞守卫收尾。
+        timeoutMs: turnOpts?.timeoutMs ?? opts.turnTimeoutMs,
         cwd: opts.cwd,
         sessionKey,
         ...(resumeSessionId ? { resumeSessionId } : {}),
@@ -645,7 +643,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         ...(opts.agentIdentity ? { agentIdentity: opts.agentIdentity } : {}),
         prompt,
         model: modelForTurn(model),
-        timeoutMs: opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+        timeoutMs: opts.turnTimeoutMs,
         cwd: opts.cwd,
         onChunk: onDelta,
         // 思考流增量直接并入 onDelta 第二参：runStreamedTurn 维护

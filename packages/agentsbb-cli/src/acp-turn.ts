@@ -59,7 +59,8 @@ export interface AcpTurnOpts {
   /** 本轮模型（`provider/model` 路由）；空 = 跟随 agent 当前会话模型。 */
   model?: string;
   cwd?: string;
-  timeoutMs: number;
+  /** 墙钟超时；不传 = 无总时长上限（卡死由调用方的停滞守卫收尾）。 */
+  timeoutMs?: number;
   signal?: AbortSignal;
   resumeSessionId?: string;
   /** 权限限制态：拒绝一切需要授权的动作（只读 ACP 会话不该能写盘）。 */
@@ -424,7 +425,7 @@ export function runAcpTurn(opts: AcpTurnOpts): Promise<string> {
     const settle = (fn: () => void): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       clearTimeout(quietTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       for (const resolvePending of pending.values()) resolvePending(null);
@@ -441,9 +442,11 @@ export function runAcpTurn(opts: AcpTurnOpts): Promise<string> {
       fail(new AcpStartupError(`${spec.label} ACP: ${message}`));
     };
 
-    const timer = setTimeout(() => {
-      fail(new Error(`agent turn timeout after ${opts.timeoutMs}ms`));
-    }, opts.timeoutMs);
+    const timer = opts.timeoutMs
+      ? setTimeout(() => {
+          fail(new Error(`agent turn timeout after ${opts.timeoutMs}ms`));
+        }, opts.timeoutMs)
+      : null;
 
     const onAbort = (): void => fail(new Error("agent turn aborted"));
     opts.signal?.addEventListener("abort", onAbort, { once: true });

@@ -253,9 +253,10 @@ export interface TurnOptions {
    */
   signal?: AbortSignal;
   /**
-   * 本轮 agent 回合的超时（毫秒）。不传时沿用设备级默认（`DEFAULT_TURN_TIMEOUT_MS`
-   * = 300s）。角色推荐必须传：服务端只等 60s 就作废这一批，设备端跑满 5 分钟
-   * 只会留下僵尸回合跟下一轮抢额度（见 roleRecommendTurnTimeoutMs）。
+   * 本轮 agent 回合的墙钟超时（毫秒）。**可选**：常规对话轮不传 —— 单轮没有
+   * 总时长上限，收尾由无进展停滞守卫负责（见 PRIVATE_TURN_STALL_MS /
+   * PRIVATE_TURN_SILENT_STALL_MS）。角色推荐必须传：服务端只等 60s 就作废
+   * 这一批，设备端久跑只会留下僵尸回合跟下一轮抢额度（见 roleRecommendTurnTimeoutMs）。
    */
   timeoutMs?: number;
   /**
@@ -410,31 +411,35 @@ const STREAM_FRAME_INTERVAL_MS = 900;
 const STREAM_TEXT_FRAME_INTERVAL_MS = 200;
 // 终帧补发前的间隔：足够让第一份走完 IM 链路，又不至于让用户多等。
 const TERMINAL_RESEND_GAP_MS = 600;
-// 私聊轮次的外层兜底墙钟（修复③）：对齐服务端中继保底 relayTurnTimeoutFloor
-// =600s。正常超时由 runAgentTurn 自己的 timeoutMs（默认 300s）先触发；这道
-// 墙钟只在「内层超时机制本身没生效」（如 opencode serve 的 HTTP 悬挂、进程
-// 不响应 abort）时才会到点 —— 到点即 abort + failed 终帧 + 文本占位。
-export const PRIVATE_TURN_TIMEOUT_MS = 600_000;
-
+// 私聊轮次**不再有固定墙钟**（2026-11-19：取消单轮超时限制）——原 600s 兜底
+// 墙钟（PRIVATE_TURN_TIMEOUT_MS，对齐服务端 relayTurnTimeoutFloor）已删除：
+// 长任务（深思考、装依赖、多步工具链）只要还在推进就不该被总时长掐掉。
+// 现在唯一的收尾判据是下面的「无进展停滞守卫」，分两档窗口：
 /**
- * 「停滞」判定：**已经产出过正文**之后，连续这么久没有任何新进展
+ * 「说了话之后停滞」窗口：**已经产出过正文**之后，连续这么久没有任何新进展
  * （正文增量 / 思考增量 / 工具步骤都算进展），就判定这一轮卡死了。
  *
- * 为什么需要它：外层墙钟 600s 是按「运维要跑长命令」定的，但最常见的卡死形态
- * 不是长任务，而是**模型说了半句之后彻底不动**（2026-11-17 现场：运维回了一句
- * 「要操作哪个智能体」就挂住，前端 3 分钟就提示「可能卡住」，却要等到 10 分钟
- * 才收尾，用户看到的是「一句话说完还在转圈」）。
- *
- * 只对「已产出正文」生效：从头到尾没输出的是真长任务（装依赖、重启服务），
- * 那种继续由 600s 墙钟兜，不在这里误杀。
+ * 最常见的卡死形态是**模型说了半句之后彻底不动**（2026-11-17 现场：运维回了
+ * 一句「要操作哪个智能体」就挂住）——这个窗口要明显短于下一档，让用户尽早
+ * 看到终态而不是继续转圈。
  */
 export const PRIVATE_TURN_STALL_MS = 240_000;
+/**
+ * 「全程无产出停滞」窗口：一个字都还没输出、且连续这么久没有任何进展
+ * （没有正文、没有思考、没有工具步骤），才判定这一轮挂死。取 600s 与服务端
+ * 群聊中继保底（relayTurnTimeoutFloor）同一量级：真正完全沉默的挂死轮次，
+ * 最坏也只比原墙钟多等一会；而工具步骤 / 思考流任一路还在上报的轮次，
+ * 现在可以无限跑下去（装依赖、长命令、深思考不再被误杀）。
+ */
+export const PRIVATE_TURN_SILENT_STALL_MS = 600_000;
 
 /**
  * 停滞守卫的判定（纯函数，便于单测）。
  *
- * 只在「已经产出过正文、且长时间没有任何新进展」时返回 true —— 从头到尾没
- * 输出的是长任务（装依赖、重启服务），继续由 600s 墙钟兜，不在这里误杀。
+ * 判据只看「有没有进展」，不看总时长：
+ *   - 已产出过正文：连续 stallMs（默认 PRIVATE_TURN_STALL_MS）无进展 → 掐；
+ *   - 全程无产出：连续 PRIVATE_TURN_SILENT_STALL_MS 无进展 → 掐（serve 悬挂、
+ *     HTTP 挂死这类「零输出僵死」的兜底；工具步骤 / 思考流任一路在动就不算停滞）。
  */
 export function shouldAbortStalledTurn(input: {
   aborted: boolean;
@@ -444,8 +449,10 @@ export function shouldAbortStalledTurn(input: {
   stallMs?: number;
 }): boolean {
   if (input.aborted || input.terminalSent) return false;
-  if (!input.producedText) return false;
-  return input.idleMs >= (input.stallMs ?? PRIVATE_TURN_STALL_MS);
+  const windowMs = input.producedText
+    ? (input.stallMs ?? PRIVATE_TURN_STALL_MS)
+    : PRIVATE_TURN_SILENT_STALL_MS;
+  return input.idleMs >= windowMs;
 }
 
 /**
@@ -1190,10 +1197,10 @@ export class MessageDispatcher {
     /** 超时占位只发一次（内层失败路径与外层兜底都可能触发）。 */
     let timeoutNoticeSent = false;
     /**
-     * 私聊超时占位（修复③）：任何路径把本轮判成 turn_timeout（内层 agent
-     * 超时，或下面的外层兜底墙钟）都向发送者回一条文本占位 —— 群聊有服务端
-     * relayTurnFailedNote 兜底，私聊没有，不补这条用户就只能靠 web 端解析
-     * failed 终帧（旧 web / 降级链路收不到帧 = 永远转圈）。
+     * 私聊超时占位（修复③）：任何路径把本轮判成 turn_timeout（停滞守卫掐掉的
+     * 卡死轮次）都向发送者回一条文本占位 —— 群聊有服务端 relayTurnFailedNote
+     * 兜底，私聊没有，不补这条用户就只能靠 web 端解析 failed 终帧（旧 web /
+     * 降级链路收不到帧 = 永远转圈）。
      * 发送失败只记日志；只在私聊会话生效。
      */
     const sendTimeoutNoticeIfPrivate = (errorCode: string): void => {
@@ -1214,33 +1221,11 @@ export class MessageDispatcher {
           );
         });
     };
-    // 外层兜底墙钟（仅私聊）：runAgentTurn 自带 timeoutMs（默认 300s），但那套
-    // 机制失效时（serve 悬挂、abort 不响应）本轮会无限挂着 —— 到点强制 abort
-    // + failed 终帧 + 文本占位。fire-and-forget：真正收尾仍由主流程的 abort 分支
-    // / catch 完成，这里只保证「一定有终态」。
-    const privateGuardTimer: ReturnType<typeof setTimeout> | null = ctx.conversationType === 1
-      ? setTimeout(() => {
-          try {
-            if (controller.signal.aborted || terminalSent) return;
-            terminalSent = true;
-            console.error(
-              `private turn guard fired: conv=${ctx.conversationId} req=${ctx.requestMessageId}`
-              + ` elapsed=${Math.round((Date.now() - turnStartedAt) / 1000)}s — aborting`,
-            );
-            void emit(seq, "failed", "", undefined, "turn_timeout");
-            sendTimeoutNoticeIfPrivate("turn_timeout");
-            controller.abort();
-          } catch (err) {
-            console.error(
-              "private turn guard failed:",
-              err instanceof Error ? err.message : err,
-            );
-          }
-        }, PRIVATE_TURN_TIMEOUT_MS)
-      : null;
-    // 停滞守卫（仅私聊）：已经产出正文、之后连续 PRIVATE_TURN_STALL_MS 没有任何
-    // 新进展 —— 这是「模型说了半句就卡住」的典型形态，比 600s 墙钟早得多收尾。
-    // 判据只看「有没有进展」，不看总时长：运维跑长命令时工具步骤会持续上报，
+    // （原「私聊外层兜底墙钟 600s」已删：固定墙钟会掐掉还在推进的长任务。
+    //  零输出僵死的兜底由下面的停滞守卫第二档 PRIVATE_TURN_SILENT_STALL_MS 承担。）
+    // 停滞守卫（仅私聊）：判据只看「有没有进展」，不看总时长 —— 正文产出后的
+    // 停滞用短窗口（PRIVATE_TURN_STALL_MS），全程无产出的僵死用长窗口
+    // （PRIVATE_TURN_SILENT_STALL_MS）。运维跑长命令时工具步骤会持续上报，
     // 不停推进的轮次不会被这里掐掉。
     const stallTimer: ReturnType<typeof setInterval> | null = ctx.conversationType === 1
       ? setInterval(() => {
@@ -1608,11 +1593,7 @@ export class MessageDispatcher {
         await opts.onError(errMsg).catch(() => {});
       }
     } finally {
-      // 私聊兜底墙钟随轮次结束撤掉：正常完成/内层超时先收尾，它就不该再响。
-      if (privateGuardTimer !== null) {
-        clearTimeout(privateGuardTimer);
-      }
-      // 停滞守卫同理：轮次结束就撤，晚到的一次检查只会重复收尾。
+      // 停滞守卫随轮次结束撤掉：晚到的一次检查只会重复收尾。
       if (stallTimer !== null) {
         clearInterval(stallTimer);
       }

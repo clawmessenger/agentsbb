@@ -14,9 +14,9 @@ import { windowsCandidateDirs } from "./win-dirs.js";
 // turns are executed by the locally installed opencode CLI.
 export const OPS_AGENT_NAME = "ops";
 
-// Ops turns run real machine-maintenance commands (inspect logs, edit
-// configs, restart services); they routinely exceed the default 120s.
-export const OPS_TURN_TIMEOUT_MS = 600_000;
+// （原 OPS_TURN_TIMEOUT_MS = 600s 已删：运维轮次与普通轮次一样不再有固定墙钟，
+//  长命令（装依赖、重启服务、看日志）只要还在上报进展就一直跑；卡死由 im.ts
+//  的无进展停滞守卫收尾。）
 
 export interface EnsureOpencodeDeps {
   discover?: () => Promise<AgentInfo[]>;

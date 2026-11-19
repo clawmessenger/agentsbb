@@ -806,7 +806,8 @@ export function buildAgentArgs(
   return strategy(prompt, model, sessionKey, ctx);
 }
 
-const DEFAULT_TIMEOUT_MS = 120_000;
+// （原 DEFAULT_TIMEOUT_MS = 120s 已删：runAgentTurn 不再对未传 timeoutMs 的
+//  轮次兜底任何墙钟 —— 常规对话轮没有总时长上限，见 runAgentTurn 内注释。）
 const DEFAULT_MAX_OUTPUT_BYTES = 65_536;
 // stream-json（claude/codex/opencode/hermes）的事件流含元数据行与思考流，同回答
 // 体积约为纯文本 2-3 倍；opencode 还是「整段 part 全文」重复上报，一次带工具的
@@ -2297,7 +2298,7 @@ export function syncAgentPermissionConfig(
 /** 起 `opencode serve` 并等它把监听地址打到 stdout，然后跑完一轮。 */
 async function runOpenCodeServerTurn(
   opts: RunAgentTurnOpts,
-  timeoutMs: number,
+  timeoutMs: number | undefined,
   hardLimit: number,
 ): Promise<string> {
   const { file, args } = buildSpawnInvocation(opts.execPath, [
@@ -2465,7 +2466,11 @@ function logFsRestrictionOnce(
 }
 
 export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // 墙钟超时只在调用方显式给 timeoutMs 时才设（角色推荐这类「调用方在等」的
+  // 短回合）。常规对话轮不传 = 无总时长上限：长任务（深思考、装依赖、多步
+  // 工具链）只要还在产出就不该被固定墙钟掐掉；卡死轮次由 im.ts 的无进展
+  // 停滞守卫 abort（走这里的 aborted 分支收尾），不再有 turn_timeout 兜底。
+  const timeoutMs = opts.timeoutMs;
   // stream-json 的 JSONL 冗余大（事件元数据 + 思考流），64KB 会截断长回答。
   const streamJsonTurn = opts.onReasoningChunk !== undefined || agentSupportsReasoning(opts.agentName);
   const hardLimit = opts.hardOutputBytes
@@ -2666,21 +2671,24 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       opts.onChunk?.(delta);
     };
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
     const settle = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
     };
 
-    const timer = setTimeout(() => {
-      settle(() => {
-        killProcessTree(child);
-        reject(new Error(`agent turn timeout after ${timeoutMs}ms`));
-      });
-    }, timeoutMs);
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        settle(() => {
+          killProcessTree(child);
+          reject(new Error(`agent turn timeout after ${timeoutMs}ms`));
+        });
+      }, timeoutMs);
+    }
 
     const onAbort = () => {
       settle(() => {
