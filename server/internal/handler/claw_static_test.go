@@ -68,7 +68,7 @@ func TestClawRegisterWritesUnifiedDefaultPortrait(t *testing.T) {
 	t.Setenv("CLAW_AI_NODE_PORTRAIT_URI", "")
 	t.Setenv("MULTICA_PUBLIC_URL", "https://newsradar.dreamdt.cn/im-test")
 
-	username := fmt.Sprintf("portrait-probe-%d", time.Now().UnixNano())
+	username := fmt.Sprintf("portrait-probe-%d@test.example.com", time.Now().UnixNano())
 	dbfx.Cleanup(t, `DELETE FROM claw_im_users WHERE username = $1`, username)
 
 	req := testutil.JSONRequest(http.MethodPost, "/api/register", map[string]string{

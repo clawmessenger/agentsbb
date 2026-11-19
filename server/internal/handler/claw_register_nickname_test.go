@@ -20,8 +20,10 @@ import (
 	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
+// 2026-11-19 起 /api/register 校验「账号须为邮箱或手机号」（缺陷 D-002），
+// helper 生成的样本必须是合法邮箱，否则注册会被 400 挡掉。
 func uniqueClawUsername(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	return fmt.Sprintf("%s-%d@test.example.com", prefix, time.Now().UnixNano())
 }
 
 // 注册不填昵称：库里是 NULL（不是空串），接口返回 nickname: ""。

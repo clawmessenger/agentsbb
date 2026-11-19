@@ -689,6 +689,49 @@ func TestGroupUpdateByOwnerRefreshesRongCloud(t *testing.T) {
 	}
 }
 
+// 缺陷 D-003（2026-11-19）：只换头像（groupName 为空）时，融云
+// /group/refresh.json 要求 groupName 必填，原实现直接提交被融云 1002
+// 「The parameter groupName is required.」整体拒绝，头像永远换不上（线上日志
+// 实测）。修复后从本地 mirror 读当前群名补齐，只换头像的请求不再报错。
+func TestGroupUpdatePortraitOnlyCarriesTheCurrentName(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	stub := newGroupMirrorStub()
+	stub.owners["100001"] = "user-7"
+	stub.profile(GroupProfile{GroupID: "100001", GroupName: "ABQA-029 Web回归群"})
+	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "user-7",
+		Content:    `{"request_id":"r3","service":"group","action":"update","params":{"groupId":"100001","portraitUri":"https://img/only-portrait.png"}}`,
+	}
+	if err := handler.handleCommand(context.Background(), msg); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+
+	refreshes := rec.calls("/group/refresh.json")
+	if len(refreshes) != 1 {
+		t.Fatalf("refresh calls = %d, want 1", len(refreshes))
+	}
+	if refreshes[0]["groupName"] != "ABQA-029 Web回归群" {
+		t.Errorf("refresh form groupName = %#v, want the current mirrored name (RongCloud requires it)", refreshes[0]["groupName"])
+	}
+	if refreshes[0]["portraitUri"] != "https://img/only-portrait.png" {
+		t.Errorf("refresh form portraitUri = %#v", refreshes[0]["portraitUri"])
+	}
+	if result := rec.lastCommandResult(t); result["status"] != "success" {
+		t.Errorf("result = %#v", result)
+	}
+	// 落库的 UpdateMeta 仍只带用户提交的字段：groupName 空串 = 保持原值。
+	if len(stub.metaCalls) != 1 {
+		t.Fatalf("meta calls = %d, want 1", len(stub.metaCalls))
+	}
+	if call := stub.metaCalls[0]; call.GroupName != "" || call.PortraitURI != "https://img/only-portrait.png" {
+		t.Errorf("meta call = %#v", call)
+	}
+}
+
 func TestGroupUpdateSkipsRefreshWhenOnlyHiddenSettingsChange(t *testing.T) {
 	rec, srv := newGroupTestServer(t)
 	defer srv.Close()

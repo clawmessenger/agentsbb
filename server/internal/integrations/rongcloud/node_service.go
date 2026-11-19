@@ -760,9 +760,21 @@ func (s *NodeService) LegacyNodeRecords(ctx context.Context, userID string) ([]m
 		if len(n.Capabilities) > 0 {
 			record["capabilities"] = json.RawMessage(n.Capabilities)
 		}
-		if u, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID); err == nil && u.Name.Valid && u.Name.String != "" {
-			record["name"] = u.Name.String
-			record["nickname"] = u.Name.String
+		// name 之外再下发 portraitUri（缺陷 D-004）：设备管理（Home.tsx 的
+		// avatarImg: node.portraitUri）与通讯录名片（contacts.ts 的
+		// nodePortrait 优先链）都按 node.portraitUri 读头像。此前 record 没有
+		// 这个字段，这两处只能退到 IM SDK 的资料缓存 —— 节点头像更新后
+		// （ClawUpdateNode 只写 rongcloud_user + 推融云），它们会长期停留在
+		// 旧默认图，而单聊列表读会话资料已是新图，三个入口各不相同。融云侧
+		// user 资料是唯一已同步的真相，随 name 一起下发。
+		if u, err := s.queries.GetRongCloudUserByRongCloudID(ctx, n.RongcloudUserID); err == nil {
+			if u.Name.Valid && u.Name.String != "" {
+				record["name"] = u.Name.String
+				record["nickname"] = u.Name.String
+			}
+			if portrait := strings.TrimSpace(u.PortraitUri.String); portrait != "" {
+				record["portraitUri"] = portrait
+			}
 		}
 		records = append(records, record)
 	}

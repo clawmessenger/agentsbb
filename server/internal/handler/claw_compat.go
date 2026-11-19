@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -362,6 +363,20 @@ func (h *Handler) clawRong(ctx context.Context) *clawRongClient {
 
 // ---- HTTP handlers ----
 
+// clawAccountPhoneRe / clawAccountEmailRe 注册账号的两种合法形态（缺陷 D-002）。
+// 手机号按中国大陆号段（1 开头、第二位 3-9、共 11 位纯数字）；邮箱不追 RFC 全集，
+// 只要 local@domain 且 domain 带点（短域名 a@b.c 也放行，测试正向对照包含它）。
+var (
+	clawAccountPhoneRe = regexp.MustCompile(`^1[3-9]\d{9}$`)
+	// domain 至少一个点：短域名 a@b.c 放行（QA 正向对照），无点的 12@x 拒绝。
+	clawAccountEmailRe = regexp.MustCompile(`^[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+$`)
+)
+
+// clawAccountFormatOK 报告账号是否满足「邮箱或手机号」之一。
+func clawAccountFormatOK(account string) bool {
+	return clawAccountPhoneRe.MatchString(account) || clawAccountEmailRe.MatchString(account)
+}
+
 // ClawRegister POST /api/register
 func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -375,6 +390,14 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	username := strings.TrimSpace(req.Username)
+	// 注册账号必须满足「邮箱或手机号」之一（缺陷 D-002）：表单标注是
+	// 「账号（邮箱或手机号）」，但此前服务端只查重、不校验格式，缺域名的
+	// 邮箱、位数不对 / 0 开头 / 含字母的"手机号"都能注册成功并进入登录态。
+	// 校验收口在服务端，前端的提示只是第一道防线。
+	if username == "" || !clawAccountFormatOK(username) {
+		clawJSON(w, 400, 400, "账号须为邮箱或手机号", nil)
+		return
+	}
 	if req.Password == "" {
 		clawJSON(w, 400, 400, "密码不能为空", nil)
 		return

@@ -310,10 +310,24 @@ func (h *systemHandler) handleGroupUpdate(ctx context.Context, msg NormalizedMes
 	portraitURI := strings.TrimSpace(getString(cmd.Params, "portraitUri"))
 	description := strings.TrimSpace(getString(cmd.Params, "description"))
 
+	// 融云 /group/refresh.json 要求 groupName **必填**：用户只换头像（groupName
+	// 为空）时直接提交会被融云 1002「The parameter groupName is required.」整体
+	// 拒绝（缺陷 D-003，线上日志实测），头像也就永远换不上。修法：从本地 mirror
+	// 读当前群名补齐。mirror 读不到就保持空串按原行为提交（不比修复前更糟），
+	// 但本地群是 mirror 建的，正常都读得到。
+	refreshName := groupName
+	if refreshName == "" && portraitURI != "" && h.groupMirror.GroupProfiles != nil {
+		if profiles, perr := h.groupMirror.GroupProfiles(ctx, []string{groupID}); perr == nil && len(profiles) > 0 {
+			if current := strings.TrimSpace(profiles[0].GroupName); current != "" {
+				refreshName = current
+			}
+		}
+	}
+
 	// 名字/头像属于融云群资料：必须先刷融云，否则本端看着是新的、其他成员
 	// 读到的还是旧资料（旧后端同样先刷融云再落本地）。
 	if groupName != "" || portraitURI != "" {
-		if err := h.client.refreshGroupInfo(ctx, groupID, groupName, portraitURI); err != nil {
+		if err := h.client.refreshGroupInfo(ctx, groupID, refreshName, portraitURI); err != nil {
 			h.logger.Error("rongcloud: group refresh", "error", err, "group_id", groupID)
 			return h.sendWebError(ctx, msg, cmd, 500, "failed to update the RongCloud group profile")
 		}
