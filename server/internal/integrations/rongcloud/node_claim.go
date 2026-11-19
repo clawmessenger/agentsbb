@@ -299,3 +299,93 @@ func friendEdgeNodeOwner(queries *db.Queries, client *rongcloudAPIClient, logger
 		return nodes, nil
 	}
 }
+
+// ---- 单拥有者换绑：绑定时把 agent 从旧拥有者迁到新拥有者 ----
+//
+// 用户口径：本机的 agent（如 opencode）只允许一个普通用户（设备拥有者）绑定。
+// 当另一个账号绑定同一个 agent 时，程序自动把归属从旧拥有者迁到新账号：撤销
+// 旧 owner → agent 的融云好友边（agent 从旧设备列表消失）、清掉归属投影，再
+// 建新边并把投影写为新 owner。
+//
+// 这里**只迁移归属，不注销 agent 的融云账号**：agent 的 rc user / node / 凭据
+// 全部保留复用，机器上的其他 agent 与账号不受影响。要物理注销账号是另一条
+// 显式 opt-in 的路径（UnregisterNode / unregister=true），两者不可混用。
+//
+// 好友边与投影的读写都是 best-effort：任一步失败只记日志、不阻断绑定本身，
+// 与既有绑定路径（bindAgentsToMachine）的口径一致。
+
+// setNodeOwner 把节点归属设为 owner：先从当前拥有者（若有、且不是 owner）迁移
+// 过来，再建 owner → node 好友边、写归属投影。供绑定路径调用；ops 节点与空
+// owner 不进入这里（由调用方过滤）。
+func (s *NodeService) setNodeOwner(ctx context.Context, nodeRCID, owner string) {
+	nodeRCID = strings.TrimSpace(nodeRCID)
+	owner = strings.TrimSpace(owner)
+	if nodeRCID == "" || owner == "" {
+		return
+	}
+	// 1) 迁移归属：撤销旧边 + 清投影（无旧 owner / 同一个 owner 时是 no-op）。
+	s.reassignNodeOwnerOnBind(ctx, nodeRCID, owner)
+	// 2) 建新 owner → node 好友边（幂等：已是好友返回 25460 也算成功）。
+	if s.client != nil {
+		if _, err := s.client.addFriend(ctx, owner, nodeRCID, ""); err != nil {
+			s.log().Warn("rongcloud: add friend for bound agent failed",
+				"owner", owner, "node_rc", nodeRCID, "error", err)
+		}
+	}
+	// 3) 写归属投影。好友边是真相，写失败只记日志，读路径会反查回填。
+	if err := s.SetNodeClaim(ctx, nodeRCID, owner); err != nil &&
+		!errors.Is(err, ErrNodeClaimStoreUnavailable) {
+		s.log().Warn("rongcloud: sync node claim after bind failed",
+			"owner", owner, "node_rc", nodeRCID, "error", err)
+	}
+}
+
+// reassignNodeOwnerOnBind 维护「一个 agent 只有一个拥有者」：查出节点当前归属，
+// 若属于另一个账号，就撤销该账号到节点的好友边并清掉归属投影，让 agent 从旧
+// 拥有者的设备列表消失。返回是否真的发生了迁移。
+func (s *NodeService) reassignNodeOwnerOnBind(ctx context.Context, nodeRCID, newOwner string) bool {
+	nodeRCID = strings.TrimSpace(nodeRCID)
+	newOwner = strings.TrimSpace(newOwner)
+	if nodeRCID == "" || newOwner == "" {
+		return false
+	}
+	oldOwner := s.currentOwnerForReassign(ctx, nodeRCID)
+	if oldOwner == "" || oldOwner == newOwner {
+		return false
+	}
+	// 撤销旧 owner → agent 的单向好友边，与绑定写入的边界一致（owner → node）。
+	if err := s.RevokeFriendship(ctx, oldOwner, nodeRCID); err != nil {
+		s.log().Warn("rongcloud: revoke old owner edge on rebind failed",
+			"node_rc", nodeRCID, "old_owner", oldOwner, "error", err)
+	}
+	// 只清属于旧 owner 的投影，避免清掉并发换绑刚写入的新归属。
+	if err := s.ClearNodeClaim(ctx, nodeRCID, oldOwner); err != nil &&
+		!errors.Is(err, ErrNodeClaimStoreUnavailable) {
+		s.log().Warn("rongcloud: clear old owner claim on rebind failed",
+			"node_rc", nodeRCID, "old_owner", oldOwner, "error", err)
+	}
+	s.log().Info("rongcloud: node ownership reassigned on bind",
+		"node_rc", nodeRCID, "from", oldOwner, "to", newOwner)
+	return true
+}
+
+// currentOwnerForReassign 读出节点当前归属账号。投影列命中即返回（绑定路径写过
+// 它，是常态）；投影缺失时降级到好友边反查，与 getDeviceOwner 的读路径同源，
+// 保证投影列尚未回填的存量 agent 也能正确换绑。
+func (s *NodeService) currentOwnerForReassign(ctx context.Context, nodeRCID string) string {
+	dbtx := s.claimStore()
+	if dbtx == nil {
+		return ""
+	}
+	owners := &friendNodeOwners{dbtx: dbtx, client: s.client, logger: s.log()}
+	owner, found, err := owners.lookup(ctx, nodeRCID)
+	if err != nil {
+		s.log().Warn("rongcloud: lookup current owner on rebind failed",
+			"node_rc", nodeRCID, "error", err)
+		return ""
+	}
+	if !found {
+		return ""
+	}
+	return owner
+}

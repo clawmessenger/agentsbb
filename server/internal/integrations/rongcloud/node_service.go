@@ -1760,22 +1760,14 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 			return nil, fmt.Errorf("rongcloud: bind agent %q: %w", agent, err)
 		}
 		// Surface the bound agent in the owner's friend list. The built-in ops
-		// agent is internal plumbing, so it is never added. Best-effort: a
-		// failed friend write must not fail the bind itself.
+		// agent is internal plumbing, so it is never added.
+		//
+		// setNodeOwner 在写新归属之前先把 agent 从旧拥有者名下迁走（撤销旧
+		// owner 的好友边 + 清投影），实现「一个 agent 只有一个拥有者」。同一
+		// 账号重复绑定 / 无旧 owner 时是 no-op + 幂等建边，行为与之前一致。
+		// 好友边与投影的读写都是 best-effort，失败只记日志，不阻断绑定。
 		if ownerRongCloudID != "" && agent != OpsAgentType && binding.RongcloudUserID != "" {
-			if _, err := s.client.addFriend(ctx, ownerRongCloudID, binding.RongcloudUserID, ""); err != nil {
-				s.logger.Warn("rongcloud: add friend for bound agent failed",
-					"owner", ownerRongCloudID, "agent", agent, "error", err)
-			}
-			// 写路径 ①：好友边是本地的真相，claimed_by_user_id 是它的投影。
-			// 每次绑定都必须同步，否则读路径会拿到「列说有主、其实已经换人」
-			// 的旧值（脏列不会像 15s 缓存那样自己过期）。best-effort，失败只
-			// 记日志：下一次 getDeviceOwner 会回退到反查并回填。
-			if err := s.SetNodeClaim(ctx, binding.RongcloudUserID, ownerRongCloudID); err != nil &&
-				!errors.Is(err, ErrNodeClaimStoreUnavailable) {
-				s.logger.Warn("rongcloud: sync node claim after bind failed",
-					"owner", ownerRongCloudID, "agent", agent, "error", err)
-			}
+			s.setNodeOwner(ctx, binding.RongcloudUserID, ownerRongCloudID)
 		}
 		results = append(results, BoundAgentResult{Agent: agent, NodeID: binding.NodeID})
 	}
