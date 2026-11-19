@@ -595,6 +595,24 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 				return
 			}
 			member := s.members[s.index]
+			// 群成员移除闸门（缺陷 D-012）：群中继在会话启动时对成员列表做
+			// 快照，用户在中继进行中（或消息已排队）时把某位 AI 移出群聊，
+			// 旧快照仍会给他派 your_turn —— QA 实测「移出 opencode 后发
+			// 『你好』，opencode 仍显示正在思考」。派发前按镜像复核一次，
+			// 已被移出的成员直接跳过。查询失败按放行处理（与 groupPaused
+			// 失败同一取向）：一次数据库抖动不该让整个群哑掉。
+			if s.isGroup && !h.groupMemberStillPresent(ctx, s.chatroomRCID, member.rcID) {
+				h.rt.logger.Info("relay: member removed from group, skipping",
+					"group", s.chatroomRCID, "target", member.rcID,
+					"round", s.roundIndex+1)
+				note := relayRemovedNote(member.roleName)
+				if s.targeted {
+					note = relayTargetFailedNote(member.roleName, "已被移出群聊")
+				}
+				h.noteSkippedMember(ctx, s, &member, note)
+				s.index++
+				continue
+			}
 			// 离线闸门：派发前确认这位成员此刻连着融云。
 			//
 			// 为什么必须有它：融云私聊消息对**离线账号**是「存离线」语义，
@@ -1014,6 +1032,33 @@ func relayTimeoutNote(roleName string) string {
 // 根本没连上」（重试也没用，得先把那台设备弄上线）。
 func relayOfflineNote(roleName string) string {
 	return fmt.Sprintf("（%s 当前不在线，已跳过）", roleName)
+}
+
+// relayRemovedNote 是「这位成员已被移出群聊」的占位（缺陷 D-012）：与离线
+// 区分 —— 离线是设备问题，移除是群主刚做过的操作，用户应该知道这个跳过
+// 是他自己刚下的指令在生效，而不是设备故障。
+func relayRemovedNote(roleName string) string {
+	return fmt.Sprintf("（%s 已被移出群聊，不再参与发言）", roleName)
+}
+
+// groupMemberStillPresent 报告 rcID 此刻是否仍是 groupID 的 AI 成员（按本地
+// 镜像）。镜像不可用或查询失败时放行 —— 与 groupPaused 的容错取向一致，
+// 一次抖动不该让整个群哑掉；镜像行由 removeMember 在融云 quit 成功后删除，
+// 正常路径下这就是「是否已被移出」的真相源。
+func (h *chatroomRelayHub) groupMemberStillPresent(ctx context.Context, groupID, rcID string) bool {
+	if h.groupMirror == nil || h.groupMirror.ListAiMembers == nil {
+		return true
+	}
+	members, err := h.groupMirror.ListAiMembers(ctx, groupID)
+	if err != nil {
+		return true
+	}
+	for _, m := range members {
+		if m.UserID == rcID {
+			return true
+		}
+	}
+	return false
 }
 
 func relayTurnFailedNote(roleName string) string {
