@@ -1752,6 +1752,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// 品牌图片（默认头像 / 三张群类图 / Logo）由后台「系统配置」发布，这里公开下发。
 	// 不要求登录：登录页本身要用 Logo，且回包只是 5 个图片地址。
 	r.Get("/api/config/branding", h.ClawBranding)
+	// 客服二维码（后台「系统配置 → 客服」上传，branding/upload 同一存储）公开下发：
+	// 两端「联系客服」入口无条件常显，扫码是登录前后都可能用的能力，不要求登录。
+	r.Get("/api/config/customer-service", h.ClawCustomerService)
 	// ASR 能力声明（语音转文字开关）：登录用户可读，不给匿名探测开关状态的口子。
 	// 回包只有 enabled + 能力标识 + 文案，永不含 ask/sk（凭据只在管理端脱敏回显）。
 	// 鉴权在 handler 内走与 /api/quota/me 同一套 Bearer(rongcloud_token) 校验。

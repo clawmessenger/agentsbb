@@ -818,6 +818,37 @@ func (h *Handler) ClawUserGuide(w http.ResponseWriter, r *http.Request) {
 	clawJSON(w, 200, 200, "", cfg)
 }
 
+// customerServiceConfigKey 是客服二维码在 rongcloud_system_config 里的键。
+// config 形如 {"qr_image":"https://…"}；qr_image 为空 = 后台还没上传二维码。
+// 存的是后台 branding/upload 上传后的绝对 URL（上传时已归一），读侧无需再补。
+const customerServiceConfigKey = "customer_service"
+
+// ClawCustomerService GET /api/config/customer-service —— 公开只读，给 web 与
+// 小程序「联系客服」弹层拉二维码地址。
+//
+// 与 user-guide / branding 同套路：不需要登录（扫码联系客服是登录前后都可能
+// 用到的能力）。入口**无条件常显**（产品决定：不做任何门禁判断），后端没配
+// 时返回空 qr_image，客户端自己渲染"尚未配置"占位。
+func (h *Handler) ClawCustomerService(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var value []byte
+	err := h.DB.QueryRow(ctx,
+		"SELECT config FROM rongcloud_system_config WHERE config_key='"+customerServiceConfigKey+"' LIMIT 1").Scan(&value)
+	if err != nil {
+		clawJSON(w, 200, 200, "", map[string]interface{}{"qr_image": ""})
+		return
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(value, &cfg); err != nil {
+		// 一行坏 JSON 不该让客服入口挂掉：按没配置处理。
+		slog.Warn("customer_service: config 不是合法 JSON，按未配置下发", "error", err)
+		clawJSON(w, 200, 200, "", map[string]interface{}{"qr_image": ""})
+		return
+	}
+	qrImage, _ := cfg["qr_image"].(string)
+	clawJSON(w, 200, 200, "", map[string]interface{}{"qr_image": strings.TrimSpace(qrImage)})
+}
+
 // ClawImRefreshToken POST /api/im/refresh-token —— 用业务会话换发融云 Token。
 // 认证方式与旧 Python 端一致：Bearer 即 rongcloud_token（按 claw_im_users.rongcloud_token 认会话）。
 func (h *Handler) ClawImRefreshToken(w http.ResponseWriter, r *http.Request) {
