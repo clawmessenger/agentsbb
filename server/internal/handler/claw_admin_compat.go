@@ -287,18 +287,23 @@ func (h *Handler) ClawAdminMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---- /api/admin/users（数据源 claw_im_users） ----
+// ---- /api/admin/users（数据源：claw_im_users 人类账号 UNION ops 运维 AI 账号） ----
+
+// 运维 AI 账号从不在 claw_im_users 里：机器级 rc_node_<key>_ops、各平台
+// <platform>_<machine>_ops 等只存在于 rongcloud_node / rongcloud_user。
+// 2026-11-19 生产库实证：45 个人类账号 0 个 om_ 前缀、62 个节点的融云 ID
+// 0 个出现在 claw_im_users —— 旧实现只查 claw_im_users 加推导谓词，
+// 「运维用户」筛选器永远筛不出数据、「AI 类型」列永远是 '-'。
+// 现在列表 = 人类账号（claw_im_users）UNION ALL 运维账号（ai_type='ops'
+// 节点的融云账号）。运维账号是只读条目：状态恒 active，禁用/编辑对它们
+// 没有语义，前端不渲染操作按钮。
 
 // clawAdminOperationUserPredicate 判定一个 IM 账号是不是「运维账号」。
 //
 // claw_im_users 只装人类 IM 账号（C 端注册写入，见 claw_compat.go），没有
-// account_type / ai_type 列，所以这两列都是**推导**出来的，而不是写死：
-//   - 运维账号 = 前缀 om_ 的运维单聊账号，或被 ai_type='ops' 的运维节点占用的账号；
-//   - AI 类型 = 该账号被哪个节点占用（rongcloud_node.rongcloud_user_id）。
-//
-// 推导而不是硬编码的意义在于接口与筛选器真的会动：以前 /api/admin/users 把
-// account_type 恒返回 'normal'、ai_type 恒返回 NULL，前端的「运维用户」和
-// 「AI 类型」两个筛选器点了等于没点。
+// account_type / ai_type 列。运维 AI 账号的融云 ID 从不与人类账号重合
+// （2026-11-19 生产实证），此谓词保留作为防御性推导：万一某个节点真的
+// 占用了人类账号，该账号会被标为运维账号而不是凭空消失。
 const clawAdminOperationUserPredicate = `(
 	starts_with(u.user_id, 'om_')
 	OR EXISTS(SELECT 1 FROM rongcloud_node n
@@ -317,6 +322,72 @@ const clawAdminUserSelect = `
 
 var clawAdminUserAccountTypes = map[string]bool{"normal": true, "operation": true}
 
+// clawAdminOpsUserPlatformExpr 运维账号的「AI 类型」：融云昵称形如
+// 「qwen 运维」「opencode 运维」时取平台名，机器级通用运维（昵称就叫
+// 「运维」或无名）回落 'ops'。与前端 providers.ts 的标签映射对齐。
+const clawAdminOpsUserPlatformExpr = `CASE
+	WHEN COALESCE(ru.name,'') LIKE '%运维' AND ru.name <> '运维'
+	THEN btrim(left(ru.name, char_length(ru.name) - char_length('运维')))
+	ELSE 'ops' END`
+
+const clawAdminOpsUserSelect = `
+	SELECT n.rongcloud_user_id, COALESCE(NULLIF(ru.name,''), n.rongcloud_user_id),
+	       '', '', '', COALESCE(ru.portrait_uri,''), 'active', 'operation',
+	       ` + clawAdminOpsUserPlatformExpr + `,
+	       n.created_at, n.updated_at
+	FROM rongcloud_node n
+	LEFT JOIN rongcloud_user ru ON ru.rongcloud_user_id = n.rongcloud_user_id`
+
+// clawAdminUserListSources 组装两个数据源的过滤子句。两侧共用同一组参数
+// （Postgres 参数按整条 SQL 编号，同一 $n 可在 UNION 两侧重复出现）。
+func clawAdminUserListSources(keyword, status, accountType, aiType string) (whereA, whereB string, args []interface{}) {
+	whereA, whereB = " WHERE TRUE", " WHERE TRUE"
+	if keyword != "" {
+		args = append(args, clawAdminLikePattern(keyword))
+		n := len(args)
+		whereA += fmt.Sprintf(` AND (u.user_id ILIKE $%[1]d OR u.username ILIKE $%[1]d OR u.nickname ILIKE $%[1]d OR u.phone ILIKE $%[1]d OR u.email ILIKE $%[1]d)`, n)
+		whereB += fmt.Sprintf(` AND (n.rongcloud_user_id ILIKE $%[1]d OR COALESCE(ru.name,'') ILIKE $%[1]d)`, n)
+	}
+	if status != "" {
+		args = append(args, status)
+		n := len(args)
+		whereA += fmt.Sprintf(" AND u.status = $%d", n)
+		// 运维账号没有启停状态，恒 active：status=active 时照常返回，
+		// status=其它值时整侧排除。
+		whereB += fmt.Sprintf(" AND 'active' = $%d", n)
+	}
+	switch accountType {
+	case "operation":
+		whereA += " AND " + clawAdminOperationUserPredicate
+	case "normal":
+		whereA += " AND NOT " + clawAdminOperationUserPredicate
+		whereB += " AND FALSE"
+	}
+	if aiType != "" {
+		args = append(args, aiType)
+		n := len(args)
+		whereA += fmt.Sprintf(" AND EXISTS(SELECT 1 FROM rongcloud_node nd WHERE nd.rongcloud_user_id = u.user_id AND nd.ai_type = $%d)", n)
+		// 平台表达式含 CJK（'%运维'），不能用 Sprintf 拼（%运 会被当格式动词）。
+		whereB += " AND " + clawAdminOpsUserPlatformExpr + " = $" + strconv.Itoa(n)
+	}
+	return whereA, whereB, args
+}
+
+// clawAdminUserListSQL 人类账号 + 运维账号合并列表（按创建时间倒序分页）。
+func clawAdminUserListSQL(whereA, whereB string, limitIdx, offsetIdx int) string {
+	return "SELECT * FROM (" + clawAdminUserSelect + whereA +
+		" UNION ALL " + clawAdminOpsUserSelect + whereB +
+		") merged ORDER BY created_at DESC" +
+		fmt.Sprintf(" LIMIT $%d OFFSET $%d", limitIdx, offsetIdx)
+}
+
+// clawAdminUserCountSQL 与列表同过滤的总数（看板/分页共用口径）。
+func clawAdminUserCountSQL(whereA, whereB string) string {
+	return "SELECT (SELECT COUNT(*) FROM claw_im_users u" + whereA + ")" +
+		" + (SELECT COUNT(*) FROM rongcloud_node n" +
+		" LEFT JOIN rongcloud_user ru ON ru.rongcloud_user_id = n.rongcloud_user_id" + whereB + ")"
+}
+
 func (h *Handler) ClawAdminListUsers(w http.ResponseWriter, r *http.Request) {
 	if h.requireClawAdmin("user:read", w, r) == nil {
 		return
@@ -330,29 +401,11 @@ func (h *Handler) ClawAdminListUsers(w http.ResponseWriter, r *http.Request) {
 		clawAdminFail(w, 400, "account_type has an unsupported value")
 		return
 	}
-	where, args := " WHERE 1=1", []interface{}{}
-	if keyword != "" {
-		args = append(args, clawAdminLikePattern(keyword))
-		where += fmt.Sprintf(" AND (u.user_id ILIKE $%d OR u.username ILIKE $%d OR u.nickname ILIKE $%d OR u.phone ILIKE $%d OR u.email ILIKE $%d)", len(args), len(args), len(args), len(args), len(args))
-	}
-	if status != "" {
-		args = append(args, status)
-		where += fmt.Sprintf(" AND u.status = $%d", len(args))
-	}
-	switch accountType {
-	case "operation":
-		where += " AND " + clawAdminOperationUserPredicate
-	case "normal":
-		where += " AND NOT " + clawAdminOperationUserPredicate
-	}
-	if aiType != "" {
-		args = append(args, aiType)
-		where += fmt.Sprintf(" AND EXISTS(SELECT 1 FROM rongcloud_node n WHERE n.rongcloud_user_id = u.user_id AND n.ai_type = $%d)", len(args))
-	}
+	whereA, whereB, args := clawAdminUserListSources(keyword, status, accountType, aiType)
 	var total int
-	_ = h.DB.QueryRow(r.Context(), "SELECT COUNT(*) FROM claw_im_users u"+where, args...).Scan(&total)
+	_ = h.DB.QueryRow(r.Context(), clawAdminUserCountSQL(whereA, whereB), args...).Scan(&total)
 	args = append(args, pageSize, (page-1)*pageSize)
-	rows, err := h.DB.Query(r.Context(), clawAdminUserSelect+where+" ORDER BY created_at DESC LIMIT $"+strconv.Itoa(len(args)-1)+" OFFSET $"+strconv.Itoa(len(args)), args...)
+	rows, err := h.DB.Query(r.Context(), clawAdminUserListSQL(whereA, whereB, len(args)-1, len(args)), args...)
 	if err != nil {
 		clawAdminFail(w, 500, "database error")
 		return
@@ -579,8 +632,8 @@ func (h *Handler) clawAdminUserExists(ctx context.Context, userID string) (strin
 // ---- /api/admin/stats ----
 
 // ClawAdminStats 汇总看板卡片。这里所有数字都来自真实表，并且**与各自页面同源**：
-//   - 用户：claw_im_users（与「用户管理」同一张表；运维账号用与列表筛选器完全相同的
-//     推导规则，避免看板与列表页对不上）
+//   - 用户：claw_im_users 人类账号 + ai_type='ops' 运维节点融云账号（与
+//     「用户管理」列表页完全同一数据口径）
 //   - 节点：复用 clawAdminListNodeRecords + rongcloud.IsDisplayNode + NodeService.IsOnline，
 //     与「节点管理」页的可见性与在线判据逐行一致（以前这里恒返回 0，
 //     页面上 11 台设备显示成 0）
@@ -592,9 +645,12 @@ func (h *Handler) ClawAdminStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var users, normalUsers, operationUsers int
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users`).Scan(&users)
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users u WHERE u.status = 'active'`).Scan(&normalUsers)
-	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users u WHERE `+clawAdminOperationUserPredicate).Scan(&operationUsers)
+	// 与「用户管理」列表页同口径：普通用户 = claw_im_users，运维用户 =
+	// ai_type='ops' 的运维节点融云账号（运维账号不在 claw_im_users 里）。
+	_ = h.DB.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM claw_im_users)`+
+		` + (SELECT COUNT(*) FROM rongcloud_node WHERE ai_type = 'ops')`).Scan(&users)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM claw_im_users WHERE status = 'active'`).Scan(&normalUsers)
+	_ = h.DB.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_node WHERE ai_type = 'ops'`).Scan(&operationUsers)
 
 	// nodes / online / offline / provider 分布。取记录后在 Go 里过滤，而不是把
 	// IsDisplayNode 的判据（含 machineIdentityKey 的 sha256 分支）在 SQL 里重写一遍。

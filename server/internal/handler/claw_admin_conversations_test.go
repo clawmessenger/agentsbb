@@ -852,10 +852,12 @@ func TestClawAdminStatsReadsRealCounts(t *testing.T) {
 			return &convStubRow{err: pgx.ErrNoRows}
 		case strings.Contains(sql, "COUNT(*) FROM claw_im_users") && strings.Contains(sql, "status = 'active'"):
 			return &convStubRow{values: []any{6}}
-		case strings.Contains(sql, "COUNT(*) FROM claw_im_users") && strings.Contains(sql, "om_"):
-			return &convStubRow{values: []any{3}}
+		// 用户总数查询同时含 claw_im_users 与 rongcloud_node，必须先于
+		// 运维节点计数匹配。
 		case strings.Contains(sql, "COUNT(*) FROM claw_im_users"):
 			return &convStubRow{values: []any{7}}
+		case strings.Contains(sql, "COUNT(*) FROM rongcloud_node") && strings.Contains(sql, "ai_type = 'ops'"):
+			return &convStubRow{values: []any{3}}
 		case strings.Contains(sql, "COUNT(*) FROM rongcloud_group"):
 			return &convStubRow{values: []any{1}}
 		case strings.Contains(sql, "COUNT(*) FROM rongcloud_chatroom"):
@@ -1025,11 +1027,17 @@ func TestClawAdminListUsersFiltersOnDerivedColumns(t *testing.T) {
 			countSQL = sql
 		}
 	}
+	// 账号类型与 AI 类型筛选要落在两个数据源上：人类账号（claw_im_users）
+	// 用推导谓词，运维账号（rongcloud_node ai_type='ops' 的融云账号）用
+	// 平台表达式。
 	if !strings.Contains(countSQL, "starts_with(u.user_id, 'om_')") {
-		t.Fatalf("account_type filter not applied: %s", countSQL)
+		t.Fatalf("account_type filter not applied to human source: %s", countSQL)
 	}
-	if !strings.Contains(countSQL, "n.ai_type = $1") {
-		t.Fatalf("ai_type filter not applied: %s", countSQL)
+	if !strings.Contains(countSQL, "FROM rongcloud_node n") || !strings.Contains(countSQL, "ELSE 'ops' END = $1") {
+		t.Fatalf("ai_type filter not applied to ops source: %s", countSQL)
+	}
+	if !strings.Contains(countSQL, "nd.ai_type = $1") {
+		t.Fatalf("ai_type filter not applied to human source: %s", countSQL)
 	}
 }
 
@@ -1040,5 +1048,92 @@ func TestClawAdminListUsersRejectsUnknownAccountType(t *testing.T) {
 	h.ClawAdminListUsers(rr, convRequest(t, http.MethodGet, "/api/admin/users?account_type=weird", "", convReadOnly))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+// 用户管理列表 = 人类账号 UNION 运维 AI 账号。运维账号从不在 claw_im_users
+// 里（2026-11-19 生产实证：45 个人类账号 0 个 om_ 前缀、62 个节点融云 ID 0 个
+// 出现在 claw_im_users），列表必须从 rongcloud_node 侧把它们带出来，否则
+// 「运维用户」筛选器永远为空、AI 类型列永远是 '-'。
+func TestClawAdminListUsersIncludesOpsAccounts(t *testing.T) {
+	fake := &convFakeDB{}
+	h := newConvHandler(fake, convReadOnly)
+	created := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	qwen := "qwen"
+	fake.queryRow = func(sql string, _ []any) pgx.Row {
+		if strings.Contains(sql, "FROM claw_admin_users") {
+			return &convStubRow{values: []any{convAdminID, "boss", "老板", "role-1", "active", "超级管理员", []byte(`["user:read"]`)}}
+		}
+		return &convStubRow{values: []any{2}}
+	}
+	fake.query = func(sql string, _ []any) (pgx.Rows, error) {
+		if !strings.Contains(sql, "UNION ALL") || !strings.Contains(sql, "FROM rongcloud_node n") {
+			panic("unexpected Query: " + sql)
+		}
+		return &convStubRows{rows: [][]any{
+			{"850509", "user850509", "", "", "", "", "active", "normal", nil, created, created},
+			{"qwen_3300776275_ops", "qwen 运维", "", "", "", "", "active", "operation", &qwen, created, created},
+		}}, nil
+	}
+
+	rr := httptest.NewRecorder()
+	h.ClawAdminListUsers(rr, convRequest(t, http.MethodGet, "/api/admin/users", "", convReadOnly))
+
+	resp := dataMap(t, decodeConv(t, rr))
+	items, ok := resp["items"].([]interface{})
+	if !ok {
+		t.Fatalf("items missing: %#v", resp)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+	var opsRow map[string]interface{}
+	for _, it := range items {
+		if m, ok := it.(map[string]interface{}); ok && m["account_type"] == "operation" {
+			opsRow = m
+		}
+	}
+	if opsRow == nil {
+		t.Fatalf("ops account missing from list: %#v", items)
+	}
+	if opsRow["user_id"] != "qwen_3300776275_ops" {
+		t.Errorf("ops user_id = %#v", opsRow["user_id"])
+	}
+	if opsRow["ai_type"] != "qwen" {
+		t.Errorf("ops ai_type = %#v, want qwen", opsRow["ai_type"])
+	}
+	if opsRow["status"] != "active" {
+		t.Errorf("ops status = %#v, want active", opsRow["status"])
+	}
+}
+
+// 「运维用户」筛选只留运维侧：人类侧排除、运维侧全量。
+func TestClawAdminListUsersOpsFilterScopesBothSources(t *testing.T) {
+	fake := &convFakeDB{}
+	h := newConvHandler(fake, convReadOnly)
+	fake.queryRow = func(sql string, _ []any) pgx.Row {
+		if strings.Contains(sql, "FROM claw_admin_users") {
+			return &convStubRow{values: []any{convAdminID, "boss", "老板", "role-1", "active", "超级管理员", []byte(`["user:read"]`)}}
+		}
+		return &convStubRow{values: []any{0}}
+	}
+	fake.query = func(string, []any) (pgx.Rows, error) { return &convStubRows{}, nil }
+
+	rr := httptest.NewRecorder()
+	h.ClawAdminListUsers(rr, convRequest(t, http.MethodGet, "/api/admin/users?account_type=operation", "", convReadOnly))
+
+	listSQL := ""
+	for _, sql := range fake.stmts {
+		if strings.Contains(sql, "UNION ALL") {
+			listSQL = sql
+		}
+	}
+	if !strings.Contains(listSQL, "AND "+clawAdminOperationUserPredicate) {
+		t.Fatalf("operation filter missing on human source: %s", listSQL)
+	}
+	// account_type=operation 时运维侧本来就全是运维账号，不需要排除；
+	// AND FALSE 只在 normal 筛选时出现。
+	if strings.Contains(listSQL, "AND FALSE") {
+		t.Fatalf("ops source unexpectedly excluded for account_type=operation: %s", listSQL)
 	}
 }
