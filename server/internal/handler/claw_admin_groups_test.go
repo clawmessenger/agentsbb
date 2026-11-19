@@ -839,9 +839,6 @@ func TestClawGroupMirrorWiresEveryCallback(t *testing.T) {
 	if mirror.UpdateMeta == nil {
 		t.Error("UpdateMeta not wired")
 	}
-	if mirror.FallbackAgent == nil {
-		t.Error("FallbackAgent not wired")
-	}
 	// 成员/资料类动作（addMember、removeMember、getMembers、getMyGroups、
 	// getProfiles、getInfo、transfer、quit、dismiss）的数据侧。
 	if mirror.IsMember == nil {
@@ -870,12 +867,5 @@ func TestClawGroupMirrorWiresEveryCallback(t *testing.T) {
 	}
 }
 
-func TestClawGroupMirrorFallbackAgentNeedsTheRongCloudIntegration(t *testing.T) {
-	// RongCloudNode 为 nil（未配置融云）时必须安静地返回"没有兜底节点"，
-	// 而不是 panic 或报错。
-	h := &Handler{}
-	agentID, ok, err := h.clawGroupFallbackAgent(context.Background())
-	if err != nil || ok || agentID != "" {
-		t.Fatalf("got %q %v %v, want empty/false/nil", agentID, ok, err)
-	}
-}
+// TestClawGroupMirrorFallbackAgentNeedsTheRongCloudIntegration 已随 D-006 删除：
+// 兜底成员注入下线后 FallbackAgent 从 GroupMirror 移除，编译期即保证不再装配。

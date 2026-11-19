@@ -83,9 +83,6 @@ type GroupMirror struct {
 	// UpdateMeta applies a partial settings change (empty strings / nil pointers
 	// mean "leave as is").
 	UpdateMeta func(ctx context.Context, groupID, groupName, portraitURI, description string, maxRounds *int, stopped *bool) error
-	// FallbackAgent returns an RongCloud user id of a live agent node, used to
-	// seed a group with an AI member when the creator picked none.
-	FallbackAgent func(ctx context.Context) (string, bool, error)
 	// IsMember reports whether a RongCloud user id is in the mirrored group.
 	// addMember gates on it ("只有群成员可以邀请新成员").
 	IsMember func(ctx context.Context, groupID, userID string) (bool, error)
@@ -184,15 +181,13 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	maxRounds := groupMaxRounds(cmd.Params["openclawMaxRounds"])
 
 	userIDs := dedupeUserIDs(append([]string{ownerID}, memberIDs...))
-	// 本地部署的 AI 通过自己的融云账号收群消息。创建者没选 AI 时补一个，
-	// 否则这个群只有人类成员能收到消息（沿用旧后端语义）。
-	if !containsAgentNode(userIDs) && h.groupMirror.FallbackAgent != nil {
-		if fallback, ok, err := h.groupMirror.FallbackAgent(ctx); err == nil && ok {
-			userIDs = append(userIDs, fallback)
-		} else if err != nil {
-			h.logger.Warn("rongcloud: group create fallback agent lookup", "error", err)
-		}
-	}
+	// 不再自动兜底塞 AI 成员（缺陷 D-006，2026-11-19）：建群表单明确允许
+	// 「不选成员，先创建空群聊」，创建后却多出一个没人勾选的 opencode ——
+	// fallback 旧实现是「优先创建者自己的节点」，但 rongcloud_node 与
+	// claw_im_users 没有共用的 id 空间，「创建者的节点」根本解析不出来，
+	// 实际落成了「随便挑一个可见节点」，2026-11-18 生产事故（每个新群都被
+	// 塞进一个旧格式 opencode）和 QA 三次复现（含零智能体账号）都是它。
+	// 用户后续想加 AI，走 addMember（同样有 join 闸门）即可。
 
 	// 加入侧闸门（迁移 607 的 allow_group）也必须覆盖**建群**这条路径。
 	//

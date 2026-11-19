@@ -140,10 +140,6 @@ type groupMirrorStub struct {
 	metaCalls []groupMetaCall
 	metaErr   error
 
-	fallback    string
-	fallbackOK  bool
-	fallbackErr error
-
 	// 成员/资料类动作的状态。members 是 groupID -> userID -> role 的模拟镜像，
 	// profiles 是 getInfo/getProfiles/getMyGroups 读的资料行。
 	members  map[string]map[string]string
@@ -234,9 +230,6 @@ func (s *groupMirrorStub) mirror() *GroupMirror {
 				Description: description, MaxRounds: maxRounds, Stopped: stopped,
 			})
 			return nil
-		},
-		FallbackAgent: func(context.Context) (string, bool, error) {
-			return s.fallback, s.fallbackOK, s.fallbackErr
 		},
 		IsMember: func(_ context.Context, groupID, userID string) (bool, error) {
 			s.mu.Lock()
@@ -375,7 +368,6 @@ func TestGroupCreateHappyPath(t *testing.T) {
 	rec, srv := newGroupTestServer(t)
 	defer srv.Close()
 	stub := newGroupMirrorStub()
-	stub.fallback, stub.fallbackOK = "rc_node_machine1_opencode", true
 	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
 
 	msg := NormalizedMessage{
@@ -399,9 +391,10 @@ func TestGroupCreateHappyPath(t *testing.T) {
 	if creates[0]["groupName"] != "产品讨论" {
 		t.Errorf("groupName = %q", creates[0]["groupName"])
 	}
-	// 群主取消息发送者，而不是 payload 里的 ownerId；成员去重后补上兜底 agent。
-	if got := creates[0]["userId"]; got != "user-7,user-8,rc_node_machine1_opencode" {
-		t.Errorf("userId = %q, want owner first then deduped members then the fallback agent", got)
+	// 群主取消息发送者，而不是 payload 里的 ownerId；成员去重后不再补兜底
+	// agent（D-006：未勾选的成员不允许被自动塞进来）。
+	if got := creates[0]["userId"]; got != "user-7,user-8" {
+		t.Errorf("userId = %q, want owner first then deduped members (no fallback agent)", got)
 	}
 
 	if len(stub.saved) != 1 {
@@ -414,7 +407,7 @@ func TestGroupCreateHappyPath(t *testing.T) {
 	if saved.MaxRounds != 30 {
 		t.Errorf("mirror maxRounds = %d, want 30", saved.MaxRounds)
 	}
-	if len(saved.MemberIDs) != 3 {
+	if len(saved.MemberIDs) != 2 {
 		t.Errorf("mirror members = %v", saved.MemberIDs)
 	}
 
@@ -434,11 +427,39 @@ func TestGroupCreateHappyPath(t *testing.T) {
 	}
 }
 
+// 缺陷 D-006（2026-11-19）：建群表单明确允许「不选成员，先创建空群聊」，
+// 旧 fallback 会在此情形给群塞一个没人勾选的 opencode（QA 三次复现，含零
+// 智能体账号）。回归钉住：零选择建群时成员必须只有创建者本人。
+func TestGroupCreateEmptySelectionLeavesFallbackAgentOut(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	stub := newGroupMirrorStub()
+	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
+
+	msg := NormalizedMessage{
+		ObjectName: objectNameCommand,
+		FromUserID: "user-42",
+		Content:    `{"request_id":"r1","service":"group","action":"create","params":{"groupName":"空群","memberIds":[]}}`,
+	}
+	if err := handler.handleCommand(context.Background(), msg); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+	creates := rec.calls("/group/create.json")
+	if len(creates) != 1 {
+		t.Fatalf("create calls = %d, want 1", len(creates))
+	}
+	if got := creates[0]["userId"]; got != "user-42" {
+		t.Errorf("userId = %q, want the owner only (D-006: no auto-seeded agent)", got)
+	}
+	if len(stub.saved) == 1 && len(stub.saved[0].MemberIDs) != 1 {
+		t.Errorf("mirror members = %v, want only the owner", stub.saved[0].MemberIDs)
+	}
+}
+
 func TestGroupCreateSkipsFallbackWhenAnAgentIsSelected(t *testing.T) {
 	rec, srv := newGroupTestServer(t)
 	defer srv.Close()
 	stub := newGroupMirrorStub()
-	stub.fallback, stub.fallbackOK = "rc_node_machine1_opencode", true
 	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
 
 	msg := NormalizedMessage{
@@ -465,7 +486,6 @@ func TestGroupCreateSkipsFallbackWhenANewFormatAgentIsSelected(t *testing.T) {
 	rec, srv := newGroupTestServer(t)
 	defer srv.Close()
 	stub := newGroupMirrorStub()
-	stub.fallback, stub.fallbackOK = "rc_node_3300776275_opencode", true
 	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
 
 	msg := NormalizedMessage{
@@ -489,7 +509,6 @@ func TestGroupCreateSkipsFallbackForLegacyOpenclawSelection(t *testing.T) {
 	rec, srv := newGroupTestServer(t)
 	defer srv.Close()
 	stub := newGroupMirrorStub()
-	stub.fallback, stub.fallbackOK = "rc_node_machine1_opencode", true
 	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
 
 	msg := NormalizedMessage{

@@ -28,7 +28,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 )
 
@@ -47,7 +46,6 @@ func (h *Handler) ClawGroupMirror() *rongcloud.GroupMirror {
 		SaveGroup:        h.clawSaveGroup,
 		OwnerOf:          h.clawGroupOwner,
 		UpdateMeta:       h.clawUpdateGroupMeta,
-		FallbackAgent:    h.clawGroupFallbackAgent,
 		IsMember:         h.clawGroupIsMember,
 		AddMembers:       h.clawGroupAddMembers,
 		RemoveMember:     h.clawGroupRemoveMember,
@@ -390,56 +388,6 @@ func (h *Handler) clawUpdateGroupMeta(ctx context.Context, groupID, groupName, p
 		WHERE group_id = $1`,
 		groupID, groupName, portraitURI, description, maxRounds, stopped)
 	return err
-}
-
-// clawGroupFallbackAgent picks an agent node to seed a group with when the
-// creator selected none, otherwise the group's messages reach only humans.
-//
-// The legacy backend looked for a node owned by the creator. That is not
-// expressible here: rongcloud_node.owner_user_id points at a multica account
-// (every row shares the one installer) and shares no id space with
-// claw_im_users, so "the creator's nodes" cannot be resolved. Any
-// display-visible agent node is used instead, preferring one that is online.
-func (h *Handler) clawGroupFallbackAgent(ctx context.Context) (string, bool, error) {
-	if h.RongCloudNode == nil {
-		return "", false, nil
-	}
-	wsID, err := h.clawAdminDiscussionHostWorkspaceID(ctx)
-	if err != nil {
-		return "", false, err
-	}
-	var wsUUID pgtype.UUID
-	if err := wsUUID.Scan(wsID); err != nil {
-		return "", false, err
-	}
-	nodes, err := h.RongCloudNode.ListNodes(ctx, wsUUID)
-	if err != nil {
-		return "", false, err
-	}
-	fallback := ""
-	fallbackOnline := ""
-	for _, node := range nodes {
-		if !rongcloud.IsDisplayNode(node) {
-			continue
-		}
-		if node.RongcloudUserID == "" {
-			continue
-		}
-		if fallback == "" {
-			fallback = node.RongcloudUserID
-		}
-		if h.RongCloudNode.IsOnline(node.ID) {
-			fallbackOnline = node.RongcloudUserID
-			break
-		}
-	}
-	if fallbackOnline != "" {
-		return fallbackOnline, true, nil
-	}
-	if fallback != "" {
-		return fallback, true, nil
-	}
-	return "", false, nil
 }
 
 // ---- GET /api/admin/groups ---------------------------------------------------
