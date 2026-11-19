@@ -508,6 +508,98 @@ func (h *Handler) ClawAdminUpdateUserStatus(w http.ResponseWriter, r *http.Reque
 	clawAdminOK(w, map[string]interface{}{"ok": true})
 }
 
+// ClawAdminDeleteUser DELETE /api/admin/users/{id}
+//
+// 删除人类 IM 账号：先融云注销、后删本地行。人类账号的融云 id 就是
+// claw_im_users.user_id（注册时以 user_id 直接调 /user/getToken.json，
+// 见 claw_compat.go getUserToken），所以融云侧注销目标不需要额外映射。
+//
+// 顺序不能反：/user/deactivate.json 永久清空该 id 的资料、消息历史、会话
+// 与推送绑定（不可恢复），注销失败时本地一行不动，管理员可以直接重试；
+// 反过来先删本地行再失败，重试入口（用户行）就没了。
+//
+// 本地清理范围（都在同一个事务里，任一步失败整体回滚）：
+//   - claw_im_user_quota / claw_lobster：FK 指向 claw_im_users，不先删会
+//     挡住用户行删除（596 / 599）；
+//   - rongcloud_node.claimed_by_user_id：C 端认领投影，软引用，清成 NULL
+//     让归属判定回退到融云好友边反查（600）—— 权威好友边在融云注销时
+//     已一并消失；
+//   - im_contact_remark / im_friend_request：以 user_id 做软引用的本地行，
+//     用户没了就是垃圾数据，一并清掉；
+//   - claw_im_users 本行。
+//
+// 运维账号（AI 融云账号）不在 claw_im_users 里，天然 404；前端对它们也
+// 不渲染删除按钮，两道防线都不会碰到机器级共享 ops 账号。
+//
+// 融云集成未启用时（RongCloudNode 为 nil 或未配 API client）本地照删，
+// 但响应里 rongcloud_deactivated=false，让前端提示「融云侧未注销」。
+func (h *Handler) ClawAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	ident := h.requireClawAdmin("user:write", w, r)
+	if ident == nil {
+		return
+	}
+	userID := chi.URLParam(r, "id")
+
+	ctx := r.Context()
+	var exists bool
+	if err := h.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM claw_im_users WHERE user_id=$1)", userID).Scan(&exists); err != nil {
+		clawAdminFail(w, 500, "database error")
+		return
+	} else if !exists {
+		clawAdminFail(w, 404, "user not found")
+		return
+	}
+
+	rongcloudDeactivated := false
+	if h.RongCloudNode != nil {
+		err := h.RongCloudNode.DeactivateUserAccount(ctx, userID)
+		switch {
+		case err == nil:
+			rongcloudDeactivated = true
+		case errors.Is(err, rongcloud.ErrRongCloudClientUnavailable):
+			// 融云集成没配 client：本地照删，响应里如实标注。
+		default:
+			// 注销失败绝不能继续删本地行 —— 重试入口就靠它。409 语义：
+			// 「远端没清干净，先别删」，与 404（本地本来就没有）区分开。
+			clawAdminFail(w, 409, "融云注销失败，本地账号未删除，请稍后重试")
+			return
+		}
+	}
+
+	if h.TxStarter == nil {
+		clawAdminFail(w, 500, "database error")
+		return
+	}
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		clawAdminFail(w, 500, "database error")
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	stmts := []string{
+		`DELETE FROM claw_im_user_quota WHERE user_id = $1`,
+		`DELETE FROM claw_lobster WHERE user_id = $1`,
+		`UPDATE rongcloud_node SET claimed_by_user_id = NULL WHERE claimed_by_user_id = $1`,
+		`DELETE FROM im_contact_remark WHERE owner_user_id = $1`,
+		`DELETE FROM im_friend_request WHERE from_user_id = $1 OR to_user_id = $1`,
+		`DELETE FROM claw_im_users WHERE user_id = $1`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(ctx, stmt, userID); err != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		clawAdminFail(w, 500, "database error")
+		return
+	}
+	h.clawAdminAudit(r, ident, "admin_user_delete", "user", userID, map[string]interface{}{
+		"rongcloud_deactivated": rongcloudDeactivated,
+	})
+	clawAdminOK(w, map[string]interface{}{"ok": true, "rongcloud_deactivated": rongcloudDeactivated})
+}
+
 // ClawAdminUserNodes 返回该用户名下（按融云好友边认领）的设备。
 //
 // 归属判定与「设备管理」页同源：rongcloud_node.owner_user_id 指向 multica 账号，

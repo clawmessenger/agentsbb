@@ -478,6 +478,12 @@ var ErrWorkspaceAttributionRequired = errors.New("rongcloud: workspace attributi
 // ticket must fail loudly, not silently drop the attribution.
 var ErrInvalidPairingTicket = errors.New("rongcloud: invalid or expired pairing ticket")
 
+// ErrRongCloudClientUnavailable is returned when a caller asks for a remote
+// rongcloud operation but the API client was never wired in (integration
+// disabled). Callers use it to distinguish "nothing to do remotely" from an
+// actual rongcloud failure that must abort the flow.
+var ErrRongCloudClientUnavailable = errors.New("rongcloud: API client not configured")
+
 type workspaceAttribution struct {
 	workspaceID pgtype.UUID
 	ownerUserID pgtype.UUID
@@ -1520,6 +1526,21 @@ func (s *NodeService) DeleteDevice(ctx context.Context, id pgtype.UUID) error {
 		return errors.New("rongcloud: database not configured")
 	}
 	return s.queries.DeleteRongCloudDevice(ctx, id)
+}
+
+// DeactivateUserAccount 在融云侧永久注销一个任意融云账号（人类 IM 用户或
+// 运维账号），资料、消息历史、会话与推送绑定全部清空，user id 只能以空
+// 身份重新激活，不可恢复。与 UnregisterNode 的注销共用同一个融云 API，
+// 但不附带任何本地节点清理 —— 调用方（管理端删除用户）自行负责本地行的
+// 处置，且必须先注销融云、后删本地行：注销失败时本地什么都没动，可以直接
+// 重试；反过来本地行没了重试入口就丢了。
+func (s *NodeService) DeactivateUserAccount(ctx context.Context, rongcloudUserID string) error {
+	if s.client == nil {
+		// 融云集成未启用：没有可注销的远端实体。返回哨兵让调用方区分
+		// 「集成本来就没开（不算失败）」与「融云调用失败（必须中断）」。
+		return ErrRongCloudClientUnavailable
+	}
+	return s.client.DeactivateUser(ctx, rongcloudUserID)
 }
 
 type DeviceCreateParams struct {

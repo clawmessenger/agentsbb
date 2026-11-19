@@ -1773,6 +1773,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/users/{id}", h.ClawAdminGetUser)
 	r.Put("/api/admin/users/{id}", h.ClawAdminUpdateUser)
 	r.Put("/api/admin/users/{id}/status", h.ClawAdminUpdateUserStatus)
+	// 删除用户：先融云注销（不可恢复）后删本地行，见 ClawAdminDeleteUser。
+	r.Delete("/api/admin/users/{id}", h.ClawAdminDeleteUser)
 	r.Get("/api/admin/users/{id}/nodes", h.ClawAdminUserNodes)
 	r.Get("/api/admin/users/{id}/groups", h.ClawAdminUserGroups)
 	// 用户配额（保存即生效；updated_by 记管理员账号）。
