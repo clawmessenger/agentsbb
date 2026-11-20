@@ -558,7 +558,9 @@ func userSearchSQLChecks() []userSearchSQLCheck {
 			regexp.MustCompile(`(?i)LEFT\(\s*username\s*,\s*3\s*\)\s*(?:<>|!=)\s*'om_'`)},
 		{"the om_ user_id exclusion `LEFT(user_id, 3) <> 'om_'",
 			regexp.MustCompile(`(?i)LEFT\(\s*user_id\s*,\s*3\s*\)\s*(?:<>|!=)\s*'om_'`)},
-		{"a `username ILIKE $1` exact hit column (虾说号)", userSearchILikeColumn("username")},
+		// 2026-11-20（QA5-DEF-08）：username 已彻底退出命中条件（它是登录账号，
+		// 不是虾说号），因此这里只剩 user_id 一条命中列。username 的「必须不出现」
+		// 断言在 TestUserSearchQueryShape 里单独写（见 userSearchHitsUsername）。
 		{"the exact `user_id = $1` hit column (legacy accounts without a username)",
 			regexp.MustCompile(`(?i)\buser_id\s*=\s*\$1\b`)},
 		{"the ordering `ORDER BY created_at DESC`",
@@ -609,6 +611,23 @@ func userSearchNormalizeSQL(sql string) string {
 
 // SQL 文本形状：这条 SELECT 从未在真库上跑过，因此每个关键片段都当契约钉住。
 // 归一化空白后逐段断言，失败信息直接点名缺哪一段。
+// usernameHitCheckName 是「username 不得参与命中」这条否定断言在反证表里的名字。
+// 它没有对应的 userSearchSQLChecks 条目（那张表只放「必须出现」的检查），
+// 由 TestUserSearchQueryChecksRejectBrokenSQL 单独分支处理。
+const usernameHitCheckName = "username 不是命中列（登录账号 ≠ 虾说号）"
+
+// userSearchHitsUsername 判定这条 SQL 是否把 username（登录账号）当成命中列。
+//
+// 单独抽出来是因为它断言的是「必须不出现」，与 userSearchSQLChecks 那张「必须
+// 出现什么」的表结构不同：塞进去会让逐段改坏的反证退化。`LEFT(username, 3)
+// <> 'om_'` 这类过滤不参与命中，所以正则只认「username 与 $1 比较」。
+func userSearchHitsUsername(sql string) bool {
+	return userSearchUsernameHitPattern.MatchString(sql)
+}
+
+var userSearchUsernameHitPattern = regexp.MustCompile(`(?i)\busername\s*(?:=|ILIKE)\s*\$1\b`)
+
+// TestUserSearchQueryShape 断言 SQL 文本形状（见上）。
 func TestUserSearchQueryShape(t *testing.T) {
 	sql, raw := userSearchCapturedSQL(t)
 
@@ -619,6 +638,13 @@ func TestUserSearchQueryShape(t *testing.T) {
 		if !check.re.MatchString(sql) {
 			t.Errorf("the search SQL is missing %s\n--- normalized SQL ---\n%s", check.what, sql)
 		}
+	}
+	// QA5-DEF-08：登录账号（phone/email 形态的 username）不能当虾说号用。
+	// 早先这条 SQL 是 `username ILIKE $1 OR user_id = $1`，于是「输入好友手机号」
+	// 能直接搜到人 —— 好友搜索等于手机号反查器。
+	if userSearchHitsUsername(sql) {
+		t.Errorf("the WHERE clause still matches username against $1 — username 是登录账号"+
+			"（常为手机号/邮箱），加好友只允许按虾说号（user_id）精确查找\n--- normalized SQL ---\n%s", sql)
 	}
 
 	// 关键字绝不能拼进 SQL 文本：那既是注入面，也会让 `%` 退化成「捞全表」。
@@ -791,11 +817,18 @@ func TestUserSearchQueryChecksRejectBrokenSQL(t *testing.T) {
 			},
 		},
 		{
-			name: "username stops being a case-insensitive hit column",
-			what: "a `username ILIKE $1` exact hit column (虾说号)",
+			// QA5-DEF-08 的回退形态：又把登录账号塞回命中条件。
+			name: "username is hit again (login account leaks back into search)",
+			what: usernameHitCheckName,
 			mutate: func(s string) string {
-				// 换回大小写敏感的 `= $1`：虾说号输入大小写不一致就搜不到自己。
-				return strings.Replace(s, "username ILIKE $1", "username = $1", 1)
+				return strings.Replace(s, "user_id = $1", "user_id = $1 OR username = $1", 1)
+			},
+		},
+		{
+			name: "username becomes a case-insensitive hit column",
+			what: usernameHitCheckName,
+			mutate: func(s string) string {
+				return strings.Replace(s, "user_id = $1", "user_id = $1 OR username ILIKE $1", 1)
 			},
 		},
 		{
@@ -810,7 +843,8 @@ func TestUserSearchQueryChecksRejectBrokenSQL(t *testing.T) {
 			name: "the keyword gets wrapped in % wildcards again",
 			what: "no `%` wildcard anywhere (exact match, not LIKE-prefix)",
 			mutate: func(s string) string {
-				return strings.Replace(s, "username ILIKE $1", "username ILIKE '%' || $1 || '%'", 1)
+				return strings.Replace(s, "n.rongcloud_user_id ILIKE $1",
+					"n.rongcloud_user_id ILIKE '%' || $1 || '%'", 1)
 			},
 		},
 		{
@@ -876,6 +910,17 @@ func TestUserSearchQueryChecksRejectBrokenSQL(t *testing.T) {
 			if broken == real {
 				t.Fatalf("the mutation did not change the SQL, so this reverse test proves nothing — "+
 					"fix the mutate function for %q", breakage.name)
+			}
+			// 否定断言单独走一条：它的「变红」条件是 broken 里又出现了
+			// `username = $1 / ILIKE $1`，而不是某条正则是必匹配。
+			if breakage.what == usernameHitCheckName {
+				// 否定断言的「抓住」= 变体里确实又出现了 username 命中列；
+				// 没抓住说明这条断言是空的（和正则是必匹配那批的判定方向相反）。
+				if !userSearchHitsUsername(broken) {
+					t.Errorf("the negative check %q still matches a broken SQL — username "+
+						"又回到命中条件了\n--- broken SQL ---\n%s", breakage.what, broken)
+				}
+				return
 			}
 			checks := userSearchSQLChecks()
 			var target *userSearchSQLCheck

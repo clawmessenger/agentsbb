@@ -798,6 +798,20 @@ func (h *Handler) ClawUserUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 同步本地镜像 rongcloud_user（QA5-DEF-07）：这一行才是通讯录 / 群成员 / 讨论
+	// 花名册的数据源（service=user|group getProfiles 读它）。此前只写
+	// claw_im_users + 推融云，镜像永远是注册时的默认头像 —— 同一个人在自己顶部
+	// 导航是新头像，在别人的通讯录里却是默认虾说图标。
+	//
+	// 只 UPDATE 不 INSERT：镜像行的 workspace_id 由节点装配流程决定，读路径上
+	// 凭空造一行会让节点列表多出一个「无 workspace 的人」。行不存在时
+	// getProfiles 已改走 claw_im_users 兜底，同样能拿到新头像。
+	if _, err := h.DB.Exec(ctx,
+		"UPDATE rongcloud_user SET name=$1, portrait_uri=$2 WHERE rongcloud_user_id=$3",
+		set(req.Nickname, u.Nickname), nextPortrait, u.UserID); err != nil {
+		slog.Warn("claw: sync rongcloud_user mirror after profile update failed",
+			"user_id", u.UserID, "error", err)
+	}
 	updated, _ := h.clawQueryUser(ctx, "user_id", u.UserID)
 	clawJSON(w, 200, 200, "", clawUserJSON(updated))
 }

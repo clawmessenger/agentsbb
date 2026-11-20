@@ -133,6 +133,9 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			// 分开装配：friendStore 只服务好友边归属投影，审批状态在这张表里。
 			systemHandler.friendRequests = NewFriendRequestStore(deps.DB, logger)
 			systemHandler.userStore = NewUserStore(deps.DB)
+			// 真人资料的权威来源（claw_im_users）：getProfiles 优先读它，镜像只兜
+			// 节点账号。见 user_profiles_command.go 文件头的 2026-11-20 修订。
+			systemHandler.humanProfiles = loadHumanProfiles(deps.DB)
 			// Web 扫码登录的确认表（migrations/604）。签发/兑换在 HTTP 侧
 			// （internal/handler/claw_web_qr_login.go），移动端确认走这里。
 			systemHandler.webLoginSessions = NewWebLoginSessionStore(deps.DB, logger)

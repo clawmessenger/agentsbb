@@ -520,3 +520,78 @@ func TestUserProfilesActionIsRouted(t *testing.T) {
 	}
 	wantWebError(t, reply, 503, "user service is unavailable")
 }
+
+// QA5-DEF-07：真人资料以 claw_im_users 为准，镜像只兜节点账号。
+//
+// 现场：同一个人在顶部导航是刚换的头像，通讯录里却是默认虾说图标 —— 因为
+// ClawUpdateUserProfile 只写 claw_im_users + 推融云，镜像 rongcloud_user 还停在
+// 注册时的 default_user.png，而 getProfiles 只读镜像。这里钉住「真人行覆盖镜像」，
+// 防止有人把数据源又收窄回镜像一张表。
+func TestUserProfilesPreferTheRealAccountOverTheStaleMirror(t *testing.T) {
+	dbtx := &capturingDBTX{rows: [][]string{
+		// 镜像里是注册时的默认头像（历史数据就是这样）
+		profileMirrorRow("564639", "billy", "https://agentsbb.quukk.com/default_user.png"),
+		// 节点账号没有 claw_im_users 行，只能靠镜像
+		profileMirrorRow("rc_node_m1_codex", "代码助手", "https://example.test/node.png"),
+	}}
+	rec, handler := newProfilesHandler(t, db.New(dbtx))
+	handler.humanProfiles = func(_ context.Context, ids []string) (map[string]humanProfile, error) {
+		out := map[string]humanProfile{}
+		for _, id := range ids {
+			if id == "564639" {
+				out[id] = humanProfile{
+					nickname:    "billy",
+					portraitURI: "https://agentsbb.quukk.com/api/claw/files/claw-files/user-564639/a.jpg",
+				}
+			}
+		}
+		return out, nil
+	}
+
+	sendWebCommand(t, handler, "user-7", "user", "getProfiles",
+		map[string]interface{}{"userIds": []interface{}{"564639", "rc_node_m1_codex"}})
+
+	reply := rec.last(t)
+	if reply["status"] != "success" {
+		t.Fatalf("status = %#v, want success (reply %#v)", reply["status"], reply)
+	}
+	list := wantProfilesData(t, reply)
+	human := profilesEntry(t, list, 0)
+	if got, want := human["portraitUri"], "https://agentsbb.quukk.com/api/claw/files/claw-files/user-564639/a.jpg"; got != want {
+		t.Errorf("data[0].portraitUri = %#v, want the claw_im_users avatar %q — "+
+			"reading only the mirror is exactly the '通讯录显示默认图' bug", got, want)
+	}
+	// 节点账号不受影响：镜像仍是它的唯一来源。
+	node := profilesEntry(t, list, 1)
+	if got, want := node["portraitUri"], "https://example.test/node.png"; got != want {
+		t.Errorf("data[1].portraitUri = %#v, want the mirror value %q for agent nodes", got, want)
+	}
+	if got, want := node["nickname"], "代码助手"; got != want {
+		t.Errorf("data[1].nickname = %#v, want %q", got, want)
+	}
+}
+
+// loadHumanProfiles 的 SQL 形状：批量 ANY 绑定 + 只取两列，且不得回退去写库。
+func TestLoadHumanProfilesIsABatchReadOnlyLookup(t *testing.T) {
+	dbtx := &capturingDBTX{rows: [][]string{{"564639", "billy", "https://example.test/a.jpg"}}}
+	lookup := loadHumanProfiles(dbtx)
+	if lookup == nil {
+		t.Fatal("loadHumanProfiles returned nil for a non-nil DBTX")
+	}
+	got, err := lookup(context.Background(), []string{"564639"})
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if profile, ok := got["564639"]; !ok || profile.portraitURI != "https://example.test/a.jpg" {
+		t.Fatalf("lookup = %#v, want 564639 with its portrait", got)
+	}
+	if !strings.Contains(dbtx.sql, "claw_im_users") || !strings.Contains(dbtx.sql, "ANY($1)") {
+		t.Fatalf("query = %s, want a batch ANY($1) read over claw_im_users", dbtx.sql)
+	}
+	if strings.Contains(strings.ToLower(dbtx.sql), "update") || strings.Contains(strings.ToLower(dbtx.sql), "insert") {
+		t.Fatalf("query = %s, must stay read-only — the write-back lives in ClawUpdateUserProfile", dbtx.sql)
+	}
+	if loadHumanProfiles(nil) != nil {
+		t.Fatal("loadHumanProfiles(nil) must return nil so getProfiles falls back to the mirror")
+	}
+}

@@ -18,6 +18,13 @@ package rongcloud
 // 成员，逐个回填既慢又会把命令通道拖向客户端 15s 超时，所以与 group 域的
 // getProfiles（group_members.go:263）同一口径：**本地镜像就是权威投影**。
 //
+// 2026-11-20 修订（QA5-DEF-07）：镜像不再是真人的唯一来源。真人改头像/昵称走
+// ClawUpdateUserProfile，它只写 claw_im_users + 推融云，**不写 rongcloud_user**
+// —— 于是「顶部导航是自己新头像，通讯录里同一个虾说号却是默认图」。现在真人
+// 优先读 claw_im_users（同一份数据源，改完立即生效），镜像只兜节点账号；两边
+// 都缺的字段再回融云补一次（与 user/search 共用 enrichUserSummariesFromRongCloud）。
+// 镜像写回放在 ClawUpdateUserProfile，这里不写库 —— 读路径不该引入锁竞争。
+//
 // 语义决定（与 review 方案对齐）：
 //   1. 空列表回 200 + []，不是 400。调用方（contacts.ts）包在 bestEffortWithin
 //     （失败吞成 []）里，空列表在前端语义里是合法回包；回 400 只会把「没传 id」
@@ -36,9 +43,7 @@ import (
 	"strings"
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-)
-
-// userProfilesLimit 是单次请求的 id 数上限。回包是一条 IM 私聊消息（web 15s 超时
+)// userProfilesLimit 是单次请求的 id 数上限。回包是一条 IM 私聊消息（web 15s 超时
 // 链路），不设上限的话一次恶意/误用请求能把整张镜像表塞进一条消息。前端
 // contacts.ts 的真实调用规模是「好友列表 + 自己」，几十为上限，200 给足余量。
 const userProfilesLimit = 200
@@ -76,26 +81,110 @@ func (h *systemHandler) handleUserProfiles(ctx context.Context, msg NormalizedMe
 		byID[row.RongcloudUserID] = row
 	}
 
+	// 真人账号以 claw_im_users 为准（见文件头 2026-11-20 修订）。查不到就退回
+	// 镜像；查询报错不降级成 503 —— 镜像还在手上，少一份更准的名字/头像不该
+	// 让整个花名册打不开。
+	humans := map[string]humanProfile{}
+	if h.humanProfiles != nil {
+		var err error
+		humans, err = h.humanProfiles(ctx, userIDs)
+		if err != nil {
+			h.logger.Warn("rongcloud: user profiles human lookup", "error", err, "count", len(userIDs))
+			humans = map[string]humanProfile{}
+		}
+	}
+
 	// 按请求顺序逐 id 组装；镜像没有的 id 补占位条目（见文件头语义决定 2）。
 	profiles := make([]map[string]interface{}, 0, len(userIDs))
+	// 两边都拿不到名字/头像的条目留给融云补一次（只补空字段，见 enrich 注释）。
+	needEnrich := make([]UserSummary, 0, len(userIDs))
 	for _, id := range userIDs {
 		row, found := byID[id]
-		if !found {
-			profiles = append(profiles, map[string]interface{}{
-				"userId":      id,
-				"username":    id,
-				"nickname":    "",
-				"portraitUri": "",
-			})
-			continue
+		human := humans[id]
+		name := strings.TrimSpace(human.nickname)
+		portrait := strings.TrimSpace(human.portraitURI)
+		if name == "" && found {
+			name = strings.TrimSpace(row.Name.String)
 		}
-		name := strings.TrimSpace(row.Name.String)
+		if portrait == "" && found {
+			portrait = strings.TrimSpace(row.PortraitUri.String)
+		}
+		if name == "" || portrait == "" {
+			needEnrich = append(needEnrich, UserSummary{UserID: id, Nickname: name, PortraitURI: portrait})
+		}
 		profiles = append(profiles, map[string]interface{}{
-			"userId":      row.RongcloudUserID,
-			"username":    row.RongcloudUserID,
+			"userId":      id,
+			"username":    id,
 			"nickname":    name,
-			"portraitUri": strings.TrimSpace(row.PortraitUri.String),
+			"portraitUri": portrait,
 		})
 	}
+	// 融云补全按切片原地改，再按 id 回填（回包已经按请求顺序排好了，不能重排）。
+	if h.client != nil && len(needEnrich) > 0 {
+		enrichUserSummariesFromRongCloud(ctx, h.client, h.logger, needEnrich)
+		filled := make(map[string]UserSummary, len(needEnrich))
+		for _, item := range needEnrich {
+			filled[item.UserID] = item
+		}
+		for _, profile := range profiles {
+			id, _ := profile["userId"].(string)
+			item, ok := filled[id]
+			if !ok {
+				continue
+			}
+			if item.Nickname != "" {
+				profile["nickname"] = item.Nickname
+			}
+			if item.PortraitURI != "" {
+				profile["portraitUri"] = item.PortraitURI
+			}
+		}
+	}
 	return h.sendWebOK(ctx, msg, cmd, profiles)
+}
+
+// humanProfile 是 claw_im_users 里真人账号的展示字段（只读两列）。
+type humanProfile struct {
+	nickname    string
+	portraitURI string
+}
+
+// humanProfileLookup 是真人资料的读取接缝：生产实现走 claw_im_users（见
+// loadHumanProfiles），测试注入假数据即可，不必起库。
+type humanProfileLookup func(ctx context.Context, userIDs []string) (map[string]humanProfile, error)
+
+// loadHumanProfiles 从 claw_im_users 批量取真人的昵称与头像。
+//
+// 为什么不用 sqlc：这个 service 的本地表读写一律走参数化 SQL（registration.go
+// 的 ChannelDeps.DB 注释），user/search 也是同一套；为两列再生成一次 sqlc 查询
+// 只会让生成代码与手写 SQL 两套口径并存。
+//
+// 空 nickname / portrait_uri 原样返回空串（NULL 折成 ''），由调用方决定要不要
+// 退回镜像 —— 这里不做 COALESCE 到其它列，昵称回退成账号名是历史污染源。
+func loadHumanProfiles(dbtx db.DBTX) humanProfileLookup {
+	if dbtx == nil {
+		return nil
+	}
+	return func(ctx context.Context, userIDs []string) (map[string]humanProfile, error) {
+		out := make(map[string]humanProfile, len(userIDs))
+		if len(userIDs) == 0 {
+			return out, nil
+		}
+		rows, err := dbtx.Query(ctx, `
+			SELECT user_id, COALESCE(nickname, ''), COALESCE(portrait_uri, '')
+			  FROM claw_im_users
+			 WHERE user_id = ANY($1)`, userIDs)
+		if err != nil {
+			return out, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, nickname, portrait string
+			if err := rows.Scan(&id, &nickname, &portrait); err != nil {
+				return out, err
+			}
+			out[id] = humanProfile{nickname: nickname, portraitURI: portrait}
+		}
+		return out, rows.Err()
+	}
 }

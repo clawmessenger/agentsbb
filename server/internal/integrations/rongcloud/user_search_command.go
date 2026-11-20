@@ -43,15 +43,17 @@ package rongcloud
 // 于是「递增关键字 + 观察结果」就能把手机号、邮箱、真实姓名逐位枚举出来 ——
 // 客户端那层 `pickExactShuoshuoId` 只能挡住界面，直接打 IM 命令通道照样能捞人。
 //
-// 现在的判定（`username ILIKE $1 OR user_id = $1`）：
-//   - `$1` 是**原样关键字**，不再包 `%...%`。ILIKE 不带通配符就是「忽略大小写的
-//     等值」，所以 `%`/`_` 这类 LIKE 元字符天然失效，不需要转义（也不能再包通配符，
-//     否则 `alice%` 又能把前缀匹配捡回来）；
+// 现在的判定（`user_id = $1`）：
+//   - `$1` 是**原样关键字**，精确等值；`%`/`_` 这类 LIKE 元字符天然失效，也不
+//     需要转义；
 //   - nickname / email / phone 彻底退出 WHERE（连「命中但不回传」都不再成立）；
-//   - 保留 `user_id` 精确等值，只为那批没有 username 的老账号还能被找到；userId 是
-//     不可猜的串，不构成枚举入口；
-//   - `claw_im_users.username` 有 UNIQUE 约束（migrations/583），所以这个判定最多
-//     命中一条真人账号，`LIMIT 20` 保留只为兜住「username 与 user_id 同时命中」。
+//   - 2026-11-20（QA5-DEF-08）`username` 也退出 WHERE。在此之前它被当成「虾说号」
+//     保留在命中条件里，而真实库里 username 就是**登录账号**（手机号/邮箱），于是
+//     「输入某个好友的手机号能搜到他」—— 好友搜索变成了手机号反查器。全平台的
+//     虾说号口径是 `claw_im_users.user_id`（web lib/user-profile.ts、小程序资料页
+//     一致），这里必须同口径。
+//   - `claw_im_users.user_id` 是不可猜的串，不构成枚举入口；`LIMIT 20` 保留只为
+//     兜住「真人与节点账号 id 同时命中」这种理论情况。
 //
 // 客户端（web `AddFriendDialog.pickExactShuoshuoId`、小程序 `search-user`）仍保留
 // 一层精确过滤：发布顺序上总是前端先上、后端后上，旧后端还在跑的那段时间里，
@@ -264,7 +266,7 @@ func searchClawIMUsers(ctx context.Context, dbtx db.DBTX, keyword string, limit 
 			 WHERE status = 'active'
 			   AND LEFT(username, 3) <> 'om_'
 			   AND LEFT(user_id, 3) <> 'om_'
-			   AND (username ILIKE $1 OR user_id = $1)
+			   AND (user_id = $1)
 			UNION ALL
 			-- 节点账号：虾说号 = 融云账号。两类内部节点必须排除，判据与好友列表的
 			-- isHiddenNode（node_service.go:254）同源：

@@ -43,6 +43,11 @@ type systemHandler struct {
 	// 与 friendStore 分开：前者是审批过程的状态，后者是好友边归属的投影。
 	friendRequests *FriendRequestStore
 	userStore      *UserStore
+	// humanProfiles 是 service=user/getProfiles 的真人资料补充（claw_im_users）。
+	// 镜像 rongcloud_user 只在节点账号上权威：真人改头像只写 claw_im_users，
+	// 不补这一步就会出现「顶部导航是新头像、通讯录是默认图」（QA5-DEF-07）。
+	// nil 表示未装配 DB，退回纯镜像（行为与修复前一致）。
+	humanProfiles humanProfileLookup
 	// conversations 是「融云会话号映射」表的读写（migrations/605，移植自旧
 	// Python 的 service=conversation）。客户端「个人资料 → 发消息」会调用，
 	// 缺了它每次都收到 404「未知的服务或操作」（见 conversation_command.go）。
