@@ -55,7 +55,58 @@ func (h *Handler) ClawGroupMirror() *rongcloud.GroupMirror {
 		GroupProfiles:    h.clawGroupProfiles,
 		SetOwner:         h.clawGroupSetOwner,
 		DeleteGroup:      h.clawGroupDelete,
+		ResolveMemberIDs: h.clawResolveGroupMemberIDs,
 	}
+}
+
+// clawResolveGroupMemberIDs 把建群 memberIds 里可能混入的非融云身份标识
+// （username / 虾说号 / 手机号 / 邮箱）反查成融云 userId，返回
+// identifier -> rongcloudUserID 的映射。
+//
+// D-002：客户端把 ownerId（平台 user.userId 或 username/phone）塞进
+// memberIds 首项，与同一人的融云 id 并存；集成层只按字符串去重，于是融云
+// 把同一个人建成两个成员。归一后就地折叠。
+//
+// 口径与登录查询 clawQueryUserByIdentifier 完全同源：username / user_id /
+// phone / email 四列 OR，username 优先（D-015 定下的约定，查重/归一漏掉
+// username 就会「绑定了却登进别人号」）。
+//
+// 关键安全点：**查不到的标识不进 map**，集成层的 canonicalizeMemberIDs 会
+// 原样保留。AI 节点（rc_node_* / <agent>_<machine> / claw_*）、机器级运维
+// 账号、以及本来就是融云 id 的真人都不在 claw_im_users 里，绝不能因为
+// 「归一」把它们从成员名单里弄丢（2026-11-18 事故的教训）。
+// 逐条查询而非拼批量 SQL：建群成员数很小，且这样能完全复用登录口径、
+// 不引入新的数组参数/列依赖。h.DB 为 nil（未装配 DB 的部署或测试）时返回
+// 空 map，等于关闭归一，退回历史行为。
+func (h *Handler) clawResolveGroupMemberIDs(ctx context.Context, identifiers []string) (map[string]string, error) {
+	resolved := make(map[string]string)
+	if h.DB == nil {
+		return resolved, nil
+	}
+	seen := make(map[string]struct{}, len(identifiers))
+	for _, raw := range identifiers {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		u, err := h.clawQueryUserByIdentifier(ctx, id)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// 查不到 = 不是 claw_im_users 里的人类账号标识（AI 节点、
+				// 运维账号等）。原样保留，不进 map，也不当成错误中断建群。
+				continue
+			}
+			return nil, err
+		}
+		if u != nil && u.UserID != "" {
+			resolved[id] = u.UserID
+		}
+	}
+	return resolved, nil
 }
 
 // clawGenerateGroupID 生成 6 位起、在用户/群组/节点三张表之间都不重复的纯数字 ID。

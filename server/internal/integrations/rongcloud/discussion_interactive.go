@@ -2619,6 +2619,21 @@ func (rt *discussionRuntime) interactiveCancel(ctx context.Context, d Discussion
 		return rt.advanceErrorResult(ctx, err, d.DiscussionID)
 	}
 	rt.interactiveSettleActive(ctx, d.DiscussionID)
+	// QA4-DEF-07：与 legacy actionStop / actionCancel（discussion_runtime.go）
+	// 对齐 —— 停止讨论不能只改 DB 状态，还必须把「已取消」私发给正在跑
+	// 的成员/主持节点，设备端据此中止在途的 agent 任务。此前 v3 这条路径
+	// 漏了这一步，结果就是「点了停止讨论，思考任务还在继续」。
+	// notifyCancelSafe 复用现成的 discussion_cancel v2 信封（设备端已识别），
+	// best-effort：融云侧失败不阻断已提交的状态机结果，不改设备端、不建新表。
+	rt.notifyCancelSafe(ctx, advanced)
+	// TODO(QA4-DEF-07 b, 本次未改)：cancelled/stopped 时若某轮主持总结始终
+	// 没产出，该轮 rongcloud_discussion_round_document 会缺失，前端可能一直
+	// 显示「正在思考」。本可在这里用已产出的成员发言补一份「已中止」轮次
+	// 文档，但 round_document 的唯一键 (discussion_id, round, revision)、
+	// snapshotView 的文档 shape 与前端校验都是既有契约，硬插占位纪要有被
+	// 当成正常纪要渲染的回归风险，属于状态机大改，超出「低风险兜底」范围。
+	// 停止时已置 cancelled 终态、settle 在途派发并广播 discussion_cancelled
+	// 事件，前端应据此收敛；彻底解决需连同前端 / 设备端一起设计。
 	label := "user_cancelled"
 	if reason != "" && strings.Contains(reason, "stop") {
 		label = "stopped"
