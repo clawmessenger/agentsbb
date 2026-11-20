@@ -151,6 +151,10 @@ type relaySession struct {
 	// ——长思考轮下尤其明显（等 3 分钟才轮到自己说话，却说不上）。
 	// 现在改为排队：当前中继跑完，接着用 pending 起一段新的。
 	pending *relayPending
+	// triggerMessageUID 是触发本次接龙的那条群消息的融云 messageUId（web 传入）。
+	// 用户撤回这条消息时，web 会调 abortRelayGroupMessage 按它精确匹配中止；
+	// 不用文字/时间猜，避免撤回别的旧消息把正在进行的接龙误停。
+	triggerMessageUID string
 	// stopped 表示本次中继是被群主「暂停 OpenClaw」提前收尾的。
 	//
 	// 语义（2026-11-06 拍板）：暂停不打断**正在发言**的那一位 —— 它的回包照常
@@ -616,6 +620,17 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 	}()
 	for s.roundIndex < s.totalRounds {
 		for s.index < len(s.members) {
+			// 触发消息被撤回（QA5-DEF-06）：与「暂停」同语义 —— 正在发言的那位
+			// 把话说完，之后不再派下一位。标记由 AbortGroupRelay 在 h.mu 内写入。
+			h.mu.Lock()
+			aborted := s.stopped
+			h.mu.Unlock()
+			if aborted {
+				h.rt.logger.Info("relay: trigger message recalled, stopping before next speaker",
+					"group", s.chatroomRCID, "round", s.roundIndex+1,
+					"spoke", len(s.replies), "remaining", len(s.members)-s.index)
+				return
+			}
 			// 群主暂停：当前这一位已经说完（回包在 AcceptResponse 里广播完毕），
 			// 在派下一位**之前**收尾。检查放在派发前而不是每个成员回包后，是为了
 			// 保证「正在发言的说完、没发言的不再开口」这条语义。
@@ -782,7 +797,24 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 						pauseCheckedAt = time.Now()
 						h.mu.Lock()
 						quiet := ext.renews == 0
+						abortedNow := s.stopped
 						h.mu.Unlock()
+						// 触发消息被撤回且这位还没开口：不必再等满超时，直接收尾。
+						// 已经产出过流帧的照旧等它说完（与暂停同一取向）。
+						if quiet && abortedNow {
+							h.rt.logger.Info("relay: trigger message recalled before the dispatched member produced anything",
+								"group", s.chatroomRCID, "target", member.rcID,
+								"round", s.roundIndex+1)
+							h.mu.Lock()
+							if s.requestID == requestID {
+								s.requestID = ""
+							}
+							if s.turnExt == ext {
+								s.turnExt = nil
+							}
+							h.mu.Unlock()
+							return
+						}
 						if quiet && h.groupPaused(ctx, s.chatroomRCID) {
 							h.rt.logger.Info("relay: group paused before the dispatched member produced anything",
 								"group", s.chatroomRCID, "target", member.rcID,

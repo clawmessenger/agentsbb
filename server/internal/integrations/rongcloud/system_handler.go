@@ -526,7 +526,7 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 		"start": true, "getActive": true, "continue": true, "finish": true,
 		"cancel": true, "interject": true, "retry": true, "stop": true,
 		"recommendRoles": true, "createRoundtable": true, "resumeRoundtable": true, "restartRoundtable": true,
-		"relayMessage": true, "relayGroupMessage": true,
+		"relayMessage": true, "relayGroupMessage": true, "abortRelayGroupMessage": true,
 		// 引导式创建（configuring 链路）六个 action，与旧五阶段并行（uniapp 仍走旧链路）。
 		"createRoundtableShell": true, "submitSetupTopic": true, "requestRoleRecommend": true,
 		"confirmRoundtableSetup": true, "resumeSetup": true, "touchSetup": true,
@@ -581,10 +581,30 @@ func (h *systemHandler) handleDiscussionCommand(ctx context.Context, msg Normali
 			return h.replyErr(ctx, msg, cmd, 500, "查询群成员失败")
 		}
 		// 发起者校验用全量成员（真人发起），发言列表用 AI 过滤结果。
-		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelay(
+		triggerMessageUID := getStringAny(cmd.Params, "trigger_message_u_id", "triggerMessageUId", "triggerMessageUID")
+		return h.replyCommandResult(ctx, msg, cmd, h.relayHub.StartGroupRelayWithTrigger(
 			ctx, groupID, msg.FromUserID, text, allMembers, aiMembers,
-			mentionParamIDs(cmd.Params), mentionParamAll(cmd.Params),
+			mentionParamIDs(cmd.Params), mentionParamAll(cmd.Params), triggerMessageUID,
 		))
+	}
+
+	// abortRelayGroupMessage：触发消息被撤回时中止该群正在进行的接龙
+	// （QA5-DEF-06）。只匹配服务端记下的 triggerMessageUID，撤回别的消息不误停。
+	if cmd.Action == "abortRelayGroupMessage" {
+		if h.relayHub == nil {
+			return h.replyErr(ctx, msg, cmd, 503, "discussion runtime not available")
+		}
+		groupID := getStringAny(cmd.Params, "group_id", "groupId")
+		messageUID := getStringAny(cmd.Params, "message_u_id", "messageUId", "messageUid")
+		if groupID == "" || messageUID == "" {
+			return h.replyErr(ctx, msg, cmd, 400, "参数不完整")
+		}
+		aborted, matched := h.relayHub.AbortGroupRelay(groupID, messageUID)
+		return h.replyCommandResult(ctx, msg, cmd, commandResult{code: 200, data: map[string]interface{}{
+			"ok":      true,
+			"aborted": aborted,
+			"matched": matched,
+		}})
 	}
 
 	actor, err := h.discussionRuntime.resolveActor(ctx, msg.FromUserID)
