@@ -176,11 +176,70 @@ func (s *NodeService) OmStatusForNode(ctx context.Context, node db.RongcloudNode
 	// 读到的一定是离线。运维是随设备常驻的能力，不能因为一拍空窗就报离线，
 	// 否则用户每次重启服务都会看到「运维助手离线」。
 	hostAlive := s.IsOnline(node.ID)
+	// 被后台「禁用」的运维账号不能再作为运维入口：否则管理端显示已禁用，
+	// 前端却仍指向它，用户点进去就是一个已被停掉的会话。查询失败时保持
+	// 原行为（fail-open），避免配置表异常导致所有机器的运维入口消失。
+	nodes = s.filterDisabledOpsNodes(ctx, nodes)
 	chosen := pickOpsNode(nodes, node.MachineID, node.RongcloudUserID, s.perAgentOpsEnabled.Load())
 	if chosen == nil {
 		return "", false, false, nil
 	}
 	return chosen.RongcloudUserID, s.IsOnline(chosen.ID) || hostAlive, true, nil
+}
+
+// filterDisabledOpsNodes 剔除被管理端禁用的运维账号节点。
+//
+// 状态存在 rongcloud_system_config（与后台用户管理页同一份数据），key 为
+// admin_ops_account_status:<融云id>。只在 ops 节点上做过滤，agent 节点原样保留。
+// 查询出错时返回原切片：宁可让一个已禁用的账号短暂仍可见，也不能让配置表
+// 抖动把所有机器的运维入口一次性抹掉。
+func (s *NodeService) filterDisabledOpsNodes(ctx context.Context, nodes []db.RongcloudNode) []db.RongcloudNode {
+	if s == nil || s.queries == nil || len(nodes) == 0 {
+		return nodes
+	}
+	var workspaceID pgtype.UUID
+	for _, n := range nodes {
+		if n.WorkspaceID.Valid {
+			workspaceID = n.WorkspaceID
+			break
+		}
+	}
+	if !workspaceID.Valid {
+		return nodes
+	}
+	configs, err := s.queries.ListRongCloudSystemConfigs(ctx, workspaceID)
+	if err != nil {
+		return nodes
+	}
+	disabled := make(map[string]bool)
+	for _, cfg := range configs {
+		if !strings.HasPrefix(cfg.ConfigKey, "admin_ops_account_status:") {
+			continue
+		}
+		var v struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(cfg.Config, &v) == nil && v.Status != "" && v.Status != "active" {
+			disabled[strings.TrimPrefix(cfg.ConfigKey, "admin_ops_account_status:")] = true
+		}
+	}
+	return excludeDisabledOpsNodes(nodes, disabled)
+}
+
+// excludeDisabledOpsNodes 是 filterDisabledOpsNodes 的纯逻辑部分，只剔除
+// 命中禁用集合的 ops 节点，agent 节点一律保留。
+func excludeDisabledOpsNodes(nodes []db.RongcloudNode, disabled map[string]bool) []db.RongcloudNode {
+	if len(disabled) == 0 {
+		return nodes
+	}
+	out := make([]db.RongcloudNode, 0, len(nodes))
+	for _, n := range nodes {
+		if n.AiType.String == OpsAgentType && disabled[n.RongcloudUserID] {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 // isMachineLevelOpsRC 判定一个 ops 账号是不是这台机器的「机器级」运维账号。
@@ -2364,6 +2423,9 @@ func (s *NodeService) MachineAgentCredentials(ctx context.Context, machineNodeID
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: list machine nodes: %w", err)
 	}
+	// 后台禁用的运维账号不下发凭据：否则设备拉起它的 ops 子进程后仍会去连
+	// 一个已停用的会话。fail-open 语义见 filterDisabledOpsNodes 注释。
+	nodes = s.filterDisabledOpsNodes(ctx, nodes)
 	// per-agent ops 默认关闭（SetPerAgentOpsEnabled，默认 false）：CLI 仍会
 	// 传 wantPerAgentOps（老版本不认识开关），这里统一忽略，避免名额继续被
 	// 吃掉。只有显式打开开关时才走旧的「每 agent 一个运维账号」路径。

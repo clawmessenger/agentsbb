@@ -180,10 +180,49 @@ func TestClawAdminDeleteUserCleansUpRelatedRows(t *testing.T) {
 func TestClawAdminDeleteUserUnknownIDReturns404(t *testing.T) {
 	f := setupDeleteUserFixture(t)
 	rr := httptest.NewRecorder()
-	// 运维账号 / 纯融云账号不在 claw_im_users：404，不会误删任何行。
-	f.h.ClawAdminDeleteUser(rr, f.adminReq(t, http.MethodDelete, "/api/admin/users/rc_node_xxx_ops", "rc_node_xxx_ops"))
+	// 不存在的账号：404，不会误删任何行。
+	f.h.ClawAdminDeleteUser(rr, f.adminReq(t, http.MethodDelete, "/api/admin/users/does-not-exist-xxx", "does-not-exist-xxx"))
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// 运维账号删除要求服务端强确认：没有 confirm_ops=<融云id> 时即使账号真实存在
+// 也按 404 处理。这是防止误删整机共享运维通道的最后一道防线（前端弹窗之外）。
+func TestClawAdminDeleteOpsUserRequiresConfirmParam(t *testing.T) {
+	f := setupDeleteUserFixture(t)
+	ctx := context.Background()
+	rcID := deleteTestUnique("rc_node_deltest")
+	if _, err := f.pool.Exec(ctx,
+		`INSERT INTO rongcloud_user (workspace_id, rongcloud_user_id, name, node_type)
+		 SELECT workspace_id, $1, '运维', 'ai' FROM rongcloud_node LIMIT 1`, rcID); err != nil {
+		t.Skipf("skip: cannot seed rongcloud_user: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx,
+		`INSERT INTO rongcloud_node (workspace_id, owner_user_id, rongcloud_user_id, node_id, ai_type)
+		 SELECT workspace_id, owner_user_id, $1, $2, 'ops' FROM rongcloud_node LIMIT 1`, rcID, "node-"+rcID); err != nil {
+		t.Skipf("skip: cannot seed rongcloud_node: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(ctx, `DELETE FROM rongcloud_node WHERE rongcloud_user_id=$1`, rcID)
+		_, _ = f.pool.Exec(ctx, `DELETE FROM rongcloud_user WHERE rongcloud_user_id=$1`, rcID)
+	})
+
+	rr := httptest.NewRecorder()
+	f.h.ClawAdminDeleteUser(rr, f.adminReq(t, http.MethodDelete, "/api/admin/users/"+rcID, rcID))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status without confirm_ops = %d, want 404; body = %s", rr.Code, rr.Body.String())
+	}
+	// 确认参数存在且匹配才进入删除流程（这里 RongCloudNode 未接线，本地照删）。
+	rr = httptest.NewRecorder()
+	req := f.adminReq(t, http.MethodDelete, "/api/admin/users/"+rcID+"?confirm_ops="+rcID, rcID)
+	f.h.ClawAdminDeleteUser(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status with confirm_ops = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM rongcloud_node WHERE rongcloud_user_id=$1`, rcID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("ops node row still present: n=%d err=%v", n, err)
 	}
 }
 

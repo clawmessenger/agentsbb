@@ -24,9 +24,54 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
 )
+
+// ---- 运维账号启停状态（复用 rongcloud_system_config，不改表结构）----
+//
+// 运维 AI 账号（rc_node_*_ops / *_ops）没有 claw_im_users 行，也没有账号级
+// status 列。启停状态落在 rongcloud_system_config：config_key =
+// "admin_ops_account_status:<融云id>"，config = {"status":"active|inactive"}。
+// 这样不需要新迁移（生产机没有 migrations 目录，加了迁移反而会让 health 的
+// 版本清单与线上不一致）。缺省视为 active，与列表原来的硬编码一致。
+const clawAdminOpsStatusKeyPrefix = "admin_ops_account_status:"
+
+func clawAdminOpsStatusKey(userID string) string { return clawAdminOpsStatusKeyPrefix + userID }
+
+// clawAdminOpsStatusExpr 供列表 SQL 读取运维账号状态：查不到配置时回落 active。
+// 只拼常量，不含用户输入 / CJK 格式动词。
+const clawAdminOpsStatusExpr = `COALESCE((
+	SELECT sc.config->>'status' FROM rongcloud_system_config sc
+	WHERE sc.workspace_id = n.workspace_id AND sc.config_key = 'admin_ops_account_status:' || n.rongcloud_user_id
+), 'active')`
+
+// clawAdminOpsUserExists 判断一个融云 id 是不是运维 AI 账号（ai_type='ops' 的节点）。
+// 只认 rongcloud_node 里的真实行，杜绝把普通 agent 节点当运维账号操作。
+func (h *Handler) clawAdminOpsUserExists(ctx context.Context, userID string) (bool, error) {
+	if userID == "" {
+		return false, nil
+	}
+	var exists bool
+	err := h.DB.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM rongcloud_node WHERE rongcloud_user_id=$1 AND ai_type='ops')`,
+		userID).Scan(&exists)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 测试用的假 DB / 极端降级场景：EXISTS 理论上总有一行，拿不到就当不存在。
+		return false, nil
+	}
+	return exists, err
+}
+
+// clawAdminOpsWorkspace 返回运维账号所在 workspace（写状态配置要用）。
+func (h *Handler) clawAdminOpsWorkspace(ctx context.Context, userID string) (pgtype.UUID, error) {
+	var ws pgtype.UUID
+	err := h.DB.QueryRow(ctx,
+		`SELECT workspace_id FROM rongcloud_node WHERE rongcloud_user_id=$1 AND ai_type='ops' LIMIT 1`,
+		userID).Scan(&ws)
+	return ws, err
+}
 
 // ---- JWT (HS256, 紧凑形式 header.payload.signature) ----
 
@@ -332,7 +377,7 @@ const clawAdminOpsUserPlatformExpr = `CASE
 
 const clawAdminOpsUserSelect = `
 	SELECT n.rongcloud_user_id, COALESCE(NULLIF(ru.name,''), n.rongcloud_user_id),
-	       '', '', '', COALESCE(ru.portrait_uri,''), 'active', 'operation',
+	       '', '', '', COALESCE(ru.portrait_uri,''), ` + clawAdminOpsStatusExpr + `, 'operation',
 	       ` + clawAdminOpsUserPlatformExpr + `,
 	       n.created_at, n.updated_at
 	FROM rongcloud_node n
@@ -341,7 +386,10 @@ const clawAdminOpsUserSelect = `
 // clawAdminUserListSources 组装两个数据源的过滤子句。两侧共用同一组参数
 // （Postgres 参数按整条 SQL 编号，同一 $n 可在 UNION 两侧重复出现）。
 func clawAdminUserListSources(keyword, status, accountType, aiType string) (whereA, whereB string, args []interface{}) {
-	whereA, whereB = " WHERE TRUE", " WHERE TRUE"
+	// 运维侧只看 ai_type='ops' 的真实运维账号：rongcloud_node 里还有大量
+	// agent 节点行（opencode/codex/…），它们不是 IM 账号，不该出现在用户管理。
+	// 列表页描述与看板统计都按这个口径，这里补齐过滤让三处一致。
+	whereA, whereB = " WHERE TRUE", " WHERE n.ai_type = 'ops'"
 	if keyword != "" {
 		args = append(args, clawAdminLikePattern(keyword))
 		n := len(args)
@@ -352,9 +400,9 @@ func clawAdminUserListSources(keyword, status, accountType, aiType string) (wher
 		args = append(args, status)
 		n := len(args)
 		whereA += fmt.Sprintf(" AND u.status = $%d", n)
-		// 运维账号没有启停状态，恒 active：status=active 时照常返回，
-		// status=其它值时整侧排除。
-		whereB += fmt.Sprintf(" AND 'active' = $%d", n)
+		// 运维账号同样支持启停：状态来自 rongcloud_system_config，
+		// 缺省 active。与列表投影 clawAdminOpsStatusExpr 用同一口径。
+		whereB += " AND " + clawAdminOpsStatusExpr + fmt.Sprintf(" = $%d", n)
 	}
 	switch accountType {
 	case "operation":
@@ -434,13 +482,24 @@ func (h *Handler) ClawAdminGetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := chi.URLParam(r, "id")
-	row := h.DB.QueryRow(r.Context(), clawAdminUserSelect+" WHERE u.user_id = $1", userID)
+	ctx := r.Context()
 	var username, nickname, phone, email, portrait, st, accountType string
 	var aiType *string
 	var createdAt, updatedAt time.Time
-	if err := row.Scan(&userID, &username, &nickname, &phone, &email, &portrait, &st, &accountType, &aiType, &createdAt, &updatedAt); err != nil {
-		clawAdminFail(w, 404, "user not found")
-		return
+
+	// 先查人类账号；没有则回落到运维 AI 账号（rongcloud_node ai_type='ops'）。
+	// 两端投影列顺序一致（age 列表的 UNION 两侧），扫描共用一组变量。
+	err := h.DB.QueryRow(ctx, clawAdminUserSelect+" WHERE u.user_id = $1", userID).
+		Scan(&userID, &username, &nickname, &phone, &email, &portrait, &st, &accountType, &aiType, &createdAt, &updatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = h.DB.QueryRow(ctx, clawAdminOpsUserSelect+" WHERE n.rongcloud_user_id = $1 AND n.ai_type = 'ops'", userID).
+				Scan(&userID, &username, &nickname, &phone, &email, &portrait, &st, &accountType, &aiType, &createdAt, &updatedAt)
+		}
+		if err != nil {
+			clawAdminFail(w, 404, "user not found")
+			return
+		}
 	}
 	clawAdminOK(w, map[string]interface{}{
 		"user_id": userID, "username": username, "nickname": nickname,
@@ -467,7 +526,8 @@ func (h *Handler) ClawAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		clawAdminFail(w, 400, "JSON object is required")
 		return
 	}
-	tag, err := h.DB.Exec(r.Context(), `
+	ctx := r.Context()
+	tag, err := h.DB.Exec(ctx, `
 		UPDATE claw_im_users SET
 			nickname = COALESCE($1, nickname), phone = COALESCE($2, phone),
 			email = COALESCE($3, email), portrait_uri = COALESCE($4, portrait_uri),
@@ -475,9 +535,33 @@ func (h *Handler) ClawAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		WHERE user_id = $5`,
 		body.Nickname, body.Phone, body.Email, body.PortraitURI, userID)
 	affected := tag.RowsAffected()
-	if err != nil || affected == 0 {
-		clawAdminFail(w, 404, "user not found")
+	if err != nil {
+		clawAdminFail(w, 500, "database error")
 		return
+	}
+	if affected == 0 {
+		// 运维账号不在 claw_im_users：可编辑字段落到 rongcloud_user 的
+		// name（列表里显示为「用户名」）与 portrait_uri。phone/email 对
+		// 运维 AI 账号没有语义，前端也不展示这两栏。
+		ops, opsErr := h.clawAdminOpsUserExists(ctx, userID)
+		if opsErr != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+		if !ops {
+			clawAdminFail(w, 404, "user not found")
+			return
+		}
+		_, err = h.DB.Exec(ctx, `
+			UPDATE rongcloud_user SET
+				name = COALESCE($1, name), portrait_uri = COALESCE($2, portrait_uri),
+				updated_at = now()
+			WHERE rongcloud_user_id = $3`,
+			body.Nickname, body.PortraitURI, userID)
+		if err != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
 	}
 	h.clawAdminAudit(r, ident, "admin_user_update", "user", userID, nil)
 	h.ClawAdminGetUser(w, r)
@@ -498,11 +582,42 @@ func (h *Handler) ClawAdminUpdateUserStatus(w http.ResponseWriter, r *http.Reque
 		clawAdminFail(w, 400, "status has an unsupported value")
 		return
 	}
-	tag, err := h.DB.Exec(r.Context(), `UPDATE claw_im_users SET status = $1, updated_at = now() WHERE user_id = $2`, body.Status, userID)
+	ctx := r.Context()
+	tag, err := h.DB.Exec(ctx, `UPDATE claw_im_users SET status = $1, updated_at = now() WHERE user_id = $2`, body.Status, userID)
 	affected := tag.RowsAffected()
-	if err != nil || affected == 0 {
-		clawAdminFail(w, 404, "user not found")
+	if err != nil {
+		clawAdminFail(w, 500, "database error")
 		return
+	}
+	if affected == 0 {
+		// 运维账号：状态写 rongcloud_system_config，缺省 active。启用/禁用
+		// 通过 clawAdminOpsStatusExpr 反映到列表，并在 ops 入口选择处生效。
+		ops, opsErr := h.clawAdminOpsUserExists(ctx, userID)
+		if opsErr != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+		if !ops {
+			clawAdminFail(w, 404, "user not found")
+			return
+		}
+		ws, wsErr := h.clawAdminOpsWorkspace(ctx, userID)
+		if wsErr != nil || !ws.Valid {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+		state, _ := json.Marshal(map[string]string{"status": body.Status})
+		_, err = h.DB.Exec(ctx, `
+			INSERT INTO rongcloud_system_config (workspace_id, config_key, config, config_version)
+			VALUES ($1, $2, $3::jsonb, 1)
+			ON CONFLICT (workspace_id, config_key) DO UPDATE
+			SET config = EXCLUDED.config, config_version = rongcloud_system_config.config_version + 1,
+			    updated_at = now()`,
+			ws, clawAdminOpsStatusKey(userID), string(state))
+		if err != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
 	}
 	h.clawAdminAudit(r, ident, "admin_user_status", "user", userID, map[string]interface{}{"status": body.Status})
 	clawAdminOK(w, map[string]interface{}{"ok": true})
@@ -545,9 +660,22 @@ func (h *Handler) ClawAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if err := h.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM claw_im_users WHERE user_id=$1)", userID).Scan(&exists); err != nil {
 		clawAdminFail(w, 500, "database error")
 		return
-	} else if !exists {
-		clawAdminFail(w, 404, "user not found")
-		return
+	}
+	isOps := false
+	if !exists {
+		// 运维 AI 账号：只在 rongcloud_node 里。删除会永久注销整机共享的
+		// 运维通道（该机器所有智能体的运维对话都会失效），所以要求请求
+		// 带 ?confirm_ops=<融云id> 作服务端强确认，光靠前端弹窗不够。
+		ops, opsErr := h.clawAdminOpsUserExists(ctx, userID)
+		if opsErr != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+		if !ops || strings.TrimSpace(r.URL.Query().Get("confirm_ops")) != userID {
+			clawAdminFail(w, 404, "user not found")
+			return
+		}
+		isOps = true
 	}
 
 	rongcloudDeactivated := false
@@ -576,6 +704,7 @@ func (h *Handler) ClawAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
 	stmts := []string{
 		`DELETE FROM claw_im_user_quota WHERE user_id = $1`,
 		`DELETE FROM claw_lobster WHERE user_id = $1`,
@@ -584,7 +713,27 @@ func (h *Handler) ClawAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		`DELETE FROM im_friend_request WHERE from_user_id = $1 OR to_user_id = $1`,
 		`DELETE FROM claw_im_users WHERE user_id = $1`,
 	}
+	if isOps {
+		// 运维账号的本地行在 rongcloud_* 侧：先删依赖（node_control /
+		// agent_cli 有 ON DELETE CASCADE，upgrade 是 SET NULL），再删 node
+		// 与 user，最后清掉本功能写入的启停配置。全部在同一事务里。
+		stmts = []string{
+			`DELETE FROM rongcloud_node_control WHERE node_id IN (SELECT id FROM rongcloud_node WHERE rongcloud_user_id = $1)`,
+			`DELETE FROM rongcloud_node_agent_cli WHERE node_id IN (SELECT id FROM rongcloud_node WHERE rongcloud_user_id = $1)`,
+			`UPDATE rongcloud_node_upgrade SET node_id = NULL WHERE node_id IN (SELECT id FROM rongcloud_node WHERE rongcloud_user_id = $1)`,
+			`DELETE FROM rongcloud_node WHERE rongcloud_user_id = $1`,
+			`DELETE FROM rongcloud_system_config WHERE config_key = $2`,
+			`DELETE FROM rongcloud_user WHERE rongcloud_user_id = $1`,
+		}
+	}
 	for _, stmt := range stmts {
+		if strings.Contains(stmt, "config_key = $2") {
+			if _, err := tx.Exec(ctx, stmt, userID, clawAdminOpsStatusKey(userID)); err != nil {
+				clawAdminFail(w, 500, "database error")
+				return
+			}
+			continue
+		}
 		if _, err := tx.Exec(ctx, stmt, userID); err != nil {
 			clawAdminFail(w, 500, "database error")
 			return
@@ -713,6 +862,15 @@ func (h *Handler) clawAdminUserExists(ctx context.Context, userID string) (strin
 	var found string
 	err := h.DB.QueryRow(ctx, `SELECT user_id FROM claw_im_users WHERE user_id = $1 LIMIT 1`, userID).Scan(&found)
 	if errors.Is(err, pgx.ErrNoRows) {
+		// 运维账号不在 claw_im_users，但在 rongcloud_node 里是真实实体：
+		// 详情页能打开，节点/群/配额标签页应回空而不是 404。
+		ops, opsErr := h.clawAdminOpsUserExists(ctx, userID)
+		if opsErr != nil {
+			return "", false, opsErr
+		}
+		if ops {
+			return userID, true, nil
+		}
 		return "", false, nil
 	}
 	if err != nil {

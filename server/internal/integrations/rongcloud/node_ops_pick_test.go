@@ -149,3 +149,26 @@ func TestPerAgentOpsRecordForRetiredByDefault(t *testing.T) {
 		t.Fatalf("no per-agent row must emit nothing, got %q", rc)
 	}
 }
+
+// 后台禁用运维账号后，它必须从运维入口候选中消失；agent 节点与未被禁用的
+// ops 节点不受影响。fail-open 由 filterDisabledOpsNodes 的查询失败路径保证。
+func TestExcludeDisabledOpsNodes(t *testing.T) {
+	const machine = "3300776275"
+	machineOps := opsNode("ops_3300776275", machine)
+	legacyOps := opsNode("openclaw_3300776275_ops", machine)
+	agent := agentNodeAt("openclaw_3300776275", machine, "openclaw")
+	nodes := []db.RongcloudNode{agent, machineOps, legacyOps}
+
+	got := excludeDisabledOpsNodes(nodes, map[string]bool{"ops_3300776275": true})
+	if len(got) != 2 || got[0].RongcloudUserID != agent.RongcloudUserID || got[1].RongcloudUserID != legacyOps.RongcloudUserID {
+		t.Fatalf("disabled machine-level ops not excluded correctly: %+v", got)
+	}
+	if pick := pickOpsNode(got, machine, agent.RongcloudUserID, false); pick != nil {
+		t.Fatalf("disabled machine ops still picked: %s", pick.RongcloudUserID)
+	}
+
+	got = excludeDisabledOpsNodes(nodes, map[string]bool{})
+	if len(got) != len(nodes) {
+		t.Fatalf("empty disabled set must keep all nodes, got %d", len(got))
+	}
+}
