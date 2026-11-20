@@ -1893,6 +1893,70 @@ describe("MessageDispatcher chat_stream streaming", () => {
     return { turns, abort: (e: Error) => rejectTurn(e) }
   }
 
+  // QA4-DEF-07：「停止讨论」后设备侧那一轮必须真的停。服务端两条通道都会私发
+  // discussion_cancel（v2 无 targetRequestId，只有 chatroomId），CLI 以前不认识
+  // 这个 msg_type，被判成「不是讨论指令」静默丢包 —— 界面上已停止，agent 还在跑。
+  it("discussion_cancel 掐掉房间在飞的轮次、回 ack，且不补 error 回执", async () => {
+    const { deps, sent, streams } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    const { turns, abort } = hangingTurn()
+    const handleDone = dispatcher.handle({
+      objectName: "command", fromUserId: "host_node", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        request_id: "turn_9_1", service: "discussion", action: "your_turn",
+        params: { round: 1, speaking_order: 1, role_name: "顾问", chatroom_id: "room_rc", conversation_type: 3 },
+      }),
+    }, turns)
+    await new Promise((r) => setTimeout(r, 30))
+
+    await dispatcher.handle({
+      objectName: "command", fromUserId: "host_node", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "discussion_cancel", protocolVersion: 2, discussionId: "d-1",
+        chatroomId: "room_rc", requestId: "cancel-1", stateVersion: 4, round: 1,
+        timestamp: 1, reason: "cancelled",
+      }),
+    }, { runTurn: async () => "" })
+
+    abort(new Error("agent turn aborted"))
+    await handleDone
+
+    const parsed = sent.map((s) => JSON.parse(s.content) as Record<string, unknown>)
+    const ack = parsed.find((p) => p.msg_type === "discussion_cancel_ack")
+    expect(ack).toBeDefined()
+    expect(ack).toMatchObject({
+      result: "cancelled",
+      // v2 信封没有这两个字段，回执必须用本地命中的轮次与自身 id 补齐
+      targetRequestId: "turn_9_1",
+      targetMemberId: "node_self",
+      discussionId: "d-1",
+      chatroomId: "room_rc",
+    })
+    // 安静中止：房间已 cancelled，再回 command_result 会在时间线多一个失败气泡
+    expect(parsed.some((p) => p.msg_type === "command_result")).toBe(false)
+    expect(streams.map((s) => JSON.parse(s.content) as Record<string, unknown>)
+      .every((f) => f.status !== "failed")).toBe(true)
+  })
+
+  it("discussion_cancel 没有在飞轮次时回 not_started，不误伤单聊", async () => {
+    const { deps, sent } = buildDeps()
+    const dispatcher = new MessageDispatcher(deps)
+    await dispatcher.handle({
+      objectName: "command", fromUserId: "host_node", toUserId: "", targetId: "node_self",
+      conversationType: 1,
+      content: JSON.stringify({
+        msg_type: "discussion_cancel", protocolVersion: 2, discussionId: "d-2",
+        chatroomId: "room_none", requestId: "cancel-2", stateVersion: 1, round: 0,
+        timestamp: 1, reason: "cancelled",
+      }),
+    }, { runTurn: async () => "" })
+    const ack = sent.map((s) => JSON.parse(s.content) as Record<string, unknown>)
+      .find((p) => p.msg_type === "discussion_cancel_ack")
+    expect(ack).toMatchObject({ result: "not_started" })
+  })
+
   it("chat_stop 的 stream_id 对不上时按 request_message_id 兜底命中，真的中止", async () => {
     const { deps, sent } = buildDeps()
     const dispatcher = new MessageDispatcher(deps)

@@ -6,6 +6,11 @@ import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type 
 import type { ActivityStep } from "./agent-activity.js";
 import type { AnsweredTurn, AnsweredTurnStore } from "./answered-turns.js";
 import { decodeCommandContent, encodeCommandResult } from "./protocol.js";
+import {
+  buildDiscussionCancelAck,
+  parseDiscussionCancelRequest,
+  type DiscussionCancelRequest,
+} from "./discussion-cancel.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus, type ChatStreamTimelineEntry } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
 import { buildAutoContinuationPrompt, classifyTurnError, describeTurnError, TurnIncompleteError } from "./turn-error.js";
@@ -472,6 +477,14 @@ interface ActiveStream {
   requestMessageId: string;
   conversationType: 1 | 3 | 4;
   conversationId: string;
+  /**
+   * 「安静中止」：被服务端 `discussion_cancel` 掐掉的轮次不再回 command_result。
+   *
+   * chat_stop 要回 onError 的结果帧（前端靠它落定气泡），但讨论取消相反 ——
+   * 房间已经进入 cancelled 终态，此时再补一条 error 回执只会被服务端当成
+   * 「这一轮失败」记进时间线，用户看到的就是「已停止」下面又冒一条红色失败。
+   */
+  quietAbort?: boolean;
 }
 
 // 私聊闸门拒绝占位回执：同一发送者的节流窗口。窗口内多条被拒只回一条，
@@ -853,6 +866,13 @@ export class MessageDispatcher {
       const recoveryRequest = parseRuntimeRecoveryRequest(msg.content);
       if (recoveryRequest) {
         await this.handleRuntimeRecovery(msg, recoveryRequest);
+        return;
+      }
+      // 服务端「停止讨论」：msg_type 判别，**没有** request_id/action 那套信封，
+      // 所以必须排在 decodeCommandContent 之前。落地见 discussion-cancel.ts。
+      const cancelRequest = parseDiscussionCancelRequest(msg.content);
+      if (cancelRequest) {
+        await this.handleDiscussionCancel(msg, cancelRequest);
         return;
       }
       const cmd = decodeCommandContent(msg.content);
@@ -1589,7 +1609,11 @@ export class MessageDispatcher {
       }
       // 中继轮（your_turn）必须回 command_result：服务端靠它推进下一位，
       // 不回就只能干等超时。重复回包由服务端按 requestID 吞掉，安全。
-      if (opts.onError) {
+      //
+      // 但被 `discussion_cancel` 安静掐掉的轮次例外（见 ActiveStream.quietAbort）：
+      // 房间已进入 cancelled 终态，再回一条 error 只会在时间线上多一个失败气泡。
+      const quietAbort = this.activeStreams.get(ctx.streamId)?.quietAbort === true;
+      if (opts.onError && !quietAbort) {
         await opts.onError(errMsg).catch(() => {});
       }
     } finally {
@@ -1809,6 +1833,60 @@ export class MessageDispatcher {
       + ` req=${stream.requestMessageId} requester_aborted=${wasAborted}`,
     );
     await this.sendStopResult(msg, requestId, streamId, "accepted", "stop_requested");
+  }
+
+  /**
+   * 服务端「停止讨论」：掐掉本地在飞的讨论轮次，并按 v3 契约回
+   * `discussion_cancel_ack`。
+   *
+   * 定位顺序：
+   *   1. `targetRequestId`（v3 交互轮带）—— 精确到某一轮，同房间其他节点不受
+   *      影响；
+   *   2. `chatroomId`（v2 只带这个）—— 命中该房间所有在飞轮次。讨论房间本来
+   *      就只有本节点在跑自己的轮次，一起掐是正确语义；
+   *   3. 两个都没有 —— 退到「非私聊轮次」，绝不误伤单聊（单聊没有讨论的概念，
+   *      一条脏包不该把用户正在等的普通回复掐掉）。
+   *
+   * 无论有没有命中都要回 ack：服务端在 v3 链路里就是靠它判断「节点已确认
+   * 中断」，不回会让这一轮等到超时才失败。
+   */
+  private async handleDiscussionCancel(
+    msg: InboundIMMessage,
+    cancel: DiscussionCancelRequest,
+  ): Promise<void> {
+    const candidates = [...this.activeStreams.entries()].filter(([, stream]) => {
+      if (cancel.targetRequestId) return stream.requestMessageId === cancel.targetRequestId;
+      if (cancel.chatroomId) return stream.conversationId === cancel.chatroomId;
+      return stream.conversationType !== 1;
+    });
+    // 不复用答案台账判 already_terminal 之前的顺序：先看有没有在飞的轮次，
+    // 有就是 cancelled；没有再看台账（这一轮早就答完，通知来晚了）。
+    let alreadyTerminal = false;
+    if (candidates.length === 0 && cancel.targetRequestId) {
+      alreadyTerminal = Boolean(this.deps.answeredTurns?.get(cancel.targetRequestId));
+    }
+    for (const [, stream] of candidates) {
+      stream.quietAbort = true;
+      stream.controller.abort();
+    }
+    const result = candidates.length > 0
+      ? "cancelled"
+      : alreadyTerminal ? "already_terminal" : "not_started";
+    console.log(
+      `discussion_cancel: result=${result} discussion=${cancel.discussionId || "-"}`
+      + ` room=${cancel.chatroomId || "-"} target_req=${cancel.targetRequestId || "-"}`
+      + ` aborted=${candidates.map(([, stream]) => stream.requestMessageId).join(",") || "-"}`,
+    );
+    const ack = buildDiscussionCancelAck(cancel, {
+      selfUserId: this.deps.selfUserId,
+      abortedRequestId: candidates[0]?.[1].requestMessageId,
+      result,
+    });
+    await this.deps.send(msg.fromUserId, "command", ack).catch((err: unknown) => {
+      // 回执失败只记日志：本地该停已经停了，回执丢了最多让服务端多等一轮超时，
+      // 不能反过来把「停止」算成失败。
+      console.warn("discussion_cancel: ack send failed", err);
+    });
   }
 
   /** 见 handleChatStop 的三级定位。返回命中的 key 与「靠哪一级命中」。 */
