@@ -213,13 +213,18 @@ func (h *Handler) ClawUserBinding(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) clawIdentifierTaken(ctx context.Context, column, value, selfID string) (bool, error) {
 	var exists bool
 	var err error
+	// D-015：登录查询（clawQueryUserByIdentifier）把 username / user_id /
+	// phone / email 四列一起 OR，且 username 优先。只查 phone/email 两列会让
+	// 「把别人正在用的登录账号绑成自己的手机号/邮箱」成功，随后用这个值登录
+	// 却永远进别人的号 —— 用户看到的就是「绑定了但联动登录不上」。
+	// 查重口径必须与登录查询的列对齐，username 这一列不能漏。
 	if column == "email" {
 		err = h.DB.QueryRow(ctx,
-			"SELECT EXISTS(SELECT 1 FROM claw_im_users WHERE lower(email)=lower($1) AND user_id<>$2)",
+			"SELECT EXISTS(SELECT 1 FROM claw_im_users WHERE (lower(username)=lower($1) OR lower(email)=lower($1)) AND user_id<>$2)",
 			value, selfID).Scan(&exists)
 	} else {
 		err = h.DB.QueryRow(ctx,
-			"SELECT EXISTS(SELECT 1 FROM claw_im_users WHERE phone=$1 AND user_id<>$2)",
+			"SELECT EXISTS(SELECT 1 FROM claw_im_users WHERE (username=$1 OR phone=$1) AND user_id<>$2)",
 			value, selfID).Scan(&exists)
 	}
 	return exists, err

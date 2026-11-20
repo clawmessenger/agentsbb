@@ -269,6 +269,26 @@ func TestClawUserWeChatBindWithoutConfig(t *testing.T) {
 	}
 }
 
+// TestClawIdentifierTakenIncludesUsername（D-015）：登录查询会把 username 一起
+// OR 进去且 username 优先，绑定去重若只看 phone/email 两列，就能把别人正在用的
+// 登录账号绑成自己的；绑完用这个值登录仍然进别人的号。这里钉住查重 SQL 必须
+// 同时覆盖 username 列。
+func TestClawIdentifierTakenIncludesUsername(t *testing.T) {
+	for _, column := range []string{"phone", "email"} {
+		var gotSQL string
+		fake := &accountSecDB{taken: map[string]bool{}}
+		rec := &recordingDB{inner: fake, onQueryRow: func(sql string, _ []any) { gotSQL = sql }}
+		h := &Handler{DB: rec}
+		taken, err := h.clawIdentifierTaken(t.Context(), column, "someone@example.com", "721913")
+		if err != nil || taken {
+			t.Fatalf("%s: taken=%v err=%v", column, taken, err)
+		}
+		if !strings.Contains(gotSQL, "username") || !strings.Contains(gotSQL, "user_id<>$2") {
+			t.Fatalf("%s: taken SQL lost username check: %q", column, gotSQL)
+		}
+	}
+}
+
 // TestClawLoginAcceptsAnyBoundIdentifier 钉住「登录框只给一个输入框」这件事：
 // 虾说号 / 手机号 / 邮箱都必须能登录，且优先级是 username 最高（老用户不受影响）。
 //

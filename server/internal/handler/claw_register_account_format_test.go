@@ -13,6 +13,8 @@ package handler
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +74,41 @@ func TestClawRegisterRejectsAnInvalidAccount(t *testing.T) {
 	}
 	if exists {
 		t.Fatal("rejected registration must not create a row")
+	}
+}
+
+// D-015：注册账号本身是手机号/邮箱时，绑定列必须同步落库。否则账号安全页
+// 显示「未绑定」，用户拿同一个值去绑又被自己占着的 username 挡住，看起来就是
+// 「手机号和邮箱无法联动登录」。
+func TestClawRegisterWritesBindingColumn(t *testing.T) {
+	cases := []struct {
+		account string
+		column  string
+	}{
+		{"13800000001", "phone"},
+		{"link@example.com", "email"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.account, func(t *testing.T) {
+			fake := &accountSecDB{taken: map[string]bool{}}
+			h := &Handler{DB: fake}
+			req := httptest.NewRequest(http.MethodPost, "/api/register",
+				strings.NewReader(fmt.Sprintf(`{"username":%q,"password":"secret123"}`, tc.account)))
+			rr := httptest.NewRecorder()
+			h.ClawRegister(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d (%s)", rr.Code, rr.Body.String())
+			}
+			if len(fake.execSQL) != 1 {
+				t.Fatalf("exec calls = %d, want 1", len(fake.execSQL))
+			}
+			if !strings.Contains(fake.execSQL[0], tc.column+", status") {
+				t.Fatalf("register SQL must write %s: %q", tc.column, fake.execSQL[0])
+			}
+			if got := fake.execArgs[0][5]; got != tc.account {
+				t.Fatalf("binding arg = %v, want %q", got, tc.account)
+			}
+		})
 	}
 }
 

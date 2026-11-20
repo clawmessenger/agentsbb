@@ -377,6 +377,23 @@ func clawAccountFormatOK(account string) bool {
 	return clawAccountPhoneRe.MatchString(account) || clawAccountEmailRe.MatchString(account)
 }
 
+// clawAccountBindingColumn 返回注册账号同时要写进绑定列的名字和值（D-015）。
+//
+// 注册表单只有「账号（邮箱或手机号）」一个输入框，用户自然认为注册完账号安全页
+// 就该显示「已绑定」。此前 INSERT 只写 username，于是邮箱/手机号注册出来的账号
+// 在账号安全页仍是「未绑定」，用户再去绑同值又会遇到「已被占用」（自己占着自己
+// 的 username），形成「手机号和邮箱无法联动登录」的观感。
+// 第二个返回值空串表示两种格式都不是（调用方已经用 clawAccountFormatOK 拦过）。
+func clawAccountBindingColumn(account string) (string, string) {
+	if clawAccountPhoneRe.MatchString(account) {
+		return "phone", account
+	}
+	if clawAccountEmailRe.MatchString(account) {
+		return "email", account
+	}
+	return "", ""
+}
+
 // ClawRegister POST /api/register
 func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -419,6 +436,22 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// D-015：注册账号本身就是手机号/邮箱时，同时写进绑定列，账号安全页才会显示
+	// 「已绑定」；写前按绑定列查一次重，避免和别的账号的 phone/email 撞车后
+	// 登录永远命中别人（登录查询会把四列一起 OR）。
+	bindColumn, bindValue := clawAccountBindingColumn(username)
+	if bindColumn != "" {
+		taken, err := h.clawIdentifierTaken(ctx, bindColumn, bindValue, "")
+		if err != nil {
+			clawJSON(w, 500, 500, err.Error(), nil)
+			return
+		}
+		if taken {
+			clawJSON(w, 409, 409, "该账号已被其他账号绑定", nil)
+			return
+		}
+	}
+
 	userID, err := h.clawGenerateUserID(ctx)
 	if err != nil {
 		clawJSON(w, 500, 500, err.Error(), nil)
@@ -438,10 +471,19 @@ func (h *Handler) ClawRegister(w http.ResponseWriter, r *http.Request) {
 	// 新用户在对方客户端长期显示裸 id。
 	portrait := h.clawDefaultPortraitForNewUser()
 
-	_, err = h.DB.Exec(ctx, `
-		INSERT INTO claw_im_users (user_id, username, nickname, portrait_uri, password_hash, status, created_at, updated_at)
-		VALUES ($1, $2, NULLIF($3,''), $4, $5, 'active', now(), now())`,
-		userID, username, nickname, portrait, clawHashPassword(req.Password))
+	// bindColumn 只来自 clawAccountBindingColumn 的白名单（phone/email/空串），
+	// 不接受请求体输入，拼进 SQL 是安全的。
+	if bindColumn == "" {
+		_, err = h.DB.Exec(ctx, `
+			INSERT INTO claw_im_users (user_id, username, nickname, portrait_uri, password_hash, status, created_at, updated_at)
+			VALUES ($1, $2, NULLIF($3,''), $4, $5, 'active', now(), now())`,
+			userID, username, nickname, portrait, clawHashPassword(req.Password))
+	} else {
+		_, err = h.DB.Exec(ctx,
+			"INSERT INTO claw_im_users (user_id, username, nickname, portrait_uri, password_hash, "+bindColumn+", status, created_at, updated_at) "+
+				"VALUES ($1, $2, NULLIF($3,''), $4, $5, $6, 'active', now(), now())",
+			userID, username, nickname, portrait, clawHashPassword(req.Password), bindValue)
+	}
 	if err != nil {
 		clawJSON(w, 500, 500, "注册失败", nil)
 		return
