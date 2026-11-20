@@ -27,7 +27,19 @@ import (
 //
 // mentions / mentionAll 是可选定向信号（「@ 某人」），语义与聊天室一致：只在
 // speakers 里挑子集、保持原顺序、筛空即回退全员。缺省时行为与老版本完全相同。
+// StartGroupRelay 是旧签名入口（不带触发消息 id）：老调用方与测试用它，
+// 行为与引入「撤回中止接龙」之前完全一致。
 func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, requesterRCID, text string, allMembers, aiMembers []GroupMember, mentions []string, mentionAll bool) commandResult {
+	return h.startGroupRelay(ctx, groupID, requesterRCID, text, allMembers, aiMembers, mentions, mentionAll, "")
+}
+
+// StartGroupRelayWithTrigger 供 IM 命令层调用：额外记下触发消息的 messageUId，
+// 用户在 web 撤回它时可通过 abortRelayGroupMessage 精确中止（QA5-DEF-06）。
+func (h *chatroomRelayHub) StartGroupRelayWithTrigger(ctx context.Context, groupID, requesterRCID, text string, allMembers, aiMembers []GroupMember, mentions []string, mentionAll bool, triggerMessageUID string) commandResult {
+	return h.startGroupRelay(ctx, groupID, requesterRCID, text, allMembers, aiMembers, mentions, mentionAll, triggerMessageUID)
+}
+
+func (h *chatroomRelayHub) startGroupRelay(ctx context.Context, groupID, requesterRCID, text string, allMembers, aiMembers []GroupMember, mentions []string, mentionAll bool, triggerMessageUID string) commandResult {
 	if h.rt == nil || !h.rt.interactiveReady() {
 		return errRelayResult(503, "讨论服务尚未初始化")
 	}
@@ -87,6 +99,10 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		rounds = 1
 	}
 	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, rounds, targeted)
+	// 记下触发消息 id：用户撤回它时按这个 id 精确中止（QA5-DEF-06 尾巴）。
+	if started || queued {
+		h.tagGroupRelayTrigger(groupID, triggerMessageUID)
+	}
 	if !started && !queued {
 		return errRelayResult(409, "当前无法发起对话，请稍后重试")
 	}
@@ -101,6 +117,48 @@ func (h *chatroomRelayHub) StartGroupRelay(ctx context.Context, groupID, request
 		// 的 agent 无群聊发言权、或 id 不存在），已回退全员接力。纯诊断信号。
 		"mentionFallback": mentionFallback,
 	}}
+}
+
+// tagGroupRelayTrigger 把「触发消息 messageUId」写到当前群中继会话上。
+//
+// 只在该群确实有进行中/排队中的中继时才需要，`AbortGroupRelay` 会按它精确
+// 匹配；空 id 视为老客户端，不写。
+func (h *chatroomRelayHub) tagGroupRelayTrigger(groupID, messageUID string) {
+	if strings.TrimSpace(groupID) == "" || strings.TrimSpace(messageUID) == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if s := h.sessions[groupID]; s != nil && s.isGroup {
+		s.triggerMessageUID = messageUID
+	}
+}
+
+// AbortGroupRelay 按「被撤回的触发消息」中止群接龙（QA5-DEF-06）。
+//
+// 语义与群主「暂停 OpenClaw」一致：不打断正在发言的那一位，它说完之后不再
+// 派下一位；**还没开口**的那位直接作废本轮（见 pump 的等待循环），排队中的
+// 用户消息一并丢弃 —— 撤回就是「这段对话不算数」，不该在撤回后又续上。
+//
+// 只匹配 triggerMessageUID：撤回群里任意一条旧消息不会误停正在进行的接龙。
+// 返回值 aborted=本次调用是否真的置了中止标记，matched=是否存在匹配的会话。
+func (h *chatroomRelayHub) AbortGroupRelay(groupID, messageUID string) (aborted bool, matched bool) {
+	if strings.TrimSpace(groupID) == "" || strings.TrimSpace(messageUID) == "" {
+		return false, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.sessions[groupID]
+	if s == nil || !s.isGroup || s.triggerMessageUID != messageUID {
+		return false, false
+	}
+	matched = true
+	if s.stopped {
+		return false, true
+	}
+	s.stopped = true
+	s.pending = nil
+	return true, true
 }
 
 // groupRelayRounds 读群设置里的「AI 对话轮数」（rongcloud_group.
