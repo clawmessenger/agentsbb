@@ -527,6 +527,33 @@ func (h *Handler) ClawAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// 后台改手机号/邮箱也要查重（QA5-DEF-07 的现场根因）：claw_im_users 的 phone
+	// 没有库级唯一索引，C 端绑定走的是 clawIdentifierTaken 先查后写，而后台这条
+	// 路径此前直接 UPDATE —— 于是同一个手机号可以同时挂在两条账号上（一个注册号，
+	// 一个微信登录号），用户在不同入口看到两个「自己」，头像/昵称各不相同。
+	// 查重口径与 C 端一致：username 也参与（手机号常被当作登录账号）。
+	if body.Phone != nil && strings.TrimSpace(*body.Phone) != "" {
+		taken, err := h.clawIdentifierTaken(ctx, "phone", strings.TrimSpace(*body.Phone), userID)
+		if err != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+		if taken {
+			clawAdminFail(w, 409, "该手机号已被其他账号占用，请先解绑或改用其他号码")
+			return
+		}
+	}
+	if body.Email != nil && strings.TrimSpace(*body.Email) != "" {
+		taken, err := h.clawIdentifierTaken(ctx, "email", strings.TrimSpace(*body.Email), userID)
+		if err != nil {
+			clawAdminFail(w, 500, "database error")
+			return
+		}
+		if taken {
+			clawAdminFail(w, 409, "该邮箱已被其他账号占用，请先解绑或改用其他邮箱")
+			return
+		}
+	}
 	tag, err := h.DB.Exec(ctx, `
 		UPDATE claw_im_users SET
 			nickname = COALESCE($1, nickname), phone = COALESCE($2, phone),
