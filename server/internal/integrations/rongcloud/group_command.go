@@ -106,6 +106,16 @@ type GroupMirror struct {
 	SetOwner func(ctx context.Context, groupID, newOwnerID string) error
 	// DeleteGroup drops the group (members cascade) — the dismiss path.
 	DeleteGroup func(ctx context.Context, groupID string) error
+	// ResolveMemberIDs 把客户端可能混入的非融云身份标识（username / 虾说号 /
+	// 手机号 / 邮箱）反查成融云 userId，返回 identifier -> rongcloudUserID 的
+	// 映射；查不到的标识不进 map，调用方原样保留。nil 表示未装配（历史行为，
+	// 现有测试 stub 都不设置），建群链路完全不启用身份归一。
+	//
+	// D-002：客户端把 ownerId（平台 user.userId 或 username/phone）塞进
+	// memberIds 首项，与同一人的融云 id 并存，而服务端的 dedupeUserIDs 只按
+	// 字符串字面去重 → 融云把同一个人当两个成员，于是「选 1 人却多出绑定
+	// 手机号的账号」。归一必须在 dedupe 之前，且只对查得到的标识改写。
+	ResolveMemberIDs func(ctx context.Context, identifiers []string) (map[string]string, error)
 }
 
 const (
@@ -180,6 +190,18 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	description := strings.TrimSpace(getString(cmd.Params, "description"))
 	maxRounds := groupMaxRounds(cmd.Params["openclawMaxRounds"])
 
+	// D-002：把 memberIds 里混入的非融云身份标识归一到融云 userId，再 dedupe。
+	// 未装配回调（含全部现有测试）时 memberIDs 原样进入旧路径，零回归。
+	if h.groupMirror.ResolveMemberIDs != nil {
+		resolved, err := h.groupMirror.ResolveMemberIDs(ctx, memberIDs)
+		if err != nil {
+			// fail-open：归一查询故障不阻断建群，退回既有字符串去重行为。
+			h.logger.Warn("rongcloud: group create member identity resolution failed",
+				"error", err)
+		} else {
+			memberIDs = canonicalizeMemberIDs(memberIDs, resolved)
+		}
+	}
 	userIDs := dedupeUserIDs(append([]string{ownerID}, memberIDs...))
 	// 不再自动兜底塞 AI 成员（缺陷 D-006，2026-11-19）：建群表单明确允许
 	// 「不选成员，先创建空群聊」，创建后却多出一个没人勾选的 opencode ——
@@ -390,6 +412,33 @@ func getStringSlice(params map[string]interface{}, key string) []string {
 			if trimmed := strings.TrimSpace(part); trimmed != "" {
 				out = append(out, trimmed)
 			}
+		}
+	}
+	return out
+}
+
+// canonicalizeMemberIDs 用 ResolveMemberIDs 的结果把 memberIds 里能反查到的
+// 非融云标识替换成融云 userId（D-002）。
+//
+// 安全底线：**查不到的标识一律原样保留，绝不丢弃**。融云 userId 有两种来源，
+// 只有人类账号落在 claw_im_users；AI 节点（rc_node_* / <agent>_<machine> /
+// claw_*）、运维账号、以及本来就是融云 id 的真人 ID 都查不到，若在这里把它们
+// 过滤掉就会重演 2026-11-18「建群把已勾选的 AI 成员弄丢」的事故。归一失败
+// 同样按「原样」处理（fail-open 到旧行为），只记日志，不阻断建群。
+//
+// 顺序：ownerID 由融云消息发送者解析而来，本身已是融云 id，不参与归一；
+// 归一后再交给 dedupeUserIDs，同一账号的 username / phone / 融云 id 就会
+// 折叠成一项。
+func canonicalizeMemberIDs(ids []string, resolved map[string]string) []string {
+	if len(resolved) == 0 || len(ids) == 0 {
+		return ids
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if canonical, ok := resolved[strings.TrimSpace(id)]; ok && canonical != "" {
+			out = append(out, canonical)
+		} else {
+			out = append(out, id)
 		}
 	}
 	return out

@@ -6,7 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -51,6 +53,46 @@ var clawFileKeyPattern = regexp.MustCompile(
 
 func validClawFileKey(key string) bool {
 	return clawFileKeyPattern.MatchString(key)
+}
+
+// clawDangerousExts 是上传时一律拒绝的危险可执行/脚本扩展名（QA5-DEF-04）。
+// 大小写不敏感：判断前统一 strings.ToLower(filepath.Ext(...))。这些类型对
+// 「agent 产出的报告 / 页面」没有正当用途，收下它们只会把聊天附件变成可执行
+// 文件的分发通道。
+var clawDangerousExts = map[string]struct{}{
+	".exe": {}, ".bat": {}, ".cmd": {}, ".com": {}, ".msi": {}, ".scr": {},
+	".pif": {}, ".dll": {}, ".so": {}, ".dylib": {}, ".vbs": {}, ".ps1": {},
+	".jar": {}, ".app": {},
+}
+
+// clawFileExtAllowed 报告上传文件名是否不在危险扩展名黑名单里。
+func clawFileExtAllowed(filename string) bool {
+	_, blocked := clawDangerousExts[strings.ToLower(filepath.Ext(filename))]
+	return !blocked
+}
+
+// clawFileContentDisposition 构造下载响应头：强制 attachment，并同时给出
+// RFC 5987 的 filename*（UTF-8 原名）与 ASCII 兜底 filename，兼容老客户端。
+func clawFileContentDisposition(filename string) string {
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
+		clawASCIIFilename(filename), url.QueryEscape(filename))
+}
+
+// clawASCIIFilename 把非 ASCII 字符与头部注入敏感字符替换为下划线，仅用于
+// filename="..." 兜底；真实原名交给 filename* 编码（url.QueryEscape）。
+func clawASCIIFilename(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if r > 0x7f || r < 0x20 || r == 0x7f || r == '"' || r == ';' || r == '\\' {
+			b.WriteByte('_')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "download"
+	}
+	return b.String()
 }
 
 // ClawUploadFile — POST /api/upload
@@ -144,6 +186,15 @@ func (h *Handler) ClawServeFile(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 	w.Header().Set("Cache-Control", "private, max-age=3600")
+	// QA5-DEF-04：下载必须带 Content-Disposition，否则浏览器直接内联打开 /
+	// 拿 URL 末段当文件名，用户存不下附件。storage 的 GetReader 只返回字节
+	// 流、不返回原始文件名，因此优先取前端可选的 ?name=，否则用 key 末段
+	// （uuid.ext）兜底 —— key 已被正则严格校验，不含注入字符。
+	downloadName := r.URL.Query().Get("name")
+	if downloadName == "" {
+		downloadName = path.Base(key)
+	}
+	w.Header().Set("Content-Disposition", clawFileContentDisposition(downloadName))
 	_, _ = io.Copy(w, reader)
 }
 
@@ -169,6 +220,17 @@ func (h *Handler) clawStoreUpload(w http.ResponseWriter, r *http.Request, scope,
 		clawJSON(w, 413, 413, "文件过大", nil)
 		return
 	}
+	// 危险可执行/脚本扩展名一律拒收（大小写不敏感）。
+	if !clawFileExtAllowed(header.Filename) {
+		clawJSON(w, 400, 400, "不支持的文件类型", nil)
+		return
+	}
+	// 空文件没有产出价值，还会让下游拿到 0 字节附件。header.Size 是
+	// multipart 声明值，下面读取后还会按实际字节数再兜一次。
+	if header.Size == 0 {
+		clawJSON(w, 400, 400, "空文件不能上传", nil)
+		return
+	}
 
 	buf := make([]byte, 512)
 	n, readErr := file.Read(buf)
@@ -177,7 +239,9 @@ func (h *Handler) clawStoreUpload(w http.ResponseWriter, r *http.Request, scope,
 		return
 	}
 	contentType := http.DetectContentType(buf[:n])
-	ext := strings.ToLower(path.Ext(header.Filename))
+	// 用 filepath.Ext 而不是 path.Ext：multipart 的文件名可能带反斜杠
+	// （Windows 客户端），filepath 在两端都能正确取到 ".exe" 之类的扩展名。
+	ext := strings.ToLower(filepath.Ext(header.Filename))
 	if ct, ok := extContentTypes[ext]; ok {
 		contentType = ct
 	} else if ct := contentTypeFromExt(ext); ct != "" {
@@ -195,6 +259,11 @@ func (h *Handler) clawStoreUpload(w http.ResponseWriter, r *http.Request, scope,
 	}
 	if int64(len(data)) > clawFileMaxBytes {
 		clawJSON(w, 413, 413, "文件过大", nil)
+		return
+	}
+	// 兜住「声明 Size 非 0、实际字节流为空」的伪造/异常 multipart。
+	if len(data) == 0 {
+		clawJSON(w, 400, 400, "空文件不能上传", nil)
 		return
 	}
 

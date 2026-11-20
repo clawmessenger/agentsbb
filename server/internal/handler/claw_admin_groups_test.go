@@ -865,6 +865,11 @@ func TestClawGroupMirrorWiresEveryCallback(t *testing.T) {
 	if mirror.DeleteGroup == nil {
 		t.Error("DeleteGroup not wired")
 	}
+	// D-002：建群成员身份归一。可选项（nil 时集成层禁用），但生产必须挂上，
+	// 否则「选 1 人却多出绑定手机号账号」的跨端缺陷只剩前端半程。
+	if mirror.ResolveMemberIDs == nil {
+		t.Error("ResolveMemberIDs not wired")
+	}
 }
 
 // TestClawGroupMirrorFallbackAgentNeedsTheRongCloudIntegration 已随 D-006 删除：

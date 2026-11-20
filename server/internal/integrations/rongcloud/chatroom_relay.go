@@ -317,6 +317,42 @@ func normalizeGroupRelayRounds(value int) int {
 	return value
 }
 
+// effectiveGroupRelayRounds 按实际可发言成员数收敛接力轮数（QA5-DEF-06）。
+//
+// 群里只有 0/1 个可见智能体时，默认 3 轮没有任何意义：pump 每轮把 index
+// 归零，唯一的 opencode 会连着被驱动三轮，提示词从「下一位请继续」到
+// 「接上一位」全是自己接自己（自问自答）。收口为 1 轮是改动最小、最不易
+// 回归的做法：不动状态机、不改设备端，只让这种群「一问一答即止」。
+// 2 个及以上成员时沿用原归一化逻辑（默认值 + 上限截断），行为完全不变。
+func effectiveGroupRelayRounds(rounds, speakerCount int) int {
+	if speakerCount <= 1 {
+		return 1
+	}
+	return normalizeGroupRelayRounds(rounds)
+}
+
+// groupRelayNextRoundStart 决定新一轮从哪个成员下标开始（QA5-DEF-06 b）。
+//
+// 多轮接龙按 members 顺序全员各发言一次，跨轮时 index 归零。若新一轮的
+// 默认起点恰好就是刚发言的那位（例如上一轮后半段成员被离线/移出闸门跳过，
+// s.senderRCID 仍停在第一位），就会变成同一智能体连续两轮接龙。这里在
+// 候选池 >1 时把起点挪到第一个「不是刚发言者」的成员，避免自己接自己。
+// 用 rcID 而不是 lastSpeaker() 的 roleName 判定：展示名可能重复，rcID 唯一。
+func groupRelayNextRoundStart(members []relayMember, lastSpeakerRCID string) int {
+	if len(members) <= 1 || lastSpeakerRCID == "" {
+		return 0
+	}
+	if members[0].rcID != lastSpeakerRCID {
+		return 0
+	}
+	for i, m := range members {
+		if m.rcID != lastSpeakerRCID {
+			return i
+		}
+	}
+	return 0
+}
+
 // attachContextLocked 在持有 h.mu 的前提下，把该会话最近 contextRounds 轮
 // 对话快照进 session.history。取值后即与 hub 的滚动缓存解耦（深拷贝），
 // 后续轮次的写入不会影响在途的提示词。
@@ -781,7 +817,9 @@ func (h *chatroomRelayHub) pump(ctx context.Context, s *relaySession) {
 			return
 		}
 		s.roundIndex++
-		s.index = 0
+		// 排除刚发言者自己：s.senderRCID 是上一轮最后实际派发的成员，
+		// 2 个及以上成员时用它把新一轮起点挪开，避免同一智能体连续接龙。
+		s.index = groupRelayNextRoundStart(s.members, s.senderRCID)
 	}
 }
 

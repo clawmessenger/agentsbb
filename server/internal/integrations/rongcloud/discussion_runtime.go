@@ -1041,14 +1041,18 @@ func (rt *discussionRuntime) notifyCancelSafe(ctx context.Context, d DiscussionR
 			}
 		}
 	}
-	// 活跃 assignment 的 target（事件流里最后一条 assignment_created/host_turn_requested）
-	events, _ := rt.repo.ListEventsAfter(ctx, d.DiscussionID, cancel_assignment_scan_floor)
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].EventType == "assignment_created" || events[i].EventType == "host_turn_requested" {
-			if events[i].TargetID != "" {
-				targets[events[i].TargetID] = true
+	// 活跃 assignment 的 target（事件流里最后一条 assignment_created/host_turn_requested）。
+	// repo 在部分单元测试构造的 runtime 里为 nil（v3 interactiveCancel 也会调到
+	// 这里），此时只看角色板里的 host，不要因此 panic。
+	if rt.repo != nil {
+		events, _ := rt.repo.ListEventsAfter(ctx, d.DiscussionID, cancel_assignment_scan_floor)
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i].EventType == "assignment_created" || events[i].EventType == "host_turn_requested" {
+				if events[i].TargetID != "" {
+					targets[events[i].TargetID] = true
+				}
+				break
 			}
-			break
 		}
 	}
 	for target := range targets {

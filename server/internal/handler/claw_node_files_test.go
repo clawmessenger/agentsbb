@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -145,5 +146,150 @@ func TestClawServeFile(t *testing.T) {
 	}
 	if w := get("/api/claw/files/claw-files/user-u1/missing.html"); w.Code != http.StatusNotFound {
 		t.Fatalf("missing object must 404, got %d", w.Code)
+	}
+}
+
+// uploadRawThroughStore 返回原始 recorder，便于断言 4xx 拒收（不像
+// uploadThroughStore 那样约定必须 200）。
+func uploadRawThroughStore(t *testing.T, h *Handler, scope, filename string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.WriteField("type", "file"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	h.clawStoreUpload(w, req, scope, "file")
+	return w
+}
+
+func decodeClawEnvelope(t *testing.T, w *httptest.ResponseRecorder) clawEnvelope {
+	t.Helper()
+	var env clawEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode response: %v (%s)", err, w.Body.String())
+	}
+	return env
+}
+
+// QA5-DEF-04 a：危险可执行/脚本扩展名一律 400「不支持的文件类型」，
+// 大小写不敏感；正常 png 仍照旧通过。
+func TestClawUploadRejectsDangerousExtensions(t *testing.T) {
+	h, _ := newClawFileTestHandler()
+	blocked := []string{
+		"payload.exe", "PAYLOAD.EXE", "setup.msi", "run.bat", "x.CMD",
+		"c.com", "s.scr", "p.pif", "d.dll", "lib.so", "lib.DYLIB",
+		"macro.vbs", "s.ps1", "app.jar", "tool.app",
+	}
+	for _, name := range blocked {
+		w := uploadRawThroughStore(t, h, "node-n1", name, []byte("MZ fake executable"))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", name, w.Code)
+		}
+		if env := decodeClawEnvelope(t, w); env.Code != 400 || env.Message != "不支持的文件类型" {
+			t.Fatalf("%s: envelope = %+v, want 400/不支持的文件类型", name, env)
+		}
+	}
+	// 正常附件不受影响（既有响应字段保持不变）。
+	w := uploadRawThroughStore(t, h, "node-n1", "chart.png", []byte("\x89PNG\r\n\x1a\nbody"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("png upload status = %d, body = %s", w.Code, w.Body.String())
+	}
+	env := decodeClawEnvelope(t, w)
+	data, _ := env.Data.(map[string]interface{})
+	if data == nil || data["filename"] != "chart.png" {
+		t.Fatalf("png response fields changed: %+v", env.Data)
+	}
+}
+
+// QA5-DEF-04 a 的纯函数：扩展名黑名单大小写不敏感，无扩展名/常规类型放行。
+func TestClawFileExtAllowed(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"a.exe", false}, {"A.EXE", false}, {"a.Ps1", false}, {"a.JAR", false},
+		{"a.so", false}, {"a.dylib", false}, {"a.msi", false},
+		{"chart.png", true}, {"report.HTML", true}, {"notes.md", true},
+		{"noextension", true}, {"archive.tar.gz", true},
+	}
+	for _, tc := range cases {
+		if got := clawFileExtAllowed(tc.name); got != tc.want {
+			t.Errorf("clawFileExtAllowed(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// QA5-DEF-04 b：空文件（声明 Size=0 + 实际 0 字节）被 400「空文件不能上传」，
+// 且不写进存储。25 MiB 上限本身不变（钉住常量）。
+func TestClawUploadRejectsEmptyFile(t *testing.T) {
+	if clawFileMaxBytes != 25<<20 {
+		t.Fatalf("clawFileMaxBytes = %d, must stay 25 MiB", clawFileMaxBytes)
+	}
+	h, store := newClawFileTestHandler()
+	w := uploadRawThroughStore(t, h, "node-n1", "empty.txt", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("empty upload status = %d, want 400", w.Code)
+	}
+	if env := decodeClawEnvelope(t, w); env.Code != 400 || env.Message != "空文件不能上传" {
+		t.Fatalf("empty upload envelope = %+v, want 400/空文件不能上传", env)
+	}
+	if len(store.files) != 0 {
+		t.Fatalf("empty file must not be stored, got %d objects", len(store.files))
+	}
+}
+
+// QA5-DEF-04 c：读回响应必须带 attachment + filename* (UTF-8) + ASCII 兜底。
+func TestClawServeFileContentDisposition(t *testing.T) {
+	h, store := newClawFileTestHandler()
+	store.files = map[string][]byte{}
+	key := "claw-files/user-u1/018f4a3b-6c1e-7a2b-9c3d-4e5f60718293.png"
+	store.files[key] = []byte("png-bytes")
+
+	router := chi.NewRouter()
+	router.Get("/api/claw/files/*", h.ClawServeFile)
+	get := func(target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	// 不传 ?name= 时用 key 末段（uuid.ext）兜底。
+	w := get("/api/claw/files/" + key)
+	if w.Code != http.StatusOK {
+		t.Fatalf("serve status = %d", w.Code)
+	}
+	cd := w.Header().Get("Content-Disposition")
+	base := "018f4a3b-6c1e-7a2b-9c3d-4e5f60718293.png"
+	if !strings.HasPrefix(cd, "attachment; ") ||
+		!strings.Contains(cd, `filename="`+base+`"`) ||
+		!strings.Contains(cd, "filename*=UTF-8''"+base) {
+		t.Fatalf("Content-Disposition = %q, want attachment + ASCII fallback + filename*", cd)
+	}
+
+	// 前端显式给中文原名：filename* 用 url.QueryEscape，ASCII 兜底不含中文。
+	name := "季度报告 2026.png"
+	w2 := get("/api/claw/files/" + key + "?name=" + url.QueryEscape(name))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("serve with name status = %d", w2.Code)
+	}
+	cd2 := w2.Header().Get("Content-Disposition")
+	if !strings.HasPrefix(cd2, "attachment; ") ||
+		!strings.Contains(cd2, "filename*=UTF-8''"+url.QueryEscape(name)) ||
+		!strings.Contains(cd2, `filename="____ 2026.png"`) {
+		t.Fatalf("Content-Disposition (Chinese) = %q, want UTF-8 filename* + ASCII fallback", cd2)
 	}
 }

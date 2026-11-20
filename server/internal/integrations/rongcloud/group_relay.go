@@ -166,7 +166,9 @@ func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string
 	if len(members) == 0 {
 		return false, false
 	}
-	total := normalizeGroupRelayRounds(rounds)
+	// 按入口解析后的实际可发言成员数收敛轮数：单智能体群不跑多轮自问自答。
+	// contextRounds 仍用原 rounds（那是历史窗口长度，语义不同，不能一并收口）。
+	total := effectiveGroupRelayRounds(rounds, len(members))
 	h.mu.Lock()
 	if existing, busy := h.sessions[groupID]; busy {
 		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds), members, targeted)
