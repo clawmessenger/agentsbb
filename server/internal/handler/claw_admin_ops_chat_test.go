@@ -3,6 +3,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -92,4 +96,70 @@ func TestClawAdminOpsChatHistoryRecorder(t *testing.T) {
 	if err := (&Handler{}).ClawAdminOpsChatHistoryRecorder()(context.Background(), rec); err != nil {
 		t.Fatalf("nil DB should be a no-op: %v", err)
 	}
+}
+
+// 历史表 613 上过一次线后，SELECT 里写了一个建表时没有的 ops_agent 列，
+// 线上每次查询直接 500（单元测试只覆盖 INSERT，没抓到）。这里直接对照
+// migration 的表定义与 handler 源码里的 SELECT/INSERT 列，防同类回归。
+func TestClawAdminOpsChatHistoryColumnsMatchMigration(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	dir := filepath.Dir(thisFile)
+	migrationPath := filepath.Join(dir, "..", "..", "migrations", "613_claw_admin_ops_chat_history.up.sql")
+	migration, err := os.ReadFile(migrationPath)
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	source, err := os.ReadFile(filepath.Join(dir, "claw_admin_ops_chat.go"))
+	if err != nil {
+		t.Fatalf("read handler: %v", err)
+	}
+
+	columns := map[string]bool{}
+	columnDef := regexp.MustCompile(`(?m)^\s{4}([a-z][a-z0-9_]*)\s+(?:bigserial|text|bigint|timestamptz)\b`)
+	for _, m := range columnDef.FindAllStringSubmatch(string(migration), -1) {
+		columns[m[1]] = true
+	}
+	if len(columns) < 10 {
+		t.Fatalf("parsed too few columns from migration: %v", columns)
+	}
+
+	const table = "claw_admin_ops_chat_history"
+	check := func(label, block string) {
+		t.Helper()
+		for _, word := range regexp.MustCompile(`[a-z][a-z0-9_]*`).FindAllString(block, -1) {
+			switch word {
+			case table, "select", "from", "where", "and", "or", "order", "by", "limit", "desc",
+				"coalesce", "on", "conflict", "do", "nothing", "values", "into", "insert",
+				"as", "not", "null", "true", "false":
+				continue
+			}
+			if !columns[word] {
+				t.Errorf("%s references column %q which migration 613 does not define", label, word)
+			}
+		}
+	}
+
+	src := string(source)
+	selectAt := strings.Index(src, "SELECT id, request_id,")
+	if selectAt < 0 {
+		t.Fatal("locate history SELECT")
+	}
+	fromAt := strings.Index(src[selectAt:], "FROM "+table)
+	if fromAt < 0 {
+		t.Fatal("locate history SELECT FROM")
+	}
+	check("history SELECT", src[selectAt:selectAt+fromAt])
+
+	insertAt := strings.Index(src, "INSERT INTO "+table)
+	if insertAt < 0 {
+		t.Fatal("locate history INSERT")
+	}
+	valuesAt := strings.Index(src[insertAt:], "VALUES (")
+	if valuesAt < 0 {
+		t.Fatal("locate history INSERT VALUES")
+	}
+	check("history INSERT", src[insertAt:insertAt+valuesAt])
 }

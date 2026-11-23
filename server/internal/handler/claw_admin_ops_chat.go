@@ -162,17 +162,17 @@ func (h *Handler) ClawAdminOpsChatResult(w http.ResponseWriter, r *http.Request)
 // clawAdminOpsChatHistoryItem 是管理端抽屉回看的一轮问答。
 // elapsed_ms / id 用数字即可（JS 安全整数范围内），时间走 RFC3339 字符串。
 type clawAdminOpsChatHistoryItem struct {
-	ID         int64      `json:"id"`
-	RequestID  string     `json:"request_id"`
-	Status     string     `json:"status"`
-	Question   string     `json:"question"`
-	Reply      string     `json:"reply"`
-	ErrorCode  string     `json:"error_code,omitempty"`
-	ElapsedMs  int64      `json:"elapsed_ms"`
-	CreatedAt  time.Time  `json:"created_at"`
-	SettledAt  *time.Time `json:"settled_at,omitempty"`
-	OpsAgent   string     `json:"ops_agent,omitempty"`
-	OpsPeerID  string     `json:"ops_peer_id,omitempty"`
+	ID        int64      `json:"id"`
+	RequestID string     `json:"request_id"`
+	Status    string     `json:"status"`
+	Question  string     `json:"question"`
+	Reply     string     `json:"reply"`
+	ErrorCode string     `json:"error_code,omitempty"`
+	ElapsedMs int64      `json:"elapsed_ms"`
+	CreatedAt time.Time  `json:"created_at"`
+	SettledAt *time.Time `json:"settled_at,omitempty"`
+	OpsAgent  string     `json:"ops_agent,omitempty"`
+	OpsPeerID string     `json:"ops_peer_id,omitempty"`
 }
 
 // ClawAdminOpsChatHistoryRecorder 把结算后的问答写进历史表。
@@ -239,7 +239,7 @@ func (h *Handler) ClawAdminOpsChatHistory(w http.ResponseWriter, r *http.Request
 
 	rows, err := h.DB.Query(r.Context(), `
 		SELECT id, request_id, status, question, reply, error_code, elapsed_ms, created_at, settled_at,
-		       COALESCE(ops_agent, ''), COALESCE(ops_peer_id, '')
+		       COALESCE(ops_peer_id, '')
 		FROM claw_admin_ops_chat_history
 		WHERE node_id = $1 AND ($2 = 0 OR id < $2)
 		ORDER BY id DESC LIMIT $3`, rec.NodeID, before, limit+1)
@@ -254,7 +254,7 @@ func (h *Handler) ClawAdminOpsChatHistory(w http.ResponseWriter, r *http.Request
 		var item clawAdminOpsChatHistoryItem
 		var settledAt *time.Time
 		if err := rows.Scan(&item.ID, &item.RequestID, &item.Status, &item.Question, &item.Reply,
-			&item.ErrorCode, &item.ElapsedMs, &item.CreatedAt, &settledAt, &item.OpsAgent, &item.OpsPeerID); err != nil {
+			&item.ErrorCode, &item.ElapsedMs, &item.CreatedAt, &settledAt, &item.OpsPeerID); err != nil {
 			clawAdminFail(w, 500, "读取运维对话历史失败")
 			return
 		}
