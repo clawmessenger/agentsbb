@@ -1256,6 +1256,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			rcNodeRequests := rongcloud.NewNodeRequestBroker(slog.Default())
 			// 管理端运维对话：与普通文本私聊同一条链路，和 broker 一样一个实例两端持有。
 			rcOpsChat := rongcloud.NewOpsChatBroker(slog.Default())
+			// 历史落库挂在结算回调上：设备一回包就写，不等页面轮询，
+			// 这样关抽屉/刷新/进程内记录过期都不影响回看。
+			rcOpsChat.BindRecorder(h.ClawAdminOpsChatHistoryRecorder())
 			// T01 配额服务：空组直建 / 群创建 / 聊天室创建三入口共用同一实例；
 			// REST（/api/quota/me）与 admin 配额 API 也挂它。
 			rcQuota := quota.New(pool)
@@ -1838,6 +1841,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/admin/nodes/{id}/ops-chat", h.ClawAdminOpsChatContext)
 	r.Post("/api/admin/nodes/{id}/ops-chat", h.ClawAdminOpsChatSend)
 	r.Get("/api/admin/nodes/{id}/ops-chat/result/{request_id}", h.ClawAdminOpsChatResult)
+	r.Get("/api/admin/nodes/{id}/ops-chat/history", h.ClawAdminOpsChatHistory)
 	// 启停：写期望状态，由设备 supervisor 轮询执行（见 claw_device_control.go）。
 	r.Post("/api/admin/nodes/{id}/start", h.ClawAdminStartNode)
 	r.Post("/api/admin/nodes/{id}/stop", h.ClawAdminStopNode)

@@ -13,10 +13,13 @@ package handler
 // 节点 id / 对端 / 文本长度，**绝不记正文** —— 运维对话里经常直接贴配置片段。
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/multica-ai/multica/server/internal/integrations/rongcloud"
@@ -154,6 +157,126 @@ func (h *Handler) ClawAdminOpsChatResult(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	clawAdminOK(w, result)
+}
+
+// clawAdminOpsChatHistoryItem 是管理端抽屉回看的一轮问答。
+// elapsed_ms / id 用数字即可（JS 安全整数范围内），时间走 RFC3339 字符串。
+type clawAdminOpsChatHistoryItem struct {
+	ID         int64      `json:"id"`
+	RequestID  string     `json:"request_id"`
+	Status     string     `json:"status"`
+	Question   string     `json:"question"`
+	Reply      string     `json:"reply"`
+	ErrorCode  string     `json:"error_code,omitempty"`
+	ElapsedMs  int64      `json:"elapsed_ms"`
+	CreatedAt  time.Time  `json:"created_at"`
+	SettledAt  *time.Time `json:"settled_at,omitempty"`
+	OpsAgent   string     `json:"ops_agent,omitempty"`
+	OpsPeerID  string     `json:"ops_peer_id,omitempty"`
+}
+
+// ClawAdminOpsChatHistoryRecorder 把结算后的问答写进历史表。
+// 用 ON CONFLICT DO NOTHING 而不是 UPSERT：同一 request_id 只该有一份史实，
+// 迟到的重复回包不能把已经落库的设备回复覆盖掉。
+func (h *Handler) ClawAdminOpsChatHistoryRecorder() rongcloud.OpsChatRecorder {
+	return func(ctx context.Context, rec rongcloud.OpsChatRecorded) error {
+		if h.DB == nil {
+			return nil
+		}
+		_, err := h.DB.Exec(ctx, `
+			INSERT INTO claw_admin_ops_chat_history
+				(node_id, request_id, ops_peer_id, question, reply, status, error_code, elapsed_ms, created_at, settled_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (request_id) DO NOTHING`,
+			rec.NodeID, rec.RequestID, rec.OpsPeerID, rec.Question, rec.Reply,
+			rec.Status, rec.ErrorCode, rec.ElapsedMs, rec.CreatedAt, rec.SettledAt,
+		)
+		return err
+	}
+}
+
+// ClawAdminOpsChatHistory 按节点分页返回历史（最新在前取 N 条，再翻转成时间正序）。
+// before 是游标 id；has_more=true 表示还有更早的记录。
+func (h *Handler) ClawAdminOpsChatHistory(w http.ResponseWriter, r *http.Request) {
+	if h.requireClawAdmin("system:write", w, r) == nil {
+		return
+	}
+	rec, found, err := h.clawAdminNodeByPathID(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		clawAdminFail(w, 500, "获取设备失败")
+		return
+	}
+	if !found {
+		clawAdminFail(w, 404, "设备不存在")
+		return
+	}
+	if h.DB == nil {
+		clawAdminFail(w, 503, rongcloud.OpsChatCodeUnavailable)
+		return
+	}
+
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, convErr := strconv.Atoi(raw)
+		if convErr != nil || n < 1 {
+			clawAdminFail(w, 400, "limit must be a positive integer")
+			return
+		}
+		if n > 100 {
+			n = 100
+		}
+		limit = n
+	}
+	before := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("before")); raw != "" {
+		n, convErr := strconv.ParseInt(raw, 10, 64)
+		if convErr != nil || n < 1 {
+			clawAdminFail(w, 400, "before must be a positive integer")
+			return
+		}
+		before = n
+	}
+
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT id, request_id, status, question, reply, error_code, elapsed_ms, created_at, settled_at,
+		       COALESCE(ops_agent, ''), COALESCE(ops_peer_id, '')
+		FROM claw_admin_ops_chat_history
+		WHERE node_id = $1 AND ($2 = 0 OR id < $2)
+		ORDER BY id DESC LIMIT $3`, rec.NodeID, before, limit+1)
+	if err != nil {
+		clawAdminFail(w, 500, "读取运维对话历史失败")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]clawAdminOpsChatHistoryItem, 0, limit)
+	for rows.Next() {
+		var item clawAdminOpsChatHistoryItem
+		var settledAt *time.Time
+		if err := rows.Scan(&item.ID, &item.RequestID, &item.Status, &item.Question, &item.Reply,
+			&item.ErrorCode, &item.ElapsedMs, &item.CreatedAt, &settledAt, &item.OpsAgent, &item.OpsPeerID); err != nil {
+			clawAdminFail(w, 500, "读取运维对话历史失败")
+			return
+		}
+		item.SettledAt = settledAt
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		clawAdminFail(w, 500, "读取运维对话历史失败")
+		return
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	// DESC 取最新 N 条后翻回正序，前端直接从上往下渲染就是时间线。
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+	clawAdminOK(w, map[string]interface{}{
+		"items":    items,
+		"has_more": hasMore,
+	})
 }
 
 // clawAdminOpsChatContextOf 解析「这条运维消息该发给谁」。
