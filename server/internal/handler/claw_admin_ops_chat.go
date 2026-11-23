@@ -159,6 +159,35 @@ func (h *Handler) ClawAdminOpsChatResult(w http.ResponseWriter, r *http.Request)
 	clawAdminOK(w, result)
 }
 
+// ClawAdminOpsChatCancel 放弃等待一轮还没回包的运维请求。
+//
+// 后台已取消固定超时，设备彻底不回包时会长期占着同一对端（busy）。这个接口
+// 给用户一个显式出口：立刻结为失败、释放 busy、落一条历史。request_id 必须
+// 属于 URL 上的节点，避免拿别的节点的 id 来解锁对端。
+func (h *Handler) ClawAdminOpsChatCancel(w http.ResponseWriter, r *http.Request) {
+	if h.requireClawAdmin("system:write", w, r) == nil {
+		return
+	}
+	rec, found, err := h.clawAdminNodeByPathID(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		clawAdminFail(w, 500, "获取设备失败")
+		return
+	}
+	if !found {
+		clawAdminFail(w, 404, "设备不存在")
+		return
+	}
+	if h.OpsChat == nil {
+		clawAdminFail(w, 503, rongcloud.OpsChatCodeUnavailable)
+		return
+	}
+	if !h.OpsChat.Cancel(chi.URLParam(r, "request_id"), rec.NodeID) {
+		clawAdminFail(w, 404, "运维请求不存在、已结束或属于其他节点")
+		return
+	}
+	clawAdminOK(w, map[string]interface{}{"cancelled": true})
+}
+
 // clawAdminOpsChatHistoryItem 是管理端抽屉回看的一轮问答。
 // elapsed_ms / id 用数字即可（JS 安全整数范围内），时间走 RFC3339 字符串。
 type clawAdminOpsChatHistoryItem struct {
@@ -293,7 +322,7 @@ func (h *Handler) clawAdminOpsChatContextOf(r *http.Request, rec clawAdminNodeRe
 		NodeType:       rec.AIType,
 		OpsPeerID:      rec.RongcloudUserID,
 		PeerKind:       "agent",
-		TimeoutSeconds: rongcloud.OpsChatDefaultTimeoutSeconds,
+		TimeoutSeconds: rongcloud.OpsChatNoTimeoutSeconds,
 	}
 
 	names, _, _ := h.clawAdminNodeUserNames(ctx)

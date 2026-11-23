@@ -41,12 +41,19 @@ const (
 	OpsChatCodeSendFailed  = "OPS_CHAT_SEND_FAILED"
 	OpsChatCodeTimeout     = "OPS_CHAT_TIMEOUT"
 	OpsChatCodeFailed      = "OPS_CHAT_FAILED"
+	OpsChatCodeCancelled   = "OPS_CHAT_CANCELLED"
 
-	// 运维一轮要跑完一次完整 agent 回合（还可能带工具调用），旗舰模型几十秒很常见。
-	// C 端的轮次超时也是这个量级，压到 20s 会把正常回答判成超时。
-	OpsChatDefaultTimeoutSeconds = 120
+	// 不再有固定墙钟：设备端已取消执行层的 300s/600s 限时，改由「无进展」守卫
+	// 收尾（见 CLI 1.3.60）。后台这道投递/轮询超时若仍留 120s，反而成了最短的
+	// 一道墙——设备还在正常跑，页面就先报「未在规定时间内回复」。
+	// OpsChatNoTimeoutSeconds=0 通过 context 下发给前端，表示「不要倒计时」。
+	OpsChatNoTimeoutSeconds = 0
 
-	// 结果保留时间：轮询方最多等 timeout+5s，留足余量让它拿到终态。
+	// 仅作内存兜底：pending 记录挂满 24h 才强制收尾，避免进程内 map 无限堆积。
+	// 正常用户永远等不到它；真不回包时用管理端「放弃等待」主动结束。
+	opsChatPendingHardLimit = 24 * time.Hour
+
+	// 结果保留时间：终态后再留 5 分钟，供轮询方拿到最后一次状态。
 	opsChatResultRetention = 5 * time.Minute
 	// 终帧先到、兜底整包文本后到：这段窗口内同节点的文本回包一律认领并丢弃。
 	// 不丢的话它会掉进通用消息分发器，被当成一条新的用户消息（可能触发回声）。
@@ -189,7 +196,7 @@ func (b *OpsChatBroker) Start(
 		opsAgent:  strings.TrimSpace(opsAgent),
 		text:      text,
 		createdAt: now,
-		expiresAt: now.Add(OpsChatDefaultTimeoutSeconds * time.Second),
+		expiresAt: now.Add(opsChatPendingHardLimit),
 		status:    "pending",
 	}
 
@@ -255,6 +262,22 @@ func (b *OpsChatBroker) Get(requestID string) (OpsChatSnapshot, bool) {
 		ElapsedMs: end.Sub(rec.createdAt).Milliseconds(),
 		ErrorCode: rec.errorCode,
 	}, true
+}
+
+// Cancel 主动放弃一轮还在等回包的请求。
+//
+// 没有固定超时后，设备彻底不回包时会一直占着 byTarget（同一对端 busy）。
+// 管理端「放弃等待」把 pending 结成失败态：立即释放 busy、落一条历史，
+// 设备迟到的回包仍按 settleLocked 的 pending 检查被丢弃，不会串进下一轮。
+func (b *OpsChatBroker) Cancel(requestID, nodeID string) bool {
+	b.mu.Lock()
+	var settled *OpsChatRecorded
+	if rec := b.records[requestID]; rec != nil && rec.nodeID == nodeID && rec.status == "pending" {
+		settled = b.settleLocked(rec, "failed", "", OpsChatCodeCancelled)
+	}
+	b.mu.Unlock()
+	b.record(settled)
+	return settled != nil
 }
 
 // Accept 让 webhook 把一条入站消息交给运维通道认领。

@@ -1842,6 +1842,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/admin/nodes/{id}/ops-chat", h.ClawAdminOpsChatSend)
 	r.Get("/api/admin/nodes/{id}/ops-chat/result/{request_id}", h.ClawAdminOpsChatResult)
 	r.Get("/api/admin/nodes/{id}/ops-chat/history", h.ClawAdminOpsChatHistory)
+	r.Post("/api/admin/nodes/{id}/ops-chat/cancel/{request_id}", h.ClawAdminOpsChatCancel)
 	// 启停：写期望状态，由设备 supervisor 轮询执行（见 claw_device_control.go）。
 	r.Post("/api/admin/nodes/{id}/start", h.ClawAdminStartNode)
 	r.Post("/api/admin/nodes/{id}/stop", h.ClawAdminStopNode)
