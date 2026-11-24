@@ -172,8 +172,8 @@ func (h *Handler) ClawAdminListChatRooms(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	// conversation_kind 三个取值：discussion=讨论组房间；normal=普通聊天室
-	// （投影里 COALESCE 成空串，只能用 = '' 表达，直接传空串又会被当成
-	// 「不过滤」，所以用 normal 这个字面量）；缺省/空 = 全部。
+	// （投影里 COALESCE 成空串，直接传空串又会被当成「不过滤」，所以用 normal
+	// 这个字面量）；缺省/空 = 全部。
 	if kind != "" && kind != "normal" && kind != "discussion" {
 		clawAdminFail(w, 400, "conversation_kind has an unsupported value")
 		return
@@ -199,7 +199,12 @@ func (h *Handler) ClawAdminListChatRooms(w http.ResponseWriter, r *http.Request)
 	}
 	switch kind {
 	case "normal":
-		where = append(where, "conversation_kind = ''")
+		// 「普通聊天室」= 除讨论组以外的一切房间，不能写成 `= ''`。
+		//
+		// 老数据（讨论组之外的房间）conversation_kind 是空串，但 2026-11-24 开放聊天室
+		// 后，C 端新建的普通房间按 actionChatroomCreate 写的是 'chatroom'。只认空串
+		// 会让「仅聊天室」把新房间全部漏掉 —— 列表看着像没建成。
+		where = append(where, "conversation_kind <> 'discussion'")
 	case "discussion":
 		args = append(args, kind)
 		where = append(where, "conversation_kind = $"+strconv.Itoa(len(args)))
