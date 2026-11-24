@@ -41,12 +41,19 @@ const (
 	OpsChatCodeSendFailed  = "OPS_CHAT_SEND_FAILED"
 	OpsChatCodeTimeout     = "OPS_CHAT_TIMEOUT"
 	OpsChatCodeFailed      = "OPS_CHAT_FAILED"
+	OpsChatCodeCancelled   = "OPS_CHAT_CANCELLED"
 
-	// 运维一轮要跑完一次完整 agent 回合（还可能带工具调用），旗舰模型几十秒很常见。
-	// C 端的轮次超时也是这个量级，压到 20s 会把正常回答判成超时。
-	OpsChatDefaultTimeoutSeconds = 120
+	// 不再有固定墙钟：设备端已取消执行层的 300s/600s 限时，改由「无进展」守卫
+	// 收尾（见 CLI 1.3.60）。后台这道投递/轮询超时若仍留 120s，反而成了最短的
+	// 一道墙——设备还在正常跑，页面就先报「未在规定时间内回复」。
+	// OpsChatNoTimeoutSeconds=0 通过 context 下发给前端，表示「不要倒计时」。
+	OpsChatNoTimeoutSeconds = 0
 
-	// 结果保留时间：轮询方最多等 timeout+5s，留足余量让它拿到终态。
+	// 仅作内存兜底：pending 记录挂满 24h 才强制收尾，避免进程内 map 无限堆积。
+	// 正常用户永远等不到它；真不回包时用管理端「放弃等待」主动结束。
+	opsChatPendingHardLimit = 24 * time.Hour
+
+	// 结果保留时间：终态后再留 5 分钟，供轮询方拿到最后一次状态。
 	opsChatResultRetention = 5 * time.Minute
 	// 终帧先到、兜底整包文本后到：这段窗口内同节点的文本回包一律认领并丢弃。
 	// 不丢的话它会掉进通用消息分发器，被当成一条新的用户消息（可能触发回声）。
@@ -72,6 +79,27 @@ type OpsChatSnapshot struct {
 	ErrorCode string `json:"error_code"`
 }
 
+// OpsChatRecorded 是结算瞬间交给落库层的一份不可变快照。
+// 进程内记录 5 分钟后会被 sweep 掉，历史表靠它在 webhook 回包时就写定，
+// 不依赖管理端页面是否还在轮询。question 只在落库用，不进轮询 API 的 snapshot。
+type OpsChatRecorded struct {
+	RequestID string
+	NodeID    string
+	OpsPeerID string
+	OpsAgent  string
+	Question  string
+	Reply     string
+	Status    string
+	ErrorCode string
+	ElapsedMs int64
+	CreatedAt time.Time
+	SettledAt time.Time
+}
+
+// OpsChatRecorder 由启动侧绑定（一般是 admin handler 的 DB 写入）。
+// nil 表示不落库——老测试/本地跑不接数据库时保持原行为。
+type OpsChatRecorder func(ctx context.Context, rec OpsChatRecorded) error
+
 type opsChatRecord struct {
 	requestID string
 	nodeID    string
@@ -93,6 +121,7 @@ type OpsChatBroker struct {
 
 	mu       sync.Mutex
 	send     OpsChatSender
+	recorder OpsChatRecorder
 	records  map[string]*opsChatRecord
 	byTarget map[string]string // 对端融云 id -> requestID；结算后仍保留到 retention
 }
@@ -115,6 +144,38 @@ func (b *OpsChatBroker) BindSender(send OpsChatSender) {
 	b.send = send
 }
 
+func (b *OpsChatBroker) BindRecorder(recorder OpsChatRecorder) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recorder = recorder
+}
+
+// record 在锁外做 I/O，绝不把 DB 写放进 b.mu 里——webhook 线程会阻塞后续
+// Accept/Get，而设备回包常常是连着来的。写失败只记日志：历史丢一条不该改变
+// 本轮问答的结果，更不能让设备端重试。
+func (b *OpsChatBroker) recordAll(recs []*OpsChatRecorded) {
+	for _, rec := range recs {
+		b.record(rec)
+	}
+}
+
+func (b *OpsChatBroker) record(rec *OpsChatRecorded) {
+	if rec == nil {
+		return
+	}
+	b.mu.Lock()
+	recorder := b.recorder
+	b.mu.Unlock()
+	if recorder == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := recorder(ctx, *rec); err != nil {
+		b.logger.Warn("ops chat: history record failed", "request_id", rec.RequestID, "error", err)
+	}
+}
+
 // Start 投递一条运维消息并登记在途请求。返回的 code 非空表示没发出去。
 //
 // 预留记录必须发生在 send 之前：设备回包可能比 HTTP 返回还快，先发后登记会让
@@ -135,15 +196,16 @@ func (b *OpsChatBroker) Start(
 		opsAgent:  strings.TrimSpace(opsAgent),
 		text:      text,
 		createdAt: now,
-		expiresAt: now.Add(OpsChatDefaultTimeoutSeconds * time.Second),
+		expiresAt: now.Add(opsChatPendingHardLimit),
 		status:    "pending",
 	}
 
 	b.mu.Lock()
-	b.sweepLocked(now)
+	swept := b.sweepLocked(now)
 	if existingID := b.byTarget[opsPeerID]; existingID != "" {
 		if existing := b.records[existingID]; existing != nil && existing.status == "pending" && now.Before(existing.expiresAt) {
 			b.mu.Unlock()
+			b.recordAll(swept)
 			return "", OpsChatCodeBusy
 		}
 	}
@@ -151,6 +213,7 @@ func (b *OpsChatBroker) Start(
 	b.records[requestID] = rec
 	b.byTarget[opsPeerID] = requestID
 	b.mu.Unlock()
+	b.recordAll(swept)
 
 	if send == nil {
 		b.settle(requestID, "failed", "", OpsChatCodeUnavailable)
@@ -174,17 +237,16 @@ func (b *OpsChatBroker) Start(
 // Get 取一次状态；顺带把过期的 pending 判成 timeout。
 func (b *OpsChatBroker) Get(requestID string) (OpsChatSnapshot, bool) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var settled []*OpsChatRecorded
+	defer func() {
+		b.mu.Unlock()
+		b.recordAll(settled)
+	}()
 	now := b.now()
-	b.sweepLocked(now)
+	settled = b.sweepLocked(now)
 	rec := b.records[requestID]
 	if rec == nil {
 		return OpsChatSnapshot{}, false
-	}
-	if rec.status == "pending" && !now.Before(rec.expiresAt) {
-		rec.status = "timeout"
-		rec.errorCode = OpsChatCodeTimeout
-		rec.settledAt = now
 	}
 	end := now
 	if !rec.settledAt.IsZero() {
@@ -202,6 +264,22 @@ func (b *OpsChatBroker) Get(requestID string) (OpsChatSnapshot, bool) {
 	}, true
 }
 
+// Cancel 主动放弃一轮还在等回包的请求。
+//
+// 没有固定超时后，设备彻底不回包时会一直占着 byTarget（同一对端 busy）。
+// 管理端「放弃等待」把 pending 结成失败态：立即释放 busy、落一条历史，
+// 设备迟到的回包仍按 settleLocked 的 pending 检查被丢弃，不会串进下一轮。
+func (b *OpsChatBroker) Cancel(requestID, nodeID string) bool {
+	b.mu.Lock()
+	var settled *OpsChatRecorded
+	if rec := b.records[requestID]; rec != nil && rec.nodeID == nodeID && rec.status == "pending" {
+		settled = b.settleLocked(rec, "failed", "", OpsChatCodeCancelled)
+	}
+	b.mu.Unlock()
+	b.record(settled)
+	return settled != nil
+}
+
 // Accept 让 webhook 把一条入站消息交给运维通道认领。
 //
 // 返回 true 表示「这条已经被运维通道消费，不要再进通用分发」——尤其是那条兜底
@@ -212,9 +290,13 @@ func (b *OpsChatBroker) Accept(msg NormalizedMessage) bool {
 		return false
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var settled []*OpsChatRecorded
+	defer func() {
+		b.mu.Unlock()
+		b.recordAll(settled)
+	}()
 	now := b.now()
-	b.sweepLocked(now)
+	settled = b.sweepLocked(now)
 
 	requestID := b.byTarget[msg.FromUserID]
 	if requestID == "" {
@@ -243,7 +325,7 @@ func (b *OpsChatBroker) Accept(msg NormalizedMessage) bool {
 		}
 		// 私聊闸门拒绝时设备会回一条占位说明（sendGateRejectNotice）。它也是
 		// 文本、也应该给管理员看到——那是「这台节点为什么不干活」的唯一线索。
-		b.settleLocked(rec, "completed", text, "")
+		settled = append(settled, b.settleLocked(rec, "completed", text, ""))
 		return true
 
 	case "chat_stream", "chat_stream_chunk":
@@ -267,13 +349,13 @@ func (b *OpsChatBroker) Accept(msg NormalizedMessage) bool {
 		}
 		switch frame.Status {
 		case "completed":
-			b.settleLocked(rec, "completed", frame.Text, "")
+			settled = append(settled, b.settleLocked(rec, "completed", frame.Text, ""))
 		case "failed", "cancelled":
 			code := OpsChatCodeFailed
 			if frame.ErrorCode != "" {
 				code = frame.ErrorCode
 			}
-			b.settleLocked(rec, "failed", frame.Text, code)
+			settled = append(settled, b.settleLocked(rec, "failed", frame.Text, code))
 		default:
 			// processing / streaming：全量快照，暂不结算（首版不做流式展示）。
 		}
@@ -285,29 +367,48 @@ func (b *OpsChatBroker) Accept(msg NormalizedMessage) bool {
 
 func (b *OpsChatBroker) settle(requestID, status, reply, code string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var settled *OpsChatRecorded
 	if rec := b.records[requestID]; rec != nil {
-		b.settleLocked(rec, status, reply, code)
+		settled = b.settleLocked(rec, status, reply, code)
 	}
+	b.mu.Unlock()
+	b.record(settled)
 }
 
-func (b *OpsChatBroker) settleLocked(rec *opsChatRecord, status, reply, code string) {
+// settleLocked 只改内存态并返回一份给落库层的快照；同一条记录重复结算返回 nil。
+func (b *OpsChatBroker) settleLocked(rec *opsChatRecord, status, reply, code string) *OpsChatRecorded {
 	if rec.status != "pending" {
-		return
+		return nil
 	}
 	rec.status = status
 	rec.reply = reply
 	rec.errorCode = code
 	rec.settledAt = b.now()
+	return &OpsChatRecorded{
+		RequestID: rec.requestID,
+		NodeID:    rec.nodeID,
+		OpsPeerID: rec.opsPeerID,
+		OpsAgent:  rec.opsAgent,
+		Question:  rec.text,
+		Reply:     rec.reply,
+		Status:    rec.status,
+		ErrorCode: rec.errorCode,
+		ElapsedMs: rec.settledAt.Sub(rec.createdAt).Milliseconds(),
+		CreatedAt: rec.createdAt,
+		SettledAt: rec.settledAt,
+	}
 }
 
-func (b *OpsChatBroker) sweepLocked(now time.Time) {
+// sweepLocked 顺带返回本轮被判超时的记录，调用方在解锁后把它们交给落库层。
+// 超时也要进历史：否则「点了没回」的那几轮恰恰在回看时消失。
+func (b *OpsChatBroker) sweepLocked(now time.Time) []*OpsChatRecorded {
+	var settled []*OpsChatRecorded
 	for id, rec := range b.records {
 		if rec.status == "pending" {
 			if !now.Before(rec.expiresAt) {
-				rec.status = "timeout"
-				rec.errorCode = OpsChatCodeTimeout
-				rec.settledAt = now
+				if snap := b.settleLocked(rec, "timeout", "", OpsChatCodeTimeout); snap != nil {
+					settled = append(settled, snap)
+				}
 			}
 			continue
 		}
@@ -318,6 +419,7 @@ func (b *OpsChatBroker) sweepLocked(now time.Time) {
 			}
 		}
 	}
+	return settled
 }
 
 // opsChatTextContent 拆 RC:TxtMsg 的 {"content": "..."} 信封；不是 JSON 时按原文

@@ -136,10 +136,56 @@ func TestOpsChatTimesOutWithoutAnyReply(t *testing.T) {
 	b := newOpsChatTestBroker(t, func(_ context.Context, _, _, _ string) (string, error) { return "uid", nil })
 	b.now = func() time.Time { return now }
 	id, _ := b.Start(context.Background(), "node_8", "rc-ops-8", "", "q")
-	b.now = func() time.Time { return now.Add((OpsChatDefaultTimeoutSeconds + 1) * time.Second) }
+	b.now = func() time.Time { return now.Add(opsChatPendingHardLimit + time.Second) }
 	got, _ := b.Get(id)
 	if got.Status != "timeout" || got.ErrorCode != OpsChatCodeTimeout {
 		t.Fatalf("result = %+v, want timeout", got)
+	}
+}
+
+// 设备端 1.3.60 起取消了执行层固定墙钟，后台也不能再按 120s 把正常长任务
+// 判成超时。曾经的 121s 必须仍是 pending；真不回包由管理端显式放弃等待。
+func TestOpsChatHasNoFixed120sTimeout(t *testing.T) {
+	now := time.Now()
+	b := newOpsChatTestBroker(t, func(_ context.Context, _, _, _ string) (string, error) { return "uid", nil })
+	b.now = func() time.Time { return now }
+	id, _ := b.Start(context.Background(), "node_9", "rc-ops-9", "", "q")
+	for _, elapsed := range []time.Duration{121 * time.Second, 10 * time.Minute, 9 * time.Hour} {
+		b.now = func() time.Time { return now.Add(elapsed) }
+		got, _ := b.Get(id)
+		if got.Status != "pending" || got.ErrorCode != "" {
+			t.Fatalf("after %s: result = %+v, want pending with no error code", elapsed, got)
+		}
+	}
+}
+
+func TestOpsChatCancelFreesBusyPeer(t *testing.T) {
+	now := time.Now()
+	b := newOpsChatTestBroker(t, func(_ context.Context, _, _, _ string) (string, error) { return "uid", nil })
+	b.now = func() time.Time { return now }
+	id, code := b.Start(context.Background(), "node_10", "rc-ops-10", "", "q")
+	if code != "" {
+		t.Fatalf("first start code = %q", code)
+	}
+	if _, code := b.Start(context.Background(), "node_10", "rc-ops-10", "", "q2"); code != OpsChatCodeBusy {
+		t.Fatalf("second start while pending = %q, want busy", code)
+	}
+	// 别节点的 request_id 不能拿来解锁这条对端。
+	if b.Cancel(id, "other-node") {
+		t.Fatal("cancel with wrong node must fail")
+	}
+	if !b.Cancel(id, "node_10") {
+		t.Fatal("cancel should succeed")
+	}
+	if b.Cancel(id, "node_10") {
+		t.Fatal("cancel must be idempotent-false on a settled record")
+	}
+	if second, code := b.Start(context.Background(), "node_10", "rc-ops-10", "", "q2"); code != "" || second == id {
+		t.Fatalf("start after cancel = (%q, %q), want a fresh request", second, code)
+	}
+	got, _ := b.Get(id)
+	if got.Status != "failed" || got.ErrorCode != OpsChatCodeCancelled {
+		t.Fatalf("cancelled snapshot = %+v", got)
 	}
 }
 
@@ -184,5 +230,64 @@ func TestEncodeOpsTextContent(t *testing.T) {
 	}
 	if got := encodeOpsTextContent("hi", ""); got != `{"content":"hi"}` {
 		t.Fatalf("empty opsAgent must omit the field: %s", got)
+	}
+}
+
+// 历史落库挂在结算上，且同一轮只写一次：迟到的重复回包/反复轮询都不能
+// 再写第二行（表上还有 request_id 唯一索引兜底）。
+func TestOpsChatRecorderWritesSettlementExactlyOnce(t *testing.T) {
+	b := newOpsChatTestBroker(t, func(_ context.Context, _, _, _ string) (string, error) {
+		return "msguid-history", nil
+	})
+	var recorded []OpsChatRecorded
+	b.BindRecorder(func(_ context.Context, rec OpsChatRecorded) error {
+		recorded = append(recorded, rec)
+		return nil
+	})
+	id, code := b.Start(context.Background(), "node_history", "rc-ops-history", "codearts", "请只报告当前 agent 的版本")
+	if code != "" || id == "" {
+		t.Fatalf("Start = (%q, %q), want a request", id, code)
+	}
+	if !b.Accept(NormalizedMessage{ObjectName: objectNameText, FromUserID: "rc-ops-history",
+		Content: `{"content":"agentsbb 1.3.61"}`}) {
+		t.Fatal("reply not claimed")
+	}
+	if len(recorded) != 1 {
+		t.Fatalf("recorded %d times, want 1", len(recorded))
+	}
+	rec := recorded[0]
+	if rec.RequestID != id || rec.NodeID != "node_history" || rec.OpsPeerID != "rc-ops-history" ||
+		rec.OpsAgent != "codearts" || rec.Question != "请只报告当前 agent 的版本" ||
+		rec.Reply != "agentsbb 1.3.61" || rec.Status != "completed" {
+		t.Fatalf("recorded payload = %+v", rec)
+	}
+	if rec.CreatedAt.IsZero() || rec.SettledAt.Before(rec.CreatedAt) {
+		t.Fatalf("bad timestamps: created=%v settled=%v", rec.CreatedAt, rec.SettledAt)
+	}
+	// 重复文本 + 多次轮询都不再触发落库。
+	b.Accept(NormalizedMessage{ObjectName: objectNameText, FromUserID: "rc-ops-history",
+		Content: `{"content":"agentsbb 1.3.61"}`})
+	b.Get(id)
+	b.Get(id)
+	if len(recorded) != 1 {
+		t.Fatalf("recorded %d times after duplicates, want 1", len(recorded))
+	}
+}
+
+func TestOpsChatRecorderWritesTimeout(t *testing.T) {
+	now := time.Now()
+	b := newOpsChatTestBroker(t, func(_ context.Context, _, _, _ string) (string, error) { return "uid", nil })
+	b.now = func() time.Time { return now }
+	var recorded []OpsChatRecorded
+	b.BindRecorder(func(_ context.Context, rec OpsChatRecorded) error {
+		recorded = append(recorded, rec)
+		return nil
+	})
+	id, _ := b.Start(context.Background(), "node_timeout", "rc-ops-timeout", "", "在吗")
+	b.now = func() time.Time { return now.Add(opsChatPendingHardLimit + time.Second) }
+	b.Get(id)
+	if len(recorded) != 1 || recorded[0].Status != "timeout" || recorded[0].ErrorCode != OpsChatCodeTimeout ||
+		recorded[0].Question != "在吗" {
+		t.Fatalf("timeout record = %+v", recorded)
 	}
 }

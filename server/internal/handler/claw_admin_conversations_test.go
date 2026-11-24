@@ -389,16 +389,17 @@ func TestClawAdminListChatRoomsConversationKindFilter(t *testing.T) {
 		t.Fatalf("discussion filter missing parameterized kind clause; statements: %v", fake.stmts)
 	}
 
-	// normal=普通聊天室：投影里 kind 是空串，只能写成 = ''，不能参数化空串
-	// （空串在 handler 里表示「不过滤」）。
+	// normal=普通聊天室：投影里 kind 对讨论组是 'discussion'，其余为空串或
+	// 'chatroom'（2026-11-24 开放聊天室后新房间写的就是 'chatroom'）。所以判据是
+	// 「不等于 discussion」，只写 `= ''` 会把新房间全漏掉。
 	h, fake = newHandler()
 	rr = httptest.NewRecorder()
 	h.ClawAdminListChatRooms(rr, convRequest(t, http.MethodGet, "/api/admin/chatrooms?conversation_kind=normal", "", convReadOnly))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("normal filter status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	if !sawStatementContaining(fake, "conversation_kind = ''") {
-		t.Fatalf("normal filter should match empty kind literally; statements: %v", fake.stmts)
+	if !sawStatementContaining(fake, "conversation_kind <> 'discussion'") {
+		t.Fatalf("normal filter should exclude discussion rooms literally; statements: %v", fake.stmts)
 	}
 
 	// 其他取值一律 400，与 stage 的口径一致。
