@@ -630,6 +630,8 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // 精简回合（换掉 build 系统提示 + 关全部工具）：推荐这类"问一句拿一段
         // JSON"的短回合用它，输入 token 从 2.9 万降到 1.7 千。
         ...(turnOpts?.lean ? { lean: true } : {}),
+        // 发言回合：只换提示、留工具（见 TurnOptions.terse）。
+        ...(!turnOpts?.lean && turnOpts?.terse ? { terse: true } : {}),
         ...(turnOpts?.onUsage ? { onUsage: turnOpts.onUsage } : {}),
       })),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
@@ -659,6 +661,10 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // 行为规范走指令层（codex AGENTS.md / opencode instructions 文件），
         // 只有私聊轮次非空 —— 绝不拼进 prompt。
         ...(turnOpts?.behaviorPrompt ? { behaviorPrompt: turnOpts.behaviorPrompt } : {}),
+        // 发言回合的精简提示（讨论组/群聊）：只换 build 系统提示、工具照旧。
+        // 流式路径必须单独传 —— 之前只给 runTurn 传了 lean，流式回合（也就是
+        // 线上真正在跑的讨论/群聊）一直吃满 2.9 万 token 的 build 提示。
+        ...(turnOpts?.terse ? { terse: true } : {}),
       })),
     // 用户发「新开会话」：只清「会话键 → agent 会话 id」的映射，下一轮没有
     // resumeSessionId 自然就是新会话。agent 自己的会话文件保持原样（历史不销毁）。

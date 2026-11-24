@@ -2581,4 +2581,15 @@ describe("deviceOpencodeConfigPath", () => {
     expect(deviceOpencodeConfigPath(undefined, home, true))
       .toBe(join(home, ".agentsbb", "opencode-device-lean.json"));
   });
+
+  it("发言回合写 -terse 副本，与聊天轮次、推荐回合三份独立", () => {
+    const home = join(tmpdir(), "cm-home-terse");
+    expect(deviceOpencodeConfigPath("opencode_673", home, false, true))
+      .toBe(join(home, ".agentsbb", "opencode-device-opencode_673-terse.json"));
+    expect(deviceOpencodeConfigPath(undefined, home, false, true))
+      .toBe(join(home, ".agentsbb", "opencode-device-terse.json"));
+    // lean 与 terse 同时为真时仍然是两份不同的文件（lean 优先，但路径不能撞）。
+    expect(deviceOpencodeConfigPath("opencode_673", home, true, true))
+      .toBe(join(home, ".agentsbb", "opencode-device-opencode_673-lean.json"));
+  });
 });

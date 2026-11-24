@@ -874,11 +874,40 @@ export interface DeviceOpencodeConfigOpts {
    * （见 deviceOpencodeConfigPath 的 lean 参数），聊天轮次那份配置不受影响。
    */
   lean?: boolean;
+  /**
+   * 「发言回合」的提示精简：**只替换** `build` 的系统提示，工具照旧可用。
+   *
+   * 与 `lean` 的区别是分寸：`lean` 是给「问一句、拿一段 JSON」的推荐回合用的，
+   * 连工具一起关掉；`terse` 给讨论组/群聊的发言回合用 —— 那里 agent 仍然要能
+   * 读写文件、跑命令（用户在群里让它干活是正常用法），所以只砍提示、不砍工具。
+   *
+   * 为什么值得单独做（2026-11-24 实测，quukk/glm-5.2）：
+   *   · 裸问一句「什么是 HTTP」，输入 17 token，思考量 3,255 字符、出正文 13.5s；
+   *   · 讨论组真实回合（输入约 2.9 万 token）思考量上万字符，单轮耗时中位 70s。
+   * 也就是说耗时 ≈ prefill(输入 token) + 输出(思考+正文)，而 build 那套系统提示
+   * （约 1.9 万 token 的工具规范与技能清单）与「按角色说一段话」毫无关系，却每轮
+   * 都要重新 prefill，并且诱导模型长篇展开。换掉它，工具不动，能力不降。
+   */
+  terse?: boolean;
 }
 
 /** 精简回合的 `build` agent：只输出用户要的 JSON，零工具、零寒暄。 */
 export const LEAN_AGENT_SYSTEM_PROMPT =
   "你是角色推荐器：不要使用任何工具，不要分析或解释，直接输出用户要求的 JSON 对象。";
+
+/**
+ * 发言回合（讨论组/群聊/聊天室）的 `build` 系统提示。
+ *
+ * 三条要求都对着实测过的病灶：
+ *   1. 不复述指令 —— 服务端拼的 role_prompt 已经很长，模型照着念一遍就是纯浪费；
+ *   2. 不先描述再动手 —— 讨论场景里"我准备先查一下…"这类宣告会先产出一大段
+ *      与结论无关的正文，用户看到的就是"说了半天没干货"；
+ *   3. 给篇幅上限 —— 没有上限时 GLM 会写到被 max_tokens 截断（实测「正文 2 字」
+ *      的回合就是这么来的）。
+ */
+export const TERSE_AGENT_SYSTEM_PROMPT =
+  "你是这场对话中的一位参与者。直接给出你的观点与论证，不要客套、不要复述用户的话或上面的指令，"
+  + "不要先宣告你打算做什么。需要调用工具时直接调用。回答控制在 300 字以内，除非用户明确要求更长。";
 
 // 文件读写限制态要关掉的工具。`read`/`glob`/`grep`/`list` 是读，`edit`/`write`/
 // `patch` 是写；`bash` 既能读也能写，一并关掉 —— 否则「禁了文件工具但留一个
@@ -987,6 +1016,17 @@ export function buildDeviceOpencodeConfig(
       // 也不会因为漏了某个新工具名而让模型又开始翻文件。
       tools: { "*": false },
     };
+    out.agent = agents;
+  } else if (opts.terse) {
+    // 只换提示、工具照旧（见 DeviceOpencodeConfigOpts.terse）。必须放在 lean 的
+    // else 分支里：需要 JSON 的短回合若被 terse 覆盖了提示，输出就不是 JSON 了。
+    const agents = (out.agent && typeof out.agent === "object" && !Array.isArray(out.agent))
+      ? { ...(out.agent as Record<string, unknown>) }
+      : {};
+    const build = (agents.build && typeof agents.build === "object" && !Array.isArray(agents.build))
+      ? { ...(agents.build as Record<string, unknown>) }
+      : {};
+    agents.build = { ...build, prompt: TERSE_AGENT_SYSTEM_PROMPT };
     out.agent = agents;
   }
   return { text: JSON.stringify(out, null, 2), dropped };

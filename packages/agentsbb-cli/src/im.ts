@@ -273,6 +273,14 @@ export interface TurnOptions {
    * 1,722 输入 token，单轮 27s → 14s）。
    */
   lean?: boolean;
+  /**
+   * 发言回合的精简提示（讨论组 / 群聊 / 聊天室）：只替换 opencode `build` 的
+   * 系统提示，工具照旧。见 DeviceOpencodeConfigOpts.terse。
+   *
+   * 与 `lean` 分开是因为这两类回合的产品语义不同：推荐回合只要一段 JSON（可以
+   * 关工具），讨论/群聊回合要"按角色说话"但用户仍可能让它动手做事（不能关工具）。
+   */
+  terse?: boolean;
   /** 上游用量回调（只有 serve 模式能拿到），用于把「为什么慢」写进日志。 */
   onUsage?: (usage: { inputTokens: number; outputTokens: number; reasoningTokens: number }) => void;
 }
@@ -980,6 +988,10 @@ export class MessageDispatcher {
         // 产出也会被判「响应超时」，重试后跳过，最后主持人汇总超时 → 讨论失败
         // summary_failed（线上 2026-10-22）。私聊轮次不是按序派发，不需要心跳。
         heartbeat: turnNeedsHeartbeat(venue),
+        // 讨论组 / 群聊 / 聊天室都是「按角色说一段话」：换掉 build 那套约 1.9 万
+        // token 的工具规范提示，只留一句"直接说结论、别复述指令"。私聊不套用 ——
+        // 那里用户会真的让它干活，build 原有提示还有用。
+        turnOptions: venue === "private" ? {} : { terse: true },
         fallback: async (out) => {
           await this.deps.send(
             replyTo,

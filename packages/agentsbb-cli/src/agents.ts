@@ -141,6 +141,14 @@ export interface RunAgentTurnOpts {
    * 与推荐任务毫无关系，却要每轮重新 prefill。见 DeviceOpencodeConfigOpts.lean。
    */
   lean?: boolean;
+  /**
+   * 发言回合：只换掉 opencode `build` 的系统提示，**工具保留**。
+   *
+   * 讨论组/群聊每一轮都要"按角色说一段话"，而 build 那套约 1.9 万 token 的系统
+   * 提示（工具使用规范 + 技能清单）与说话无关，却每轮都 prefill 一遍，还会诱导
+   * 模型长篇展开。见 DeviceOpencodeConfigOpts.terse。
+   */
+  terse?: boolean;
   /** 本轮上游用量（输入/输出 token）：目前只有 serve 模式能拿到，用于排查"为什么慢"。 */
   onUsage?: (usage: { inputTokens: number; outputTokens: number; reasoningTokens: number }) => void;
 }
@@ -2151,12 +2159,20 @@ export function deviceOpencodeConfigPath(
    * 若与聊天轮次共用同一份，私聊/群聊的 agent 会突然不会用工具、也不会按人格说话。
    */
   lean = false,
+  /**
+   * 发言回合专用配置（见 DeviceOpencodeConfigOpts.terse）。
+   *
+   * 同样必须独立成文件：那份配置的 `agent.build` 提示被换成了"说人话、别复述"，
+   * 私聊轮次需要原本那套（含工具使用规范的）build 人格。两份共用会让私聊和讨论
+   * 组来回覆盖，每轮都触发 opencode 重新读配置。
+   */
+  terse = false,
 ): string {
   // Default home → go through stateHome() (honours AGENTSBB_HOME and the
   // migration/fallback policy); an explicitly injected home (tests) keeps its
   // per-test isolation under `.agentsbb`.
   const base = home === homedir() ? stateHome() : join(home, ".agentsbb");
-  const suffix = lean ? "-lean" : "";
+  const suffix = lean ? "-lean" : terse ? "-terse" : "";
   // 没有 agent 名（老调用方 / 手工探测）时退回整机一份的老路径，行为与升级前一致。
   if (!agentName) return join(base, `opencode-device${suffix}.json`);
   return join(base, `opencode-device-${sanitizeAgentId(agentName)}${suffix}.json`);
@@ -2179,6 +2195,8 @@ interface DeviceConfigInput {
   fsRestricted?: boolean;
   /** 精简回合（角色推荐）：换掉 build 系统提示并关掉全部工具，见 DeviceOpencodeConfigOpts.lean。 */
   lean?: boolean;
+  /** 发言回合（讨论组/群聊）：只换 build 系统提示、保留工具，见 DeviceOpencodeConfigOpts.terse。 */
+  terse?: boolean;
   home?: string;
 }
 
@@ -2201,8 +2219,9 @@ function opencodeServeEnv(input: DeviceConfigInput = {}): NodeJS.ProcessEnv {
   const userManaged = Boolean(env.OPENCODE_CONFIG || env.AGENTSBB_OPENCODE_CONFIG || env.CLAWMESSENGER_OPENCODE_CONFIG);
   // 精简回合即使 operator 自己指定了 OPENCODE_CONFIG 也要派生：那一份只是"源"，
   // 我们派生出 `-lean` 的副本（不动原件），否则推荐回合又回到 2.9 万 token 的
-  // build 系统提示上。FULL_CONFIG 是显式豁免，照旧不派生。
-  if (!fullConfig && (input.lean || !userManaged)) {
+  // build 系统提示上。FULL_CONFIG 是显式豁免，照旧不派生。发言回合（terse）同理：
+  // 用户自管的配置里 build 提示照样是那 1.9 万 token，不派生就白改。
+  if (!fullConfig && (input.lean || input.terse || !userManaged)) {
     const config = ensureDeviceOpencodeConfig(env, input);
     if (config) env.OPENCODE_CONFIG = config;
   }
@@ -2241,9 +2260,15 @@ function ensureDeviceOpencodeConfig(
     fsRestricted: input.fsRestricted === true,
     instructions: behaviorFile ? [behaviorFile] : [],
     ...(input.lean ? { lean: true } : {}),
+    ...(!input.lean && input.terse ? { terse: true } : {}),
   });
   if (!built) return null;
-  const target = deviceOpencodeConfigPath(input.agentName, home, input.lean === true);
+  const target = deviceOpencodeConfigPath(
+    input.agentName,
+    home,
+    input.lean === true,
+    input.terse === true,
+  );
   try {
     const existing = existsSync(target) ? readFileSync(target, "utf8") : null;
     // 内容没变就不重写：既省 IO，也避免每轮都触发 opencode 重新加载配置。
@@ -2328,6 +2353,9 @@ async function runOpenCodeServerTurn(
       // 角色推荐这类短回合：换掉 build 的系统提示、关掉全部工具（实测输入
       // token 29,397 → 1,722，单轮 27s → 14s）。见 DeviceOpencodeConfigOpts.lean。
       ...(opts.lean ? { lean: true } : {}),
+      // 发言回合：只换提示、留工具（讨论组/群聊每轮都要说一段话，build 那 1.9 万
+      // token 的工具规范与说话无关）。见 DeviceOpencodeConfigOpts.terse。
+      ...(!opts.lean && opts.terse ? { terse: true } : {}),
     }),
   });
 
@@ -2617,7 +2645,9 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       || (permissionIdentity === "opencode" && (fsRestricted || opts.behaviorPrompt))
       // 精简回合必须挂上 `-lean` 那份配置，否则退回 run 时又会拿到 2.9 万 token
       // 的 build 系统提示（用户配置里带 plugin/MCP 时这轮还会更慢）。
-      || (opts.lean === true && permissionIdentity === "opencode");
+      || (opts.lean === true && permissionIdentity === "opencode")
+      // 发言回合同理：不挂 `-terse` 就还是 build 那套 1.9 万 token 的系统提示。
+      || (opts.terse === true && permissionIdentity === "opencode");
     const deviceConfig = wantDeviceConfig
       ? ensureDeviceOpencodeConfig(process.env, {
         ...(permissionIdentity ? { agentName: permissionIdentity } : {}),
@@ -2627,6 +2657,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         ...(permissionIdentity === "ops" ? {} : { behaviorPrompt: opts.behaviorPrompt ?? "" }),
         ...(fsRestricted ? { fsRestricted: true } : {}),
         ...(opts.lean ? { lean: true } : {}),
+        ...(!opts.lean && opts.terse ? { terse: true } : {}),
       })
       : null;
     const spawnEnv = deviceConfig

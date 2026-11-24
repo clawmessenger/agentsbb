@@ -526,7 +526,7 @@ describe("readAgentConfig", () => {
 
 // --- small_model 对齐主模型（2026-11-05 现场） ------------------------------
 
-import { buildDeviceOpencodeConfig, LEAN_AGENT_SYSTEM_PROMPT } from "./model-providers.js";
+import { buildDeviceOpencodeConfig, LEAN_AGENT_SYSTEM_PROMPT, TERSE_AGENT_SYSTEM_PROMPT } from "./model-providers.js";
 
 describe("buildDeviceOpencodeConfig small_model 对齐", () => {
   it("small_model 与主 model 不一致时对齐到主 model（防小模型欠费拖慢 title 生成）", () => {
@@ -595,6 +595,38 @@ describe("buildDeviceOpencodeConfig lean 回合", () => {
     expect(parsed.agent.build.tools).toEqual({ "*": false });
     expect(parsed.tools.read).toBe(false);
     expect(parsed.permission.bash).toBe("deny");
+  });
+});
+
+// --- 发言回合：只换 build 系统提示、工具照旧（讨论组/群聊 2026-11-24）
+
+describe("buildDeviceOpencodeConfig terse 回合", () => {
+  const raw = JSON.stringify({
+    model: "quukk/glm-5.2",
+    agent: { build: { tools: { bash: true } }, "my-helper": { prompt: "用户自己的子 agent" } },
+  });
+
+  it("换掉 build 提示但保留用户声明的工具配置", () => {
+    const built = buildDeviceOpencodeConfig(raw, { terse: true });
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.agent.build.prompt).toBe(TERSE_AGENT_SYSTEM_PROMPT);
+    // 关键差异：terse 不写 tools 覆盖，用户原有的工具开关原样保留 —— 讨论组里
+    // 用户仍然可以让 agent 读文件、跑命令。
+    expect(parsed.agent.build.tools).toEqual({ bash: true });
+    expect(parsed.agent.build.tools["*"]).toBeUndefined();
+    expect(parsed.agent["my-helper"]).toEqual({ prompt: "用户自己的子 agent" });
+  });
+
+  it("lean 优先于 terse：需要 JSON 的回合不能被发言提示覆盖", () => {
+    const built = buildDeviceOpencodeConfig(raw, { lean: true, terse: true });
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.agent.build.prompt).toBe(LEAN_AGENT_SYSTEM_PROMPT);
+    expect(parsed.agent.build.tools).toEqual({ "*": false });
+  });
+
+  it("不带 terse 时不动 agent（私聊轮次保持 build 原人格）", () => {
+    const built = buildDeviceOpencodeConfig(raw, {});
+    expect(JSON.parse(built!.text).agent.build).toEqual({ tools: { bash: true } });
   });
 });
 
