@@ -40,6 +40,13 @@ const (
 	// 存的 20/50/100 是「上下文窗口」时代的量级，直接拿来当接力轮数会把设备
 	// 与融云发送配额一起打爆。
 	maxGroupRelayRounds = 10
+	// groupRelayCallBudget 是一条用户消息在群聊里**最多**触发的 agent 调用
+	// 次数（成员数 × 轮数）。它只压轮数、不压成员数（成员是用户组的局），
+	// 目的是让整场时长有个上界：设备端单轮实测中位数 70s，8 成员 × 3 轮 =
+	// 24 次 ≈ 28 分钟；压到 16 次 ≈ 18 分钟，并随成员数自动折算轮数。
+	// 取 16 而不是更低：至少给 2 人以上的群留 2 轮，AI 之间仍有"接话"，
+	// 不至于把「自动接力」这个卖点砍成一人一句。
+	groupRelayCallBudget = 16
 	// maxRelayContextRounds 是 Web 端允许设置的上限（ConversationCreationFields
 	// 的 ROUND_MAX），超过就按上限截断。
 	maxRelayContextRounds = 100
@@ -327,12 +334,27 @@ func normalizeGroupRelayRounds(value int) int {
 // 归零，唯一的 opencode 会连着被驱动三轮，提示词从「下一位请继续」到
 // 「接上一位」全是自己接自己（自问自答）。收口为 1 轮是改动最小、最不易
 // 回归的做法：不动状态机、不改设备端，只让这种群「一问一答即止」。
-// 2 个及以上成员时沿用原归一化逻辑（默认值 + 上限截断），行为完全不变。
+//
+// 成员多于 1 个时还要过一道**整场调用预算**：一轮 = 全员各跑一次 agent，
+// 一条用户消息的总耗时 ≈ 成员数 × 轮数 × 单轮耗时。单轮在设备端实测中位数
+// 就有 70s（本机 2026-11-18 日志：中位 70s / p90 140s / 最坏 226s），
+// 8 成员 × 默认 3 轮 = 24 次串行，用户要等十几分钟才看到最后一条 —— 这正是
+// 「群聊回复特别慢」的主因。轮数是运营在「AI 对话轮数」里选的，语义不动；
+// 这里只保证**一条消息最多花掉 groupRelayCallBudget 次 agent 调用**，
+// 超出就按成员数折算轮数（8 人 × 3 轮 → 2 轮 = 16 次）。
 func effectiveGroupRelayRounds(rounds, speakerCount int) int {
 	if speakerCount <= 1 {
 		return 1
 	}
-	return normalizeGroupRelayRounds(rounds)
+	normalized := normalizeGroupRelayRounds(rounds)
+	if speakerCount*normalized <= groupRelayCallBudget {
+		return normalized
+	}
+	capped := groupRelayCallBudget / speakerCount
+	if capped < 1 {
+		capped = 1
+	}
+	return capped
 }
 
 // groupRelayNextRoundStart 决定新一轮从哪个成员下标开始（QA5-DEF-06 b）。

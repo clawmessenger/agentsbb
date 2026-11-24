@@ -396,9 +396,30 @@ func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, reques
 		return discussionID, nil
 	}
 	roles := map[string]interface{}{}
+	// 成员级模型：这是「引导式确认创建」路径，历史上**不写 model**，设备端于是
+	// 回落到各自的默认模型 —— 而各设备的默认模型互不相同（有的还是
+	// opencode/big-pickle 这类免费小模型），同一场讨论里角色快慢不一，运营在成员
+	// 设置里配的模型等于没配（2026-11-24 线上：25 场活跃讨论的角色板 110 个条目
+	// 全无 model 键）。这里按成员表补齐，口径与 roundtableRoleEntryFromMember 一致：
+	// 讨论模型优先，没有才退回节点级 model，都空则不写键（保持与改造前逐字节一致）。
+	modelByAiUser := map[string]string{}
+	if memberRows, err := s.queries.ListRongCloudChatroomMembersWithNode(ctx, room.ID); err == nil {
+		for _, row := range memberRows {
+			if row.MemberType != "ai" || !row.NodeRcUserID.Valid || row.NodeRcUserID.String == "" {
+				continue
+			}
+			model := row.DiscussionModel.String
+			if !row.DiscussionModel.Valid || model == "" {
+				model = row.Model.String
+			}
+			if model != "" {
+				modelByAiUser[row.NodeRcUserID.String] = model
+			}
+		}
+	}
 	for _, role := range canonical.Roles {
 		node := validated.nodes[role.NodeID]
-		roles[node.RongcloudUserID] = map[string]interface{}{
+		entry := map[string]interface{}{
 			"memberId":         node.RongcloudUserID,
 			"nodeId":           role.NodeID,
 			"nickname":         role.RoleName,
@@ -413,6 +434,10 @@ func (s *roundtableCreationService) ensureDiscussion(ctx context.Context, reques
 			// 快照，所以这里无条件写入。
 			"speakingOrder": role.SpeakingOrder,
 		}
+		if model := modelByAiUser[node.RongcloudUserID]; model != "" {
+			entry["model"] = model
+		}
+		roles[node.RongcloudUserID] = entry
 	}
 	// host 条目（含 model）与 host_config_snapshot 由同一个函数唯一地拼装，
 	// 三个写入点共用 —— 见 roundtableHostSnapshots 的注释。

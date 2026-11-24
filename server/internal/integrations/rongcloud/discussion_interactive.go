@@ -110,8 +110,12 @@ const (
 
 	// interactiveSweepInterval 是超时恢复扫描的周期。它只决定「超时被发现的
 	// 滞后」，不决定超时本身（后者由 outbox 的 available_at 精确表达），
-	// 所以 30s 的粒度足够，也不至于让空库上的扫描成为负担。
-	interactiveSweepInterval = 30 * time.Second
+	// 所以 10s 的粒度足够，也不至于让空库上的扫描成为负担。
+	//
+	// 30s → 10s（2026-11-24）：一台真掉线的设备被发现得越晚，整场讨论就白白
+	// 多冻 20s —— 用户体感是「轮到某人后就没动静了」。扫描本身就是一次带索引
+	// 的 outbox 查询，10s 一次的开销可以忽略。
+	interactiveSweepInterval = 10 * time.Second
 )
 
 // interactiveV3EventTypes 是 C 端前端（web/src/lib/discussion-v3.ts 的 eventData）
