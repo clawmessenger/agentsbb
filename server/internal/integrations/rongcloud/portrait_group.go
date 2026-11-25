@@ -44,6 +44,11 @@ const DefaultGroupPortraitBaseURL = "https://agentsbb.quukk.com/group-avatars"
 // GroupPortraitBaseEnv 覆盖三张群类默认图的基址（自建域名 / CDN）。
 const GroupPortraitBaseEnv = "CLAW_GROUP_PORTRAIT_BASE"
 
+// legacyGroupPortraitPrefix 是域名迁移前 web 产物的路径前缀：那时站点挂在
+// /claw-web 下，群类默认图就是 <旧域名>/claw-web/group-avatars/<kind>.png。
+// 只用于识别存量行，不用于拼接新地址。
+const legacyGroupPortraitPrefix = "/claw-web"
+
 // groupPortraitKinds 是允许拼进 URL 的 kind 全集。除此之外一律回落，绝不把
 // 调用方传来的任意字符串拼成地址（那只会换回一个 404 的头像）。
 var groupPortraitKinds = []string{
@@ -143,6 +148,18 @@ func IsGroupDefaultPortrait(portrait string) bool {
 	for _, kind := range groupPortraitKinds {
 		for _, base := range bases {
 			if path == groupPortraitPath(base, kind) {
+				return true
+			}
+		}
+	}
+	// 域名迁移前的 web 产物挂在 /claw-web 前缀下（旧 nginx webroot），存量群头像
+	// 大多还是 https://<旧域名>/claw-web/group-avatars/<kind>.png —— 只比新基址的
+	// path 会让这些行永远判否，回填脚本再跑也改不动，各端一直回显旧域名。
+	// 这里多认一层固定前缀，host 换 CDN / 换域名都算；但只认这一层：
+	// /uploads/group-avatars/… 或再深一层目录仍是用户自己的图，绝不覆盖。
+	for _, kind := range groupPortraitKinds {
+		for _, base := range bases {
+			if path == legacyGroupPortraitPrefix+groupPortraitPath(base, kind) {
 				return true
 			}
 		}

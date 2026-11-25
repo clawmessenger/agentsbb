@@ -173,7 +173,10 @@ func TestGroupRelayStartOrQueueConvergesRounds(t *testing.T) {
 		{"单智能体配置5轮→排队消息也是1轮", oneSpeaker(), 5, 1},
 		{"2成员默认3轮→排队消息保持3轮", twoSpeakers(), 3, 3},
 		{"2成员0轮→排队消息回落3轮", twoSpeakers(), 0, 3},
-		{"2成员50轮→排队消息截到10轮", twoSpeakers(), 50, maxGroupRelayRounds},
+		// 50 轮先被 maxGroupRelayRounds 截到 10，再按调用预算折算：2 成员 × 10 = 20
+		// 超过 groupRelayCallBudget(16)，落到 16/2 = 8。排队消息必须与启动走同一套
+		// 收敛（否则排队那条会按 10 轮跑，超出预算），所以这里断言折算后的值。
+		{"2成员50轮→排队消息按调用预算截到8轮", twoSpeakers(), 50, 8},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
