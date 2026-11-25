@@ -149,6 +149,21 @@ describe("parseCodexConfig", () => {
     expect(config.defaultModel).toBeNull();
   });
 
+  // WEB-048：ChatGPT 账号登录（不写 model_providers）是 codex 最常见的配置形态，
+  // 没有端点可 probe。至少要把它正在用的 `model` 交进目录，否则面板永远是
+  // 「设备模型目录 · 0」，用户连当前模型都看不到。
+  it("把配置里正在用的 model 作为可选项交出去（无 model_providers 的 OAuth 形态）", () => {
+    const config = parseCodexConfig(['model = "gpt-5.6-codex"', 'model_reasoning_effort = "high"'].join("\n"));
+    expect(config.endpoints).toEqual([]);
+    expect(config.defaultModel).toBe("openai/gpt-5.6-codex");
+    expect(config.declaredModels).toEqual({ openai: ["gpt-5.6-codex"] });
+  });
+
+  it("有 model_providers 时把 model 归到该 provider 名下", () => {
+    const config = parseCodexConfig(TOML);
+    expect(config.declaredModels).toEqual({ quukk_direct: ["glm-5.2"] });
+  });
+
   it("keeps every declared provider, not just the active one", () => {
     const config = parseCodexConfig([
       '[model_providers."a.b"]',

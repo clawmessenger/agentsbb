@@ -297,9 +297,19 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
   flush();
 
   const provider = activeProvider ?? endpoints[0]?.id ?? null;
+  // WEB-048：把配置里 `model = "<slug>"` 这一条也当成「设备已知的模型」交给
+  // 目录。它一定跑得起来（这就是 codex 此刻正在用的模型），而此前目录只由
+  // 端点 probe 产生 —— 用 ChatGPT 账号登录、没写 `[model_providers.*]` 的
+  // 机器 probe 无从下手，面板上就是「设备模型目录 · 0」，用户连当前用的模型
+  // 都看不到、更选不了。
+  //
+  // provider 兜底 "openai"：codex 的内置默认 provider id 就是它（OAuth 登录
+  // 走的正是这条），注入 `-c model_provider=openai -m <slug>` 与不注入等价。
+  const declaredProvider = provider ?? "openai";
   return {
     endpoints,
-    defaultModel: provider && model ? `${provider}/${model}` : null,
+    defaultModel: provider && model ? `${provider}/${model}` : (model ? `${declaredProvider}/${model}` : null),
+    ...(model ? { declaredModels: { [declaredProvider]: [model] } } : {}),
   };
 }
 
