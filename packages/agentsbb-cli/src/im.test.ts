@@ -3234,6 +3234,22 @@ describe("shouldAbortStalledTurn", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 999_999, terminalSent: true })).toBe(false);
     expect(shouldAbortStalledTurn({ ...base, idleMs: 999_999, aborted: true })).toBe(false);
   });
+
+  // WEB-39（2026-11-25）：运维跑「查 codex 版本/配置」这类长命令时，工具执行期间
+  // 本来就没有任何增量，按 240s 增量窗口会误判卡死并提示「本轮执行超时」。
+  // 有 running 步骤时改用专门的长窗口。
+  it("有工具正在跑：长命令执行期间不再按增量窗口判卡死", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, runningToolMs: 600_000 })).toBe(false);
+  });
+
+  it("工具有 running 步骤一直不动、超过长窗口才收尾", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 1_900_000, runningToolMs: 1_900_000 })).toBe(true);
+  });
+
+  it("runningToolMs 为 0（没有跑着的工具）时仍走原判据", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000, runningToolMs: 0 })).toBe(true);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, runningToolMs: 0 })).toBe(true);
+  });
 });
 
 describe("MessageDispatcher 新开会话", () => {

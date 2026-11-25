@@ -445,11 +445,28 @@ export const PRIVATE_TURN_STALL_MS = 240_000;
  * 现在可以无限跑下去（装依赖、长命令、深思考不再被误杀）。
  */
 export const PRIVATE_TURN_SILENT_STALL_MS = 600_000;
+/**
+ * 「工具有明确在跑」窗口（WEB-39，2026-11-25）。
+ *
+ * 停滞守卫只认识「增量」：正文 / 思考 / 工具步骤有新事件才算进展。可工具一旦
+ * 开始执行，**在它返回之前本来就不会有任何增量** —— codex 的 exec 命令、装依赖、
+ * 跑构建这类动辄几分钟的步骤，中途一个字都不吐。于是「运维查 codex 版本/配置」
+ * 这种正常长命令会被判成卡死：240s 一到就中止，前端看到的是
+ * 「本轮执行超时，已中止。请重试，或把问题拆小一点。」
+ *
+ * 判据改为用工具自己的 `startedAt`：只要还有一步处于 running（有明确的
+ * 「开工了、还没结束」证据），就按这个长窗口算，而不是按增量窗口。
+ * 彻底挂死（命令等 stdin 之类）由用户 chat_stop / 服务端取消收拾 —— 宁可让
+ * 长任务跑完，也不要在用户正等结果时把它掐掉。
+ */
+export const PRIVATE_TURN_TOOL_RUNNING_STALL_MS = 1_800_000;
 
 /**
  * 停滞守卫的判定（纯函数，便于单测）。
  *
  * 判据只看「有没有进展」，不看总时长：
+ *   - 有工具正在跑（`runningToolMs` > 0）：按 PRIVATE_TURN_TOOL_RUNNING_STALL_MS
+ *     判，工具执行期间没有增量是常态（见上）；
  *   - 已产出过正文：连续 stallMs（默认 PRIVATE_TURN_STALL_MS）无进展 → 掐；
  *   - 全程无产出：连续 PRIVATE_TURN_SILENT_STALL_MS 无进展 → 掐（serve 悬挂、
  *     HTTP 挂死这类「零输出僵死」的兜底；工具步骤 / 思考流任一路在动就不算停滞）。
@@ -460,8 +477,13 @@ export function shouldAbortStalledTurn(input: {
   producedText: boolean;
   idleMs: number;
   stallMs?: number;
+  /** 仍在运行的工具已经跑了多久（ms）；undefined/0 = 当前没有跑着的工具。 */
+  runningToolMs?: number;
 }): boolean {
   if (input.aborted || input.terminalSent) return false;
+  if (input.runningToolMs !== undefined && input.runningToolMs > 0) {
+    return input.runningToolMs >= PRIVATE_TURN_TOOL_RUNNING_STALL_MS;
+  }
   const windowMs = input.producedText
     ? (input.stallMs ?? PRIVATE_TURN_STALL_MS)
     : PRIVATE_TURN_SILENT_STALL_MS;
@@ -1224,6 +1246,12 @@ export class MessageDispatcher {
     let lastProgressAt = turnStartedAt;
     /** 本轮是否已经产出过正文：停滞守卫只在这种「说了话之后」才生效。 */
     let producedText = false;
+    /**
+     * 最近一份工具步骤快照（见 ActivityStep）。停滞守卫要用它判断「现在是不是
+     * 有一步正跑着」—— 有的话不能按增量窗口判卡死（WEB-39）。
+     * 声明在 try 之外：定时器闭包要看得见它。
+     */
+    let latestActivity: ActivityStep[] = [];
     /** 最新正文快照：停滞守卫收尾时要把已经输出的内容一起带走（不能吞掉）。 */
     let latestText = "";
     /** 超时占位只发一次（内层失败路径与外层兜底都可能触发）。 */
@@ -1264,11 +1292,18 @@ export class MessageDispatcher {
           try {
             if (controller.signal.aborted || terminalSent) return;
             const idleMs = Date.now() - lastProgressAt;
+            // 工具还在跑的时候没有增量是正常的（长命令/构建/装依赖）。用步骤
+            // 自己的 startedAt 算「这一跑已经多久」，交给纯函数按长窗口判。
+            const runningStep = latestActivity.find((step) => step.status === "running");
+            const runningToolMs = runningStep?.startedAt
+              ? Date.now() - runningStep.startedAt
+              : 0;
             if (!shouldAbortStalledTurn({
               aborted: controller.signal.aborted,
               terminalSent,
               producedText,
               idleMs,
+              runningToolMs,
             })) return;
             terminalSent = true;
             console.error(
@@ -1424,6 +1459,8 @@ export class MessageDispatcher {
             if (!seen.has(step.id)) timeline.push(["s", step.id]);
           }
           activitySnapshot = activity;
+          // 同一份快照交给停滞守卫：它只看「有没有 running 的步骤」，不落盘。
+          latestActivity = activity;
         }
         const now = Date.now();
         // 只有「纯正文增量」才走短窗口，并且这一帧不带思考/过程流（见上）。

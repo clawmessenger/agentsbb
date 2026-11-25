@@ -447,6 +447,29 @@ describe("codex 的只读参数", () => {
     const args = buildAgentArgs("codex", "hi");
     expect(args).not.toContain("--sandbox");
   });
+
+  // WEB-44（2026-11-25）：0.172.0 的 `codex exec resume` 不接受 --sandbox，
+  // 放在 resume 之后会让参数解析失败、进程零输出退出。它只属于 exec 这一层，
+  // 必须紧跟在 exec 后面、resume 之前。
+  it("续接时 --sandbox 必须在 exec 之后、resume 之前", () => {
+    const args = buildAgentArgs("codex", "你好", undefined, undefined, {
+      fsRestricted: true,
+      resumeSessionId: "11111111-2222-3333-4444-555555555555",
+    });
+    expect(args.slice(0, 4)).toEqual(["exec", "--sandbox", "read-only", "resume"]);
+    expect(args.indexOf("--sandbox")).toBe(args.indexOf("exec") + 1);
+    expect(args.indexOf("--sandbox")).toBeLessThan(args.indexOf("resume"));
+    expect(args[args.indexOf("resume") + 1]).toBe("11111111-2222-3333-4444-555555555555");
+    expect(args[args.indexOf("resume") + 2]).toBe("你好");
+  });
+
+  it("续接且未限制时没有 --sandbox，resume 紧跟 exec", () => {
+    const args = buildAgentArgs("codex", "你好", undefined, undefined, {
+      resumeSessionId: "11111111-2222-3333-4444-555555555555",
+    });
+    expect(args).not.toContain("--sandbox");
+    expect(args.slice(0, 3)).toEqual(["exec", "resume", "11111111-2222-3333-4444-555555555555"]);
+  });
 });
 
 describe("codex 行为规范标记块（与输出风格各用一套标记）", () => {

@@ -437,22 +437,32 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     ...buildModelArgs("claude", model),
   ],
   codex: (prompt, model, _sessionKey, ctx) => [
+    "exec",
+    // 文件读写禁止：codex 的 `-s/--sandbox read-only` 是**官方**沙箱策略
+    // （0.144.6 的 `codex exec --help` 实测：read-only / workspace-write /
+    // danger-full-access）。read-only 挡写入与联网，但**仍允许读取** ——
+    // 这是 codex 侧能做到的最强限制，做不到「连读都不许」，报告里如实写了。
+    //
+    // ⚠️ 位置是硬约束（WEB-44，2026-11-25）：`--sandbox` 只属于 `exec` 这一层，
+    // 必须紧跟在 `exec` 之后。0.172.0 的 `codex exec resume --help` 里**没有**
+    // 这个参数，把它放在 `resume` 后面会被参数解析器判成非法位置并以
+    //   tip: to pass '--sandbox' as a value, use '-- --sandbox'
+    //   Usage: codex exec resume --json --skip-git-repo-check <SESSION_ID> <PROMPT>
+    // 直接退出 —— 设备端只看到「进程异常退出，没有任何输出」。实测
+    // `codex exec --sandbox read-only resume --help` 能正常接受该位置。
+    ...(ctx?.fsRestricted ? ["--sandbox", "read-only"] : []),
     // 续接要换成 `exec resume <id> <prompt>` 的子命令形态（prompt 必须跟在 id
     // 后面）。实测 0.144.6：`codex exec resume <uuid> "hi" --json` 会被正常接受，
     // 不存在的 id 报 `no rollout found for thread id …`（见 agent-sessions.ts 的
     // isStaleSessionError，那条错误会被识别并自动改用新会话重跑）。
     ...(ctx?.resumeSessionId
-      ? ["exec", "resume", ctx.resumeSessionId, prompt]
-      : ["exec", prompt]),
+      ? ["resume", ctx.resumeSessionId, prompt]
+      : [prompt]),
     // --json：JSONL 事件流（reasoning.item_start/delta 等可解析）。实测
     // codex 0.144：未信任目录需 --skip-git-repo-check；stdin 模式会挂起
     // 等输入，必须保持 argv 模式（runAgentTurn argvMode 下 stdin 已 end）。
+    // 这两个参数 0.172.0 的 `exec resume` usage 里仍列出，放在 prompt 之后安全。
     "--json", "--skip-git-repo-check",
-    // 文件读写禁止：codex 的 `-s/--sandbox read-only` 是**官方**沙箱策略
-    // （0.144.6 的 `codex exec --help` 实测：read-only / workspace-write /
-    // danger-full-access）。read-only 挡写入与联网，但**仍允许读取** ——
-    // 这是 codex 侧能做到的最强限制，做不到「连读都不许」，报告里如实写了。
-    ...(ctx?.fsRestricted ? ["--sandbox", "read-only"] : []),
     ...buildModelArgs("codex", model),
   ],
   // --format json --thinking：opencode 1.19 起支持逐行 JSON 事件（reasoning /
