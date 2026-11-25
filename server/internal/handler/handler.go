@@ -36,6 +36,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/mcp"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/quota"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -402,6 +403,12 @@ type Handler struct {
 	RongCloudDiscussionRepo *rongcloud.DiscussionRepository
 	// RongCloudDiscussionAccess 校验 C 端用户对聊天室的成员资格（P4 REST 用）。
 	RongCloudDiscussionAccess *rongcloud.DiscussionRoomAccess
+	// MCPServer 是入站 MCP 协议实例（claw_mcp.go），由 InitClawMCP 在 router
+	// 完成依赖装配后构造。刻意只放指针：Handler 在不少测试里按值拷贝，
+	// 带锁字段会触发 vet 的 copylocks。
+	MCPServer *mcp.Server
+	// MCPLimiter 是 /mcp 的按用户限流器（同 InitClawMCP 初始化）。
+	MCPLimiter *clawMCPRateLimiter
 	// ClawQuota 是讨论组/群/聊天室的创建配额服务（T01 internal/quota）。
 	// REST（/api/quota/me）与 admin 配额 API 读它；nil 表示配额未启用。
 	ClawQuota *quota.Service

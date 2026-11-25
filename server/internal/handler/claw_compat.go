@@ -1005,6 +1005,16 @@ func (h *Handler) clawViewerUserID(ctx context.Context, r *http.Request) (string
 }
 
 // clawRequireClawUser 按旧站契约认证：Bearer 即 claw_im_users.rongcloud_token。
+// clawUserIDByToken 用融云 token 反查 claw_im_users.user_id（= 融云侧 user id）。
+// REST 与 MCP 两条入站通道共用：token 语义只有这一处定义。
+func (h *Handler) clawUserIDByToken(ctx context.Context, token string) (string, error) {
+	var userID string
+	err := h.DB.QueryRow(ctx,
+		"SELECT user_id FROM claw_im_users WHERE rongcloud_token=$1 AND status='active' LIMIT 1",
+		token).Scan(&userID)
+	return userID, err
+}
+
 func (h *Handler) clawRequireClawUser(w http.ResponseWriter, r *http.Request) (userID string, ok bool) {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
@@ -1016,10 +1026,7 @@ func (h *Handler) clawRequireClawUser(w http.ResponseWriter, r *http.Request) (u
 		clawJSON(w, 401, 401, "登录令牌无效", nil)
 		return "", false
 	}
-	ctx := r.Context()
-	err := h.DB.QueryRow(ctx,
-		"SELECT user_id FROM claw_im_users WHERE rongcloud_token=$1 AND status='active' LIMIT 1",
-		token).Scan(&userID)
+	userID, err := h.clawUserIDByToken(r.Context(), token)
 	if err != nil {
 		clawJSON(w, 401, 401, "登录令牌无效", nil)
 		return "", false

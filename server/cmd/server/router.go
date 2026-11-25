@@ -448,6 +448,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		ServerVersion:            normalizeServerVersion(version),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
+	// 入站 MCP：工具表在这里一次性构造（见 internal/handler/claw_mcp.go）。
+	h.InitClawMCP()
 	invitationRateLimits := handler.DefaultInvitationRateLimits()
 	invitationRateLimits.Actor.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_ACTOR_10M", invitationRateLimits.Actor.Limit)
 	invitationRateLimits.Workspace.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_WORKSPACE_24H", invitationRateLimits.Workspace.Limit)
@@ -1730,6 +1732,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/wechat/login", h.ClawWeChatLogin)
 	// 默认头像：embed 进二进制的公开静态资源（注册/节点绑定时写进融云资料）。
 	handler.ServeClawStaticAssets(r)
+	// 入站 MCP（Streamable HTTP）：犇马 / SuperWagie 内嵌 opencode 调虾说。
+	// 鉴权与 C 端扁平 REST 同源（Bearer = claw_im_users.rongcloud_token），
+	// 权限口径也复用同一套检查。见 internal/handler/claw_mcp.go 顶部。
+	r.Post("/mcp", h.ClawMCPPost)
+	r.Get("/mcp", h.ClawMCPGet)
+	r.Delete("/mcp", h.ClawMCPDelete)
+
 	// P4：C 端圆桌扁平 REST（对齐旧 Python app.py:3042-3084 的路由与鉴权契约）。
 	r.Get("/api/chatrooms/{chatroomId}/discussions", h.ClawListChatroomDiscussions)
 	r.Get("/api/discussions/{discussionId}", h.ClawGetDiscussion)
