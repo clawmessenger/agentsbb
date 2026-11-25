@@ -28,7 +28,7 @@ const (
 
 // clawMCPTools 返回注册给协议层的工具表（顺序即 tools/list 顺序）。
 func (h *Handler) clawMCPTools() []*mcp.Tool {
-	return []*mcp.Tool{
+	tools := []*mcp.Tool{
 		h.clawMCPToolListChatrooms(),
 		h.clawMCPToolListDiscussions(),
 		h.clawMCPToolGetDiscussion(),
@@ -36,6 +36,8 @@ func (h *Handler) clawMCPTools() []*mcp.Tool {
 		h.clawMCPToolListRoundDocuments(),
 		h.clawMCPToolGetRoundDocument(),
 	}
+	// P2 控制类：建组 / 确认开局 / 推进收尾（有副作用，见 claw_mcp_control_tools.go）。
+	return append(tools, h.clawMCPControlTools()...)
 }
 
 // ---- list_chatrooms ------------------------------------------------------

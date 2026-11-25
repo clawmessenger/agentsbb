@@ -35,8 +35,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
-	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/mcp"
+	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/quota"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -385,6 +385,10 @@ type Handler struct {
 	RongCloudChatroom   *rongcloud.ChatroomService
 	RongCloudPairing    *rongcloud.PairingService
 	RongCloudDiscussion *rongcloud.DiscussionService
+	// RongCloudControl 是 v3 讨论的进程内控制门面（MCP 的建组/确认/推进工具用）。
+	// 由 rongcloud.ChannelDeps.DiscussionControlSink 在装配时回填；nil = 融云未
+	// 配置或讨论仓库未装配，MCP 控制类工具应回「不可用」。
+	RongCloudControl *rongcloud.DiscussionControl
 	// clawNodeOpsForTest replaces the node-service methods ClawUpdateNode /
 	// ClawDeleteNode call. NodeService cannot be constructed outside the
 	// rongcloud package (its API client parameter is unexported), so the
@@ -409,6 +413,9 @@ type Handler struct {
 	MCPServer *mcp.Server
 	// MCPLimiter 是 /mcp 的按用户限流器（同 InitClawMCP 初始化）。
 	MCPLimiter *clawMCPRateLimiter
+	// ClawAppLimiter 是外部应用接入（session/init、web-login-ticket）的按应用
+	// 限流器，由 InitClawAppAccess 初始化。同 MCPServer：只放指针。
+	ClawAppLimiter *clawAppRateLimiter
 	// ClawQuota 是讨论组/群/聊天室的创建配额服务（T01 internal/quota）。
 	// REST（/api/quota/me）与 admin 配额 API 读它；nil 表示配额未启用。
 	ClawQuota *quota.Service

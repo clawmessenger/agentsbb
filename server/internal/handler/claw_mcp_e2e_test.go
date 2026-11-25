@@ -104,8 +104,11 @@ func TestClawMCPEndToEndQueryFlow(t *testing.T) {
 	var listResp map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &listResp)
 	tools := listResp["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 6 {
-		t.Fatalf("tool count = %d, want 6", len(tools))
+	// 6 个查询 + 4 个控制类（P2）。控制类在没有融云装配的环境下仍会出现在
+	// tools/list 里 —— 能力位是运行时判断（control_unavailable），不是列表裁剪，
+	// 否则调用方在装配完成前后看到的工具集合会漂移。
+	if len(tools) != 10 {
+		t.Fatalf("tool count = %d, want 10", len(tools))
 	}
 
 	// 3. list_chatrooms：该用户没有任何群 → 空数组

@@ -450,6 +450,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
 	// 入站 MCP：工具表在这里一次性构造（见 internal/handler/claw_mcp.go）。
 	h.InitClawMCP()
+	// 外部应用接入（犇马）：按应用限流器（见 internal/handler/claw_app_access.go）。
+	h.InitClawAppAccess()
 	invitationRateLimits := handler.DefaultInvitationRateLimits()
 	invitationRateLimits.Actor.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_ACTOR_10M", invitationRateLimits.Actor.Limit)
 	invitationRateLimits.Workspace.Limit = envNonNegativeInt("RATE_LIMIT_INVITATION_WORKSPACE_24H", invitationRateLimits.Workspace.Limit)
@@ -1265,6 +1267,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// REST（/api/quota/me）与 admin 配额 API 也挂它。
 			rcQuota := quota.New(pool)
 			h.ClawQuota = rcQuota
+			// MCP 的讨论控制门面：channel 装配时回填（内部持有 discussionRuntime），
+			// 装配完在下面赋给 h.RongCloudControl。
+			var rcDiscussionControl *rongcloud.DiscussionControl
 			rongcloud.RegisterRongCloud(channelRegistry, rongcloud.ChannelDeps{
 				Registrar:    rcDispatcher,
 				Decrypt:      rcBox.Open,
@@ -1274,6 +1279,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				NodeRequests: rcNodeRequests,
 				OpsChat:      rcOpsChat,
 				Quota:        rcQuota,
+				DiscussionControlSink: func(control *rongcloud.DiscussionControl) {
+					rcDiscussionControl = control
+				},
 				// GroupMirror 的 callbacks 懒查 h.RongCloudNode（构造完才赋值），
 				// 所以这里可以安全地先挂上去。
 				GroupMirror: h.ClawGroupMirror(),
@@ -1306,6 +1314,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// The coordinator needs the admin-configured 「人设提示词」 for the
 			// host node; the config row lives on the HTTP side.
 			h.RongCloudDiscussion = rongcloud.NewDiscussionService(queries, rcClient, rcRegistry, rcBridge, h.ClawDiscussionHostPersona, slog.Default())
+			h.RongCloudControl = rcDiscussionControl
 			h.RongCloudNodeRequests = rcNodeRequests
 			h.OpsChat = rcOpsChat
 			// P4：C 端扁平 REST（/api/discussions/*）读 P2 的仓库层。
@@ -1738,6 +1747,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/mcp", h.ClawMCPPost)
 	r.Get("/mcp", h.ClawMCPGet)
 	r.Delete("/mcp", h.ClawMCPDelete)
+
+	// 外部应用接入（P2，犇马 / SuperWagie）：应用级凭据 X-App-Id / X-App-Secret，
+	// **不是**用户 Bearer —— 这两条正好发生在用户还没有虾说 token 之前。
+	// 见 internal/handler/claw_app_access.go 顶部。
+	r.Post("/api/claw/app/session/init", h.ClawAppInitSession)
+	r.Post("/api/claw/app/web-login-ticket", h.ClawAppWebLoginTicket)
 
 	// P4：C 端圆桌扁平 REST（对齐旧 Python app.py:3042-3084 的路由与鉴权契约）。
 	r.Get("/api/chatrooms/{chatroomId}/discussions", h.ClawListChatroomDiscussions)

@@ -43,6 +43,10 @@ type ChannelDeps struct {
 	// discussionRuntime 上供 createRoundtableShell 硬校验；Nil 表示不启用
 	// 配额（全部放行，不引入新的失败面）。
 	Quota *quota.Service
+	// DiscussionControlSink 在讨论运行时装配完成时被调用一次，把进程内控制门面
+	// 交给 HTTP 侧（MCP 的 create/confirm/control 工具靠它驱动 v3 引擎，不走
+	// 融云消息往返）。Nil 表示不暴露该能力。
+	DiscussionControlSink func(*DiscussionControl)
 	// DB 供 service=lobster / friend / user 的本地表读写（claw_lobster、
 	// claw_im_users.wechat_openid、好友边归属反查）。这三块没有现成的 sqlc
 	// 查询（新表 / 新列），因此直接在集成层用参数化 SQL 走 DBTX。
@@ -112,6 +116,10 @@ func newRongCloudFactory(deps ChannelDeps) channel.Factory {
 			creation.workflowAvailable = discussionRuntime.roundtablePolicyAvailable
 			// 配额服务（Nil 放行）：空组直建 / 群创建 / 聊天室创建三入口共用。
 			discussionRuntime.quota = deps.Quota
+			// 进程内控制门面：MCP 侧建组/确认/推进都走它，与 C 端同一套 action。
+			if deps.DiscussionControlSink != nil {
+				deps.DiscussionControlSink(newDiscussionControl(discussionRuntime, logger))
+			}
 		}
 		// 讨论组闲聊与普通群组的「按序发言」中继（服务端仲裁，替代客户端扇出）。
 		// groupMirror 由 HTTP 层注入，群中继用它读成员镜像。
