@@ -1048,6 +1048,21 @@ func (h *systemHandler) actionChatroomSetMemberRole(ctx context.Context, cmd Com
 	if !enabled && room.HostBusinessNodeID.Valid && room.HostBusinessNodeID.String == nodeID {
 		return errResult(409, "请先重新指派主持人")
 	}
+	// WEB-053：角色模型可以在这里一起落库。客户端改完角色模型会同时下发
+	// `/use-model`（立刻换设备侧模型）与这条命令（把「配置」写进服务端）。
+	// 只认 provider/model 格式，空串表示「跟随节点默认模型」（写 NULL）。
+	modelProvided := false
+	modelText := pgtype.Text{}
+	if raw, ok := cmd.Params["model"]; ok {
+		modelProvided = true
+		parsed, invalid := validateDiscussionModel(raw)
+		if invalid != "" {
+			return errResult(422, invalid)
+		}
+		if parsed != "" {
+			modelText = pgtype.Text{String: parsed, Valid: true}
+		}
+	}
 	updated, err := h.queries.UpdateRongCloudChatroomMemberRoleByChatroomAndNodeID(ctx, db.UpdateRongCloudChatroomMemberRoleByChatroomAndNodeIDParams{
 		ChatroomID:       room.ID,
 		NodeID:           node.ID,
@@ -1058,6 +1073,15 @@ func (h *systemHandler) actionChatroomSetMemberRole(ctx context.Context, cmd Com
 	if err != nil {
 		return errResult(404, "成员不存在")
 	}
+	if modelProvided {
+		applied, err := h.queries.UpdateRongCloudChatroomMemberDiscussionModel(ctx, modelText, room.ID, node.ID)
+		if err != nil {
+			return errResult(500, "保存角色模型失败")
+		}
+		// 角色板才是派发模型（your_turn 的 model 参数）的唯一来源，光改成员表
+		// 会让下一轮又按旧模型跑；这一句把两处拉齐，失败只记日志不阻断保存。
+		h.syncDiscussionRoleModel(ctx, rcID, textStr(updated.MemberID), textStr(applied))
+	}
 	return okResult(map[string]interface{}{
 		"nodeId":           nodeID,
 		"roleName":         roleName,
@@ -1067,6 +1091,68 @@ func (h *systemHandler) actionChatroomSetMemberRole(ctx context.Context, cmd Com
 		"capabilities":     capsToInterface(node.Capabilities),
 		"enabled":          enabled,
 	})
+}
+
+// syncDiscussionRoleModel 把某个成员的角色模型同步进活跃讨论的角色板。
+//
+// 为什么必须同步：派发（`dispatchRoleTurn`）把 `role.Model` 原样塞进 your_turn
+// 的 `model` 参数，设备按它跑这一轮。角色板只在创建/重开时写一次、之后只有
+// 「中途加人/移人」的对齐路径会整份重写，改模型本身没有任何 UPDATE 入口 ——
+// 用户改完模型，界面是新的、实际调用还是旧的（WEB-053 的根因）。
+//
+// 失败只记 warn：保存角色的主流程（成员表）已经落库，下一次轮边界仍能对齐；
+// 让整条保存失败会让用户以为连角色名都没存上。
+func (h *systemHandler) syncDiscussionRoleModel(ctx context.Context, chatroomRcID, memberID, model string) {
+	if h.discussionRuntime == nil || h.discussionRuntime.repo == nil || chatroomRcID == "" || memberID == "" {
+		return
+	}
+	record, err := h.discussionRuntime.repo.GetActiveByChatroom(ctx, chatroomRcID)
+	if err != nil {
+		// 还没有活跃讨论（刚建群 / 讨论已结束）属于正常状态，不刷日志噪音。
+		return
+	}
+	next, ok := patchRoleSnapshotModel(record.RoleSnapshot, memberID, model)
+	if !ok {
+		return
+	}
+	if _, err := h.discussionRuntime.repo.UpdateRoleSnapshot(ctx, record.DiscussionID, next); err != nil {
+		h.logger.Warn("chatroom: persist role model into role snapshot failed",
+			"chatroomId", chatroomRcID, "discussionId", record.DiscussionID, "memberId", memberID, "error", err)
+	}
+}
+
+// patchRoleSnapshotModel 在角色板里改一个成员条目的 model，返回新快照。
+//
+// 抽成纯函数是为了能脱离数据库测：这里一旦写错键名（角色板按成员 rc id 做 key，
+// `memberId` 也在条目里冗余一份），派发侧就读不到模型，用户看到「保存成功、
+// 下一轮还是旧模型」，而这种错在集成测试里表现为随机超时，很难定位。
+// ok=false 表示快照不可解析 / 没有这个成员 / 内容未变化，调用方不必写库。
+func patchRoleSnapshotModel(raw []byte, memberID, model string) ([]byte, bool) {
+	if len(raw) == 0 || memberID == "" {
+		return nil, false
+	}
+	var snapshot map[string]map[string]interface{}
+	if json.Unmarshal(raw, &snapshot) != nil {
+		return nil, false
+	}
+	entry, ok := snapshot[memberID]
+	if !ok || entry == nil {
+		return nil, false
+	}
+	current, _ := entry["model"].(string)
+	if current == model {
+		return nil, false
+	}
+	if model == "" {
+		delete(entry, "model")
+	} else {
+		entry["model"] = model
+	}
+	next, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, false
+	}
+	return next, true
 }
 
 func (h *systemHandler) actionChatroomSetDiscussionTeam(ctx context.Context, cmd CommandContent, actor db.RongcloudUser) commandResult {
