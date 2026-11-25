@@ -1048,3 +1048,64 @@ func TestRelayHub_QueuesMessageWhileBusy(t *testing.T) {
 		t.Fatalf("queued texts should be appended, got %q", s.pending.userText)
 	}
 }
+
+// WEB-050：用户说「总结一下」时必须按「整场讨论」的总结口径出提示词 —— 排在
+// 本轮接龙指令之后、身份行之前，且明确要求先回答最初的问题、偏题单列。
+func TestBuildPrompt_SummaryRequestGetsSummaryDirective(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "room1",
+		userText:     "你来总结一下",
+		isGroup:      true,
+		members:      []relayMember{{rcID: "rc_a", roleName: "A"}},
+	}
+	prompt := hub.buildPrompt(s, s.members[0])
+	if !strings.Contains(prompt, "【总结要求】") {
+		t.Fatalf("summary request must add the summary directive: %q", prompt)
+	}
+	if !strings.Contains(prompt, "最初提出") {
+		t.Fatalf("summary directive must anchor on the original question: %q", prompt)
+	}
+	if !strings.Contains(prompt, "延伸讨论") {
+		t.Fatalf("summary directive must ask for off-topic to be listed separately: %q", prompt)
+	}
+	// 顺序：本轮接龙指令 → 总结要求 → 身份行。总结要求排在最后才压得住接龙惯性。
+	turnAt := strings.Index(prompt, "现在轮到你")
+	summaryAt := strings.Index(prompt, "【总结要求】")
+	tailAt := strings.Index(prompt, "请以「A」的身份发言")
+	if turnAt < 0 || summaryAt < 0 || tailAt < 0 || !(turnAt < summaryAt && summaryAt < tailAt) {
+		t.Fatalf("summary directive must sit between the turn instruction and the tail: turn=%d summary=%d tail=%d", turnAt, summaryAt, tailAt)
+	}
+}
+
+func TestBuildPrompt_PlainTurnHasNoSummaryDirective(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	for _, text := range []string{"接着说说看", "不要总结，直接说结论", "帮我梳理下这个文件"} {
+		s := &relaySession{
+			chatroomRCID: "room1",
+			userText:     text,
+			isGroup:      true,
+			members:      []relayMember{{rcID: "rc_a", roleName: "A"}},
+		}
+		if prompt := hub.buildPrompt(s, s.members[0]); strings.Contains(prompt, "【总结要求】") {
+			t.Fatalf("%q must not trigger the summary directive: %q", text, prompt)
+		}
+	}
+}
+
+func TestRelaySummaryRequest(t *testing.T) {
+	cases := map[string]bool{
+		"你来总结一下":      true,
+		"@dsh 总结":      true,
+		"归纳一下大家的观点":   true,
+		"summarize this": true,
+		"不要总结":        false,
+		"整理一下文件":      false,
+		"":            false,
+	}
+	for text, want := range cases {
+		if got := relaySummaryRequest(text); got != want {
+			t.Fatalf("relaySummaryRequest(%q) = %v，期望 %v", text, got, want)
+		}
+	}
+}

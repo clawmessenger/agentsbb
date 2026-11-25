@@ -1028,6 +1028,20 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	if s.totalRounds > 1 {
 		turn += fmt.Sprintf("（第 %d/%d 轮接龙）", s.roundIndex+1, s.totalRounds)
 	}
+	// 总结请求（WEB-050）：用户说「总结一下」时，模型默认把**最近几段**当成
+	// 全部内容（线上实锤：群聊话题从「先有鸡还是先有蛋」漂到临时决定/续期/
+	// 追责，总结只覆盖了后半段，原始问题一个字没答）。接龙惯性 + 上下文窗口
+	// 都可能把开头截掉，所以在**指令层最后**再压一条硬要求：以最初的问题为锚，
+	// 偏题单列，不得顶替主问题。这条必须排在本轮指令之后 —— 它是整轮里最后
+	// 被读到的内容，压得住前面的接龙惯性。
+	summary := ""
+	if relaySummaryRequest(s.userText) {
+		summary = "\n\n【总结要求】用户要的是「总结整场讨论」，不是接着往下聊。逐条照做：" +
+			"① 第一句话直接回答这场讨论**最初提出**的那个问题（从对话最开头的议题算起，不是最近几段的话题），给出明确结论；" +
+			"② 再列支撑依据、已达成的一致、仍然存在的分歧（分点，别写成流水账）；" +
+			"③ 与主问题无关的延伸话题（例如临时决定、续期、结账、追责、举证清单）单独归入「延伸讨论」，可以一两句带过，**不得取代主问题**；" +
+			"④ 如果确实得不出唯一答案，就写明这是歧义/取舍题，并给出条件式结论（在什么前提下是 A、什么前提下是 B），不要说「取决于具体情况」了事。"
+	}
 	tail := fmt.Sprintf("\n\n请以「%s」的身份发言，只输出发言正文，不要输出多余格式。%s", member.roleName, instr)
 
 	// 行为准则（迁移 607 的 behavior_prompt）：每轮都带，且**单独限长**。
@@ -1055,7 +1069,7 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	// 行为准则从**整条**上限里扣（relayPromptTotalLimit），不从上下文预算
 	// （relayPromptContextLimit）里扣：它是有硬上限的固定文案，扣它只会让
 	// 上下文预算从 4000 掉到 3400 而换不来任何安全余量。
-	fixed := len([]rune(scope + opening + turn + tail))
+	fixed := len([]rune(scope + opening + turn + summary + tail))
 	budget := relayPromptContextLimit
 	if room := relayPromptTotalLimit - fixed - len([]rune(behavior)); room < budget {
 		budget = room
@@ -1082,7 +1096,34 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	// 新入群成员（无锚点）带 N 条最近发言（N = 群内 AI 成员数）。
 	contextBlock += relayHistoryBlock(s.history, budget, member.roleName, len(s.members))
 
-	return "[group chat] " + behavior + scope + opening + contextBlock + turn + tail
+	return "[group chat] " + behavior + scope + opening + contextBlock + turn + summary + tail
+}
+
+// relaySummaryRequest 判断用户这一轮是不是在要「总结」。
+//
+// 只认明确的「总结」动词，并且排除「不要总结」这类否定 —— 误判会把一条普通的
+// 接龙变成总结模式，模型于是丢掉接龙语境去答一个没人问的问题，比不判还糟。
+// 刻意不收「梳理/汇总/复盘」：它们在聊天里更常指「帮我梳理这个文件」这类具体
+// 任务，收进来会把任务轮次误判成总结。
+func relaySummaryRequest(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	lower := strings.ToLower(t)
+	for _, negative := range []string{"不要总结", "别总结", "不用总结", "先别总结", "do not summarize", "don't summarize"} {
+		if strings.Contains(lower, negative) {
+			return false
+		}
+	}
+	for _, word := range []string{
+		"总结", "归纳", "概括", "summarize", "summarise", "summary", "recap",
+	} {
+		if strings.Contains(lower, word) {
+			return true
+		}
+	}
+	return false
 }
 
 // relayClipToRoom 把 text 压进 room 个字符，**结果长度保证不超过 room** ——
