@@ -462,6 +462,29 @@ export const PRIVATE_TURN_SILENT_STALL_MS = 600_000;
 export const PRIVATE_TURN_TOOL_RUNNING_STALL_MS = 1_800_000;
 
 /**
+ * 「运维轮」的停滞窗口（WEB-39 第二次修复，2026-11-25 傍晚）。
+ *
+ * 前一版只修了「有 running 工具步骤」这一路（PRIVATE_TURN_TOOL_RUNNING_STALL_MS），
+ * 但现场证据表明并非所有运维轮都会上报 activity：`relaunch.log` 里部分 ops 轮次
+ * 全程 `activity=0`（codex 的某些执行路径只吐正文/思考，不吐工具步骤），这类轮次
+ * 落不到长窗口上，仍按 240s（已产正文）/600s（零产出）判 —— 「运维老是超时」
+ * 就是这么来的：用户让它查版本、翻配置，它先说一句「我看一下」然后闷头跑命令，
+ * 240s 一到就被掐，前端弹「本轮执行超时，已中止」。
+ *
+ * 所以运维轮单独放宽到 15 分钟：运维本来就是几分钟级的重活（装依赖、跑构建、
+ * 批量检查），而它的『停不下来』风险由用户显式「停止」和服务端取消兜住 ——
+ * 等错了只是慢，掐早了却要用户重来一遍（还要重跑那 4 分钟的命令）。
+ */
+export const PRIVATE_TURN_OPS_STALL_MS = 900_000;
+
+/** 这一轮是不是运维轮：优先看派发信封的 opsAgent，再退回会话 id 的两种运维形态。 */
+export function isOpsTurn(input: { opsAgent?: string | null; conversationId?: string }): boolean {
+  if (input.opsAgent && input.opsAgent.trim() !== "") return true;
+  const id = input.conversationId ?? "";
+  return /_ops$/.test(id) || id.startsWith("ops_") || id.startsWith("om_");
+}
+
+/**
  * 停滞守卫的判定（纯函数，便于单测）。
  *
  * 判据只看「有没有进展」，不看总时长：
@@ -479,14 +502,19 @@ export function shouldAbortStalledTurn(input: {
   stallMs?: number;
   /** 仍在运行的工具已经跑了多久（ms）；undefined/0 = 当前没有跑着的工具。 */
   runningToolMs?: number;
+  /** 运维轮：窗口整体放宽到 PRIVATE_TURN_OPS_STALL_MS（见该常量的注释）。 */
+  opsTurn?: boolean;
 }): boolean {
   if (input.aborted || input.terminalSent) return false;
   if (input.runningToolMs !== undefined && input.runningToolMs > 0) {
     return input.runningToolMs >= PRIVATE_TURN_TOOL_RUNNING_STALL_MS;
   }
-  const windowMs = input.producedText
+  const baseWindow = input.producedText
     ? (input.stallMs ?? PRIVATE_TURN_STALL_MS)
     : PRIVATE_TURN_SILENT_STALL_MS;
+  const windowMs = input.opsTurn
+    ? Math.max(baseWindow, PRIVATE_TURN_OPS_STALL_MS)
+    : baseWindow;
   return input.idleMs >= windowMs;
 }
 
@@ -1304,6 +1332,7 @@ export class MessageDispatcher {
               producedText,
               idleMs,
               runningToolMs,
+              opsTurn: isOpsTurn({ opsAgent: opts.opsAgent, conversationId: ctx.conversationId }),
             })) return;
             terminalSent = true;
             console.error(

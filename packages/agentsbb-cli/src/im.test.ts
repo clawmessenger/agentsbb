@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
 import type { ActivityStep } from "./agent-activity.js";
-import { MessageDispatcher, planReadReceipt, resolveTurnVenue, shouldAbortStalledTurn, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
+import { isOpsTurn, MessageDispatcher, planReadReceipt, resolveTurnVenue, shouldAbortStalledTurn, turnNeedsHeartbeat, turnSessionKey } from "./im.js";
 import type { PermissionSnapshot } from "./agent-permissions.js";
 import { createAnsweredTurnStore } from "./answered-turns.js";
 import { TurnIncompleteError } from "./turn-error.js";
@@ -3249,6 +3249,34 @@ describe("shouldAbortStalledTurn", () => {
   it("runningToolMs 为 0（没有跑着的工具）时仍走原判据", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000, runningToolMs: 0 })).toBe(true);
     expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, runningToolMs: 0 })).toBe(true);
+  });
+
+  // WEB-39 二次修复（2026-11-25 傍晚）：部分运维轮全程 activity=0（不吐工具步骤），
+  // 落不到「有 running 步骤」那一档，仍会被 240s 增量窗口掐掉。
+  it("运维轮（无 activity）不再按 240s 判卡死，放宽到 15 分钟", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, producedText: false, idleMs: 600_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 900_000, opsTurn: true })).toBe(true);
+  });
+
+  it("非运维轮的窗口不受影响", () => {
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000, opsTurn: false })).toBe(true);
+  });
+});
+
+describe("isOpsTurn", () => {
+  it("认派发信封的 opsAgent 与会话 id 的两种运维形态", () => {
+    expect(isOpsTurn({ opsAgent: "codex" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "rc_node_x_ops" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "ops_key1" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "om_node1" })).toBe(true);
+  });
+
+  it("普通私聊/群聊不算运维轮", () => {
+    expect(isOpsTurn({ conversationId: "user-1" })).toBe(false);
+    expect(isOpsTurn({ opsAgent: "  ", conversationId: "group_9" })).toBe(false);
+    expect(isOpsTurn({})).toBe(false);
   });
 });
 
