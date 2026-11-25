@@ -904,3 +904,23 @@ func TestInteractiveDispatch_EmptyRoundTellsHostTheTruth(t *testing.T) {
 		t.Errorf("空轮提示词不该复用「据现有发言撰写」那一版：%q", prompted)
 	}
 }
+
+// TestInteractiveHostTaskOnlyCountsExplicitAgreement 验证 WEB-054：纪要提示词必须
+// 明确禁止把「只补充材料、没表态」的发言归纳成共识。回归现场是主持人把第三轮仍在
+// 论述的成员写成「三方接受……」，而发言里根本没有认同语句。
+func TestInteractiveHostTaskOnlyCountsExplicitAgreement(t *testing.T) {
+	for _, round := range []int{1, 3} {
+		task := interactiveHostTask(round, false, 0)
+		for _, want := range []string{"明确表态", "不算共识", "未明确表态"} {
+			if !strings.Contains(task, want) {
+				t.Fatalf("round %d host task missing %q:/n%s", round, want, task)
+			}
+		}
+		// 四段结构不能因为加纪律被破坏。
+		for _, section := range []string{"【已达成的共识】", "【仍存在的分歧】", "【未解决的问题】", "【下一轮聚焦】"} {
+			if !strings.Contains(task, section) {
+				t.Fatalf("round %d host task lost section %s", round, section)
+			}
+		}
+	}
+}
