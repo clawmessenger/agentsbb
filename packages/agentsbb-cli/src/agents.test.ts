@@ -187,6 +187,32 @@ describe("buildAgentArgs", () => {
     ]);
   });
 
+  // 配置里只有被 codex 0.169+ 忽略的 `api_key` 时，调用方会把凭据方案塞进
+  // ctx，argv 补一行 `-c …env_key=<名字>` 指向子进程环境里的密钥。
+  it("codex adds the env_key override when a credential plan is supplied", () => {
+    const args = buildAgentArgs("codex", "hi", "quukk_direct/glm-5.2", undefined, {
+      codexCredential: {
+        provider: "quukk_direct",
+        envKey: "AGENTSBB_CODEX_API_KEY",
+        apiKey: "sk-test",
+        needsConfigOverride: true,
+        args: ["-c", 'model_providers.quukk_direct.env_key="AGENTSBB_CODEX_API_KEY"'],
+      },
+    });
+    expect(args).toEqual([
+      "exec", "hi", "--json", "--skip-git-repo-check",
+      "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
+      "-c", 'model_providers.quukk_direct.env_key="AGENTSBB_CODEX_API_KEY"',
+    ]);
+    // 没有方案（或方案为空 args）时 argv 保持原样 —— 纯函数不能读全局配置。
+    expect(buildAgentArgs("codex", "hi", "quukk_direct/glm-5.2", undefined, {
+      codexCredential: null,
+    })).toEqual([
+      "exec", "hi", "--json", "--skip-git-repo-check",
+      "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
+    ]);
+  });
+
   it("hermes passes the provider separately", () => {
     expect(buildAgentArgs("hermes", "hi", "quukk/glm-5.3")).toEqual([
       "chat", "-q", "hi", "--oneshot", "--format", "stream-json",
@@ -783,6 +809,31 @@ describe("agentRuntimeEnv", () => {
   it("leaves the environment alone for agents that need no gateway switch", () => {
     expect(agentRuntimeEnv("qwen", "quukk/glm-5.2", { env: {}, config: CONFIG })).toBeNull();
     expect(agentRuntimeEnv("codebuddy", "quukk/glm-5.2", { env: {}, config: null })).toBeNull();
+  });
+
+  // codex 0.169 起忽略 api_key（`api_key is ignored`），只认 env_key /
+  // http_headers。配置若还是旧形状，设备端要把密钥塞进子进程环境变量兜底。
+  it("injects the codex key through an env var when the config only has api_key", () => {
+    const env = agentRuntimeEnv("codex", "quukk/glm-5.2", { env: { PATH: "/bin" }, config: CONFIG });
+    expect(env).toMatchObject({ PATH: "/bin", AGENTSBB_CODEX_API_KEY: "sk-test" });
+  });
+
+  it("does not inject for codex when the config already carries a usable credential", () => {
+    const withHeader = {
+      endpoints: [{ ...CONFIG.endpoints[0], authHeader: "sk-test" }],
+      defaultModel: "quukk/glm-5.2",
+    };
+    expect(agentRuntimeEnv("codex", "quukk/glm-5.2", { env: {}, config: withHeader })).toBeNull();
+
+    const withEnvKey = {
+      endpoints: [{ ...CONFIG.endpoints[0], envKey: "QUUKK_API_KEY" }],
+      defaultModel: "quukk/glm-5.2",
+    };
+    expect(agentRuntimeEnv("codex", "quukk/glm-5.2", {
+      env: { QUUKK_API_KEY: "sk-test" },
+      config: withEnvKey,
+    })).toBeNull();
+    expect(agentRuntimeEnv("codex", "quukk/glm-5.2", { env: {}, config: null })).toBeNull();
   });
 });
 

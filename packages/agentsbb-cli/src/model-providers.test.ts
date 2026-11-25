@@ -12,6 +12,7 @@ import {
   parseOpenclawConfig,
   parseOpencodeConfig,
   parseQwenConfig,
+  planCodexCredential,
   probeProviderModels,
   readAgentConfig,
 } from "./model-providers.js";
@@ -158,6 +159,119 @@ describe("parseCodexConfig", () => {
     ].join("\n"));
     expect(config.endpoints.map((e) => e.id)).toEqual(["a.b", "second"]);
     expect(config.endpoints[1].apiKey).toBe("k");
+  });
+
+  // codex 0.169 起 `api_key` 被忽略（`api_key is ignored`），真正生效的是
+  // `env_key` 与 `http_headers`。这些用例锁住新形状的解析，缺一个面板就空态。
+  it("resolves env_key from the process environment", () => {
+    const config = parseCodexConfig([
+      'model = "glm-5.2"',
+      'model_provider = "quukk_direct"',
+      "[model_providers.quukk_direct]",
+      'base_url = "https://llmapi.quukk.com/v1"',
+      'env_key = "QUUKK_API_KEY"',
+    ].join("\n"), { QUUKK_API_KEY: "sk-env" });
+    expect(config.endpoints).toEqual([{
+      id: "quukk_direct",
+      baseUrl: "https://llmapi.quukk.com/v1",
+      apiKey: "sk-env",
+      envKey: "QUUKK_API_KEY",
+    }]);
+  });
+
+  it("reads an inline http_headers table and strips the Bearer prefix", () => {
+    const config = parseCodexConfig([
+      "[model_providers.quukk_direct]",
+      'base_url = "https://llmapi.quukk.com/v1"',
+      'api_key = "sk-stale"',
+      'http_headers = { Authorization = "Bearer sk-live", X-Trace = "off" }',
+    ].join("\n"));
+    expect(config.endpoints[0].apiKey).toBe("sk-live");
+    expect(config.endpoints[0].authHeader).toBe("sk-live");
+  });
+
+  it("reads a [model_providers.<id>.http_headers] sub-table", () => {
+    const config = parseCodexConfig([
+      "[model_providers.quukk_direct]",
+      'base_url = "https://llmapi.quukk.com/v1"',
+      "",
+      "[model_providers.quukk_direct.http_headers]",
+      'Authorization = "Bearer sk-sub"',
+    ].join("\n"));
+    expect(config.endpoints).toHaveLength(1);
+    expect(config.endpoints[0].authHeader).toBe("sk-sub");
+    expect(config.endpoints[0].apiKey).toBe("sk-sub");
+  });
+});
+
+describe("planCodexCredential", () => {
+  const apiKeyOnly = {
+    endpoints: [{ id: "quukk_direct", baseUrl: "https://llmapi.quukk.com/v1", apiKey: "sk-x" }],
+    defaultModel: "quukk_direct/glm-5.2",
+  };
+
+  it("injects via a config override when the file only has api_key", () => {
+    const plan = planCodexCredential(apiKeyOnly, { env: {} });
+    expect(plan).toEqual({
+      provider: "quukk_direct",
+      envKey: "AGENTSBB_CODEX_API_KEY",
+      apiKey: "sk-x",
+      needsConfigOverride: true,
+      args: ["-c", 'model_providers.quukk_direct.env_key="AGENTSBB_CODEX_API_KEY"'],
+    });
+  });
+
+  it("reuses the declared env_key name instead of adding a -c override", () => {
+    const plan = planCodexCredential({
+      endpoints: [{
+        id: "quukk_direct",
+        baseUrl: "https://llmapi.quukk.com/v1",
+        apiKey: "sk-x",
+        envKey: "QUUKK_API_KEY",
+        authHeader: "sk-x",
+      }],
+      defaultModel: null,
+    }, { env: {} });
+    // 有内联头时 codex 自己能带上，完全不插手。
+    expect(plan).toBeNull();
+
+    const envOnly = planCodexCredential({
+      endpoints: [{
+        id: "quukk_direct",
+        baseUrl: "https://llmapi.quukk.com/v1",
+        apiKey: "sk-x",
+        envKey: "QUUKK_API_KEY",
+      }],
+      defaultModel: null,
+    }, { env: {} });
+    expect(envOnly?.envKey).toBe("QUUKK_API_KEY");
+    expect(envOnly?.args).toEqual([]);
+  });
+
+  it("stays out of the way when the key is already in the environment", () => {
+    expect(planCodexCredential({
+      endpoints: [{
+        id: "quukk_direct",
+        baseUrl: "https://llmapi.quukk.com/v1",
+        apiKey: "sk-x",
+        envKey: "QUUKK_API_KEY",
+      }],
+      defaultModel: null,
+    }, { env: { QUUKK_API_KEY: "sk-x" } })).toBeNull();
+    expect(planCodexCredential({ endpoints: [], defaultModel: null })).toBeNull();
+    expect(planCodexCredential(null)).toBeNull();
+  });
+
+  it("only plans for the provider the turn actually uses", () => {
+    const config = {
+      endpoints: [
+        { id: "a", baseUrl: "http://a/v1", apiKey: "ka" },
+        { id: "b", baseUrl: "http://b/v1", apiKey: "kb" },
+      ],
+      defaultModel: null,
+    };
+    expect(planCodexCredential(config, { provider: "b", env: {} })?.apiKey).toBe("kb");
+    expect(planCodexCredential(config, { provider: "missing", env: {} })).toBeNull();
   });
 });
 

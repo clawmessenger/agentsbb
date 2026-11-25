@@ -30,6 +30,12 @@ export interface ProviderEndpoint {
   name?: string;
   baseUrl: string;
   apiKey?: string;
+  /** 配置里 `env_key` 声明的环境变量名（codex 0.169+ 认这个，不认 `api_key`）。
+   *  探测时已经把变量值取进 `apiKey`；spawn 时设备端会按它兜底注入。 */
+  envKey?: string;
+  /** 配置里内联的 `Authorization` 头 token（`http_headers` 表 / 内联表）。
+   *  codex 自己能带上它，设备端无需再注入。 */
+  authHeader?: string;
 }
 
 export interface AgentConfig {
@@ -172,23 +178,75 @@ function unquote(value: string): string | null {
   return /^[A-Za-z0-9_./:@-]+$/.test(trimmed) ? trimmed : null;
 }
 
-// `~/.codex/config.toml`: `model_provider = "<id>"`, `model = "<slug>"`, and
-// `[model_providers.<id>]` tables carrying `base_url` / `api_key` / `name`.
-export function parseCodexConfig(text: string): AgentConfig {
+// `~/.codex/config.toml`:
+//   model_provider = "<id>"
+//   model          = "<slug>"
+//   [model_providers.<id>]
+//   base_url     = "https://llmapi.quukk.com/v1"
+//   api_key      = "sk-…"                                  # ⚠️ 见下
+//   env_key      = "QUUKK_API_KEY"                         # 从环境变量取
+//   http_headers = { Authorization = "Bearer sk-…" }       # 内联表
+//   # 或标准子表：
+//   [model_providers.<id>.http_headers]
+//   Authorization = "Bearer sk-…"
+//
+// ⚠️ codex 0.169 起**不再读 `api_key`**（启动告警 `api_key is ignored`），请求
+// 于是不带 Authorization，服务端回 401「无效的令牌」。真正生效的只有
+// `env_key` 和 `http_headers`（2026-11-25 在 0.172.0 上逐字段实测）。
+// 三个字段都要读：`api_key` 是旧形状（也是 opencodex 之类工具会回写的形状），
+// 保留它才能在这种配置下探到模型目录；`env_key` / `http_headers` 是新形状，
+// 决定设备端要不要在 spawn 时兜底注入（见 planCodexCredential）。
+export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): AgentConfig {
   const endpoints: ProviderEndpoint[] = [];
   let activeProvider: string | null = null;
   let model: string | null = null;
   let table: string | null = null;
+  // 当前是否处在 `[model_providers.<id>.http_headers]` 子表里（值为 provider id）。
+  let headerTable: string | null = null;
   let current: Partial<ProviderEndpoint> & { id?: string } = {};
+  // 极少数配置把 http_headers 子表写在主表前面；先攒着，flush 时再合并。
+  const pendingHeaders = new Map<string, string>();
+  // `api_key` 原值：子表可能出现在主表之后（最常见），那时 endpoint 已 push，
+  // 凭据要重新按优先级算一遍，原值得留着。
+  const rawKeys = new Map<string, string>();
+
+  // 探测用的 token：codex 运行时真正会带的优先（env_key 解析值 > 内联头），
+  // `api_key` 只作最后兜底 —— 它是 0.169+ 被忽略的旧形状。
+  const finalizeKey = (endpoint: ProviderEndpoint): void => {
+    const fromEnv = endpoint.envKey ? asString(env[endpoint.envKey]) : null;
+    const key = fromEnv ?? endpoint.authHeader ?? rawKeys.get(endpoint.id) ?? null;
+    if (key) endpoint.apiKey = key;
+    else delete endpoint.apiKey;
+  };
+
+  const setAuthHeader = (providerId: string, raw: string): void => {
+    const token = normalizeBearer(rawValue(raw) ?? "");
+    if (!token) return;
+    const endpoint = endpoints.find((entry) => entry.id === providerId);
+    if (endpoint) {
+      endpoint.authHeader = token;
+      finalizeKey(endpoint);
+    } else {
+      pendingHeaders.set(providerId, token);
+    }
+  };
 
   const flush = (): void => {
     if (current.id && asString(current.baseUrl)) {
-      endpoints.push({
-        id: current.id,
+      const id = current.id;
+      const envKey = current.envKey;
+      const header = current.authHeader ?? pendingHeaders.get(id) ?? null;
+      pendingHeaders.delete(id);
+      if (current.apiKey) rawKeys.set(id, current.apiKey);
+      const endpoint: ProviderEndpoint = {
+        id,
         ...(current.name ? { name: current.name } : {}),
         baseUrl: current.baseUrl as string,
-        ...(current.apiKey ? { apiKey: current.apiKey } : {}),
-      });
+        ...(envKey ? { envKey } : {}),
+        ...(header ? { authHeader: header } : {}),
+      };
+      finalizeKey(endpoint);
+      endpoints.push(endpoint);
     }
     current = {};
   };
@@ -200,22 +258,41 @@ export function parseCodexConfig(text: string): AgentConfig {
     if (header) {
       flush();
       table = header[1];
+      headerTable = null;
+      // 子表必须先判：`[model_providers.x.http_headers]` 里的 `x.http_headers`
+      // 会被下面那条 provider 正则的多余点挡掉，但显式判断更不易出错。
+      const sub = /^model_providers\.(?:"([^"]+)"|([^.]+))\.http_headers$/.exec(table);
+      if (sub) {
+        headerTable = sub[1] ?? sub[2];
+        continue;
+      }
       const provider = /^model_providers\.(?:"([^"]+)"|([^.]+))$/.exec(table);
       if (provider) current.id = provider[1] ?? provider[2];
       continue;
     }
     const kv = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
     if (!kv) continue;
-    const value = unquote(kv[2]);
     if (table === null) {
+      const value = unquote(kv[2]);
       if (kv[1] === "model_provider") activeProvider = value;
       else if (kv[1] === "model") model = value;
       continue;
     }
+    if (headerTable !== null) {
+      if (kv[1].toLowerCase() === "authorization") setAuthHeader(headerTable, kv[2]);
+      continue;
+    }
     if (!current.id) continue;
+    const value = unquote(kv[2]);
     if (kv[1] === "base_url" || kv[1] === "baseUrl") current.baseUrl = value ?? undefined;
     else if (kv[1] === "name") current.name = value ?? undefined;
     else if (kv[1] === "api_key" || kv[1] === "apiKey") current.apiKey = value ?? undefined;
+    else if (kv[1] === "env_key" || kv[1] === "envKey") current.envKey = value ?? undefined;
+    else if (kv[1] === "http_headers") {
+      // 内联表：`{ Authorization = "Bearer sk-…", X-Foo = "bar" }`
+      const auth = /(?:^|[{,\s])["']?authorization["']?\s*=\s*(.+?)\s*(?:[,}]|$)/i.exec(kv[2]);
+      if (auth) setAuthHeader(current.id, auth[1]);
+    }
   }
   flush();
 
@@ -223,6 +300,72 @@ export function parseCodexConfig(text: string): AgentConfig {
   return {
     endpoints,
     defaultModel: provider && model ? `${provider}/${model}` : null,
+  };
+}
+
+/** 取出 TOML 值的字面量：允许引号内含空格（`"Bearer sk-…"`），裸值原样返回。 */
+function rawValue(value: string): string | null {
+  const trimmed = value.trim().replace(/[,}]$/, "").trim();
+  if (trimmed === "") return null;
+  const quoted = /^(['"])([\s\S]*)\1$/.exec(trimmed);
+  if (quoted) return quoted[2].trim() === "" ? null : quoted[2].trim();
+  return trimmed;
+}
+
+/** `"Bearer sk-…"` → `sk-…`；已经是裸 token 时原样返回。 */
+function normalizeBearer(value: string): string | null {
+  const token = value.replace(/^bearer\s+/i, "").trim();
+  return token === "" ? null : token;
+}
+
+/** 设备端给 codex 注入凭据时用的环境变量名（配置里没有 `env_key` 的情况）。 */
+export const CODEX_INJECTED_ENV_KEY = "AGENTSBB_CODEX_API_KEY";
+
+export interface CodexCredentialPlan {
+  /** 实际要用的 provider id。 */
+  provider: string;
+  /** 密钥写进哪个环境变量（配置声明了 `env_key` 就沿用它，否则用内置名）。 */
+  envKey: string;
+  apiKey: string;
+  /** true = 配置里没有 `env_key`，argv 需补 `-c model_providers.<id>.env_key=…`。 */
+  needsConfigOverride: boolean;
+  /** 需要追加到 codex argv 的参数（不需要时为空数组）。 */
+  args: string[];
+}
+
+/**
+ * 决定 spawn codex 前要不要补凭据。
+ *
+ * codex 0.169+ 忽略 `api_key`，只认 `env_key` / `http_headers`。设备端改不了
+ * 用户配置文件，但可以在**子进程层面**补上：把密钥放进环境变量，再用
+ * `-c` 让 codex 去读那个变量。密钥只走环境、不进命令行（`ps` 看不到）。
+ *
+ * 返回 null 的三种情况都是「codex 自己能行，别插手」：
+ *   有内联 Authorization 头、配置的 `env_key` 在真实环境里有值、端点没有密钥。
+ */
+export function planCodexCredential(
+  config: AgentConfig | null | undefined,
+  opts: { provider?: string | null; env?: NodeJS.ProcessEnv } = {},
+): CodexCredentialPlan | null {
+  if (!config || config.endpoints.length === 0) return null;
+  const wanted = opts.provider ?? null;
+  const endpoint = wanted
+    ? config.endpoints.find((entry) => entry.id === wanted) ?? null
+    : config.endpoints.find((entry) => entry.apiKey) ?? config.endpoints[0] ?? null;
+  if (!endpoint?.apiKey) return null;
+  if (endpoint.authHeader) return null;
+  const env = opts.env ?? process.env;
+  if (endpoint.envKey && asString(env[endpoint.envKey])) return null;
+  const envKey = endpoint.envKey ?? CODEX_INJECTED_ENV_KEY;
+  const needsConfigOverride = !endpoint.envKey;
+  return {
+    provider: endpoint.id,
+    envKey,
+    apiKey: endpoint.apiKey,
+    needsConfigOverride,
+    args: needsConfigOverride
+      ? ["-c", `model_providers.${endpoint.id}.env_key="${envKey}"`]
+      : [],
   };
 }
 
@@ -700,7 +843,9 @@ export function parseMcodeConfig(text: string): AgentConfig {
 
 // --- per-agent wiring ------------------------------------------------------
 
-const AGENT_CONFIG_PARSERS: Readonly<Record<string, (text: string) => AgentConfig>> = {
+const AGENT_CONFIG_PARSERS: Readonly<
+  Record<string, (text: string, env?: NodeJS.ProcessEnv) => AgentConfig>
+> = {
   openclaw: parseOpenclawConfig,
   codex: parseCodexConfig,
   hermes: parseHermesConfig,
@@ -1051,7 +1196,7 @@ export function readAgentConfig(
       continue;
     }
     try {
-      const config = parser(text);
+      const config = parser(text, env);
       return { ...config, endpoints: dedupeEndpoints(config.endpoints) };
     } catch {
       return null;

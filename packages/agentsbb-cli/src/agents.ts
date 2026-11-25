@@ -26,8 +26,10 @@ import {
 import {
   buildDeviceOpencodeConfig,
   discoverOpencodeConfigPath,
+  planCodexCredential,
   readAgentConfig,
   type AgentConfig,
+  type CodexCredentialPlan,
 } from "./model-providers.js";
 import { isSessionId } from "./agent-sessions.js";
 import {
@@ -174,6 +176,15 @@ export interface AgentArgvContext {
    * 所以注入点写在每条策略里，而不是统一拼在 argv 末尾。
    */
   resumeSessionId?: string;
+  /**
+   * codex 的凭据兜底方案（见 planCodexCredential）。由真正 spawn 的调用方算好
+   * 传进来，策略只负责把它拼成 `-c model_providers.<id>.env_key=…`。
+   *
+   * ⚠️ 不要在这里现场读配置文件：buildAgentArgs 是纯函数，测试与
+   * `agentsbb agents --print-args` 之类的诊断路径都会调它，读全局状态会让输出
+   * 随本机 config.toml 变形。
+   */
+  codexCredential?: CodexCredentialPlan | null;
 }
 type AgentArgvStrategy = (
   prompt: string,
@@ -345,7 +356,12 @@ export function grokRouteFromCliModelId(cliId: string): string | null {
 export function agentRuntimeEnv(
   agentName: string | undefined,
   model: string | undefined,
-  opts: { env?: NodeJS.ProcessEnv; config?: AgentConfig | null } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    config?: AgentConfig | null;
+    /** 已算好的 codex 凭据方案；传了就不再读配置（spawn 路径与 argv 共用一份）。 */
+    codexCredential?: CodexCredentialPlan | null;
+  } = {},
 ): NodeJS.ProcessEnv | null {
   // qwenpaw（Python CLI）：Windows 管道上 Python 的 stdout 默认编码跟随
   // locale（GBK），回复里的中文会以 GBK 字节流出而我们按 UTF-8 解码 ——
@@ -354,6 +370,22 @@ export function agentRuntimeEnv(
   if (agentName === "qwenpaw") {
     const baseEnv = opts.env ?? process.env;
     return { ...baseEnv, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" };
+  }
+  // codex：0.169 起 `api_key` 被忽略，只认 `env_key` / `http_headers`。用户的
+  // config.toml 若还是旧形状（很可能被 opencodex 之类的工具回写成只有
+  // `api_key`），每轮都会 401。这里把密钥塞进子进程环境变量，argv 侧再由
+  // buildAgentArgs 补 `-c model_providers.<id>.env_key=…` 指过来 —— 密钥不进
+  // 命令行，`ps`/日志都看不到。
+  if (agentName === "codex") {
+    const baseEnv = opts.env ?? process.env;
+    const plan = opts.codexCredential !== undefined
+      ? opts.codexCredential
+      : planCodexCredential(
+        opts.config === undefined ? readAgentConfig("codex") : opts.config,
+        { provider: model ? splitModelRoute(model)?.provider ?? null : null, env: baseEnv },
+      );
+    if (!plan) return null;
+    return { ...baseEnv, [plan.envKey]: plan.apiKey };
   }
   if (agentName !== "codebuddy") return null;
   const config = opts.config === undefined ? readAgentConfig("codebuddy") : opts.config;
@@ -418,6 +450,9 @@ export function agentSupportsReasoning(name: string | undefined): boolean {
   return name !== undefined && STREAM_JSON_AGENTS.has(name);
 }
 
+// codex 凭据兜底：见 agentRuntimeEnv 的 codex 分支。密钥走环境变量，argv 只
+// 补一行 `-c …env_key=<名字>`（配置里已经有 env_key 时不补）。
+
 const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
   // kimi 的策略在下方 qwen 之后（stream-json 升级版，含完整协议依据注释）。
   claude: (prompt, model, _sessionKey, ctx) => [
@@ -464,6 +499,7 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     // 这两个参数 0.172.0 的 `exec resume` usage 里仍列出，放在 prompt 之后安全。
     "--json", "--skip-git-repo-check",
     ...buildModelArgs("codex", model),
+    ...(ctx?.codexCredential?.args ?? []),
   ],
   // --format json --thinking：opencode 1.19 起支持逐行 JSON 事件（reasoning /
   // tool_use / text / step_start / step_finish），是思考流与过程流的数据源。
@@ -2626,6 +2662,13 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       return;
     }
 
+    // codex 凭据兜底：一次算好，argv（`-c …env_key=…`）与子进程环境（真正
+    // 的密钥）共用同一份方案，避免两处各读一次配置后判断不一致。
+    const codexPlan = opts.agentName === "codex"
+      ? planCodexCredential(readAgentConfig("codex"), {
+        provider: opts.model ? splitModelRoute(opts.model)?.provider ?? null : null,
+      })
+      : null;
     // Strategy agents take the prompt as argv; everything else (unknown
     // agent, or a prompt past the argv length cap) keeps the legacy stdin
     // invocation with the model flag as the only argument.
@@ -2633,6 +2676,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       ? buildAgentArgs(opts.agentName, opts.prompt, opts.model, opts.sessionKey, {
         fsRestricted,
         ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+        ...(codexPlan ? { codexCredential: codexPlan } : {}),
       })
       : [];
     const argvMode = strategyArgs.length > 0;
@@ -2672,7 +2716,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       : null;
     const spawnEnv = deviceConfig
       ? { ...process.env, OPENCODE_CONFIG: deviceConfig }
-      : agentRuntimeEnv(opts.agentName, opts.model);
+      : agentRuntimeEnv(opts.agentName, opts.model, { codexCredential: codexPlan });
     const { file, args } = buildSpawnInvocation(opts.execPath, agentArgs);
     const child = spawn(file, args, {
       stdio: ["pipe", "pipe", "pipe"],
