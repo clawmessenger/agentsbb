@@ -443,9 +443,12 @@ describe("codex 的只读参数", () => {
     expect(args).toEqual(expect.arrayContaining(["--sandbox", "read-only"]));
   });
 
-  it("未限制时不加（行为与升级前一致）", () => {
+  // WEB-55（2026-11-25）：`codex exec` 默认沙箱就是 read-only，不传参数**不等于**
+  // 不限制。开关打开后必须显式 workspace-write，否则 codex 仍然只读。
+  it("未限制时显式给 workspace-write（默认只读，不传等于限制）", () => {
     const args = buildAgentArgs("codex", "hi");
-    expect(args).not.toContain("--sandbox");
+    expect(args).toEqual(expect.arrayContaining(["--sandbox", "workspace-write"]));
+    expect(args).not.toContain("read-only");
   });
 
   // WEB-44（2026-11-25）：0.172.0 的 `codex exec resume` 不接受 --sandbox，
@@ -463,12 +466,13 @@ describe("codex 的只读参数", () => {
     expect(args[args.indexOf("resume") + 2]).toBe("你好");
   });
 
-  it("续接且未限制时没有 --sandbox，resume 紧跟 exec", () => {
+  it("续接且未限制时也给 workspace-write，位置同样在 exec 之后、resume 之前", () => {
     const args = buildAgentArgs("codex", "你好", undefined, undefined, {
       resumeSessionId: "11111111-2222-3333-4444-555555555555",
     });
-    expect(args).not.toContain("--sandbox");
-    expect(args.slice(0, 3)).toEqual(["exec", "resume", "11111111-2222-3333-4444-555555555555"]);
+    expect(args.slice(0, 4)).toEqual(["exec", "--sandbox", "workspace-write", "resume"]);
+    expect(args[args.indexOf("resume") + 1]).toBe("11111111-2222-3333-4444-555555555555");
+    expect(args[args.indexOf("resume") + 2]).toBe("你好");
   });
 });
 

@@ -485,7 +485,15 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     //   Usage: codex exec resume --json --skip-git-repo-check <SESSION_ID> <PROMPT>
     // 直接退出 —— 设备端只看到「进程异常退出，没有任何输出」。实测
     // `codex exec --sandbox read-only resume --help` 能正常接受该位置。
-    ...(ctx?.fsRestricted ? ["--sandbox", "read-only"] : []),
+    // ⚠️ WEB-55（2026-11-25）：不传 --sandbox **不等于**「不限制」——
+    // `codex exec` 的默认沙箱就是 read-only（官方 non-interactive-mode 文档：
+    // 「默认情况下，codex exec 在只读沙盒中运行」）。所以旧写法在开关打开后
+    // 什么都不传，codex 依旧是只读，用户看到的就是「开了本机文件权限，会话里
+    // 还提示只读」。未限制时必须显式给 workspace-write：只放开当前工作区
+    // （agent 的 workdir）的读写，不是 danger-full-access，越界写入仍然被拒。
+    ...(ctx?.fsRestricted
+      ? ["--sandbox", "read-only"]
+      : ["--sandbox", "workspace-write"]),
     // 续接要换成 `exec resume <id> <prompt>` 的子命令形态（prompt 必须跟在 id
     // 后面）。实测 0.144.6：`codex exec resume <uuid> "hi" --json` 会被正常接受，
     // 不存在的 id 报 `no rollout found for thread id …`（见 agent-sessions.ts 的

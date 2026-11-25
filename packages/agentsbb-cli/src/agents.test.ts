@@ -107,7 +107,7 @@ describe("buildAgentArgs", () => {
 
   it("codex uses exec subcommand with --json and -m", () => {
     expect(buildAgentArgs("codex", "hi", "gpt-5")).toEqual([
-      "exec", "hi", "--json", "--skip-git-repo-check", "-m", "gpt-5",
+      "exec", "--sandbox", "workspace-write", "hi", "--json", "--skip-git-repo-check", "-m", "gpt-5",
     ]);
   });
 
@@ -182,7 +182,7 @@ describe("buildAgentArgs", () => {
   // against the real CLIs: `codex -m quukk_direct/glm-5.2` is model_not_found.
   it("codex splits a route into -c model_provider + a bare -m", () => {
     expect(buildAgentArgs("codex", "hi", "quukk_direct/glm-5.2")).toEqual([
-      "exec", "hi", "--json", "--skip-git-repo-check",
+      "exec", "--sandbox", "workspace-write", "hi", "--json", "--skip-git-repo-check",
       "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
     ]);
   });
@@ -200,7 +200,7 @@ describe("buildAgentArgs", () => {
       },
     });
     expect(args).toEqual([
-      "exec", "hi", "--json", "--skip-git-repo-check",
+      "exec", "--sandbox", "workspace-write", "hi", "--json", "--skip-git-repo-check",
       "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
       "-c", 'model_providers.quukk_direct.env_key="AGENTSBB_CODEX_API_KEY"',
     ]);
@@ -208,7 +208,7 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("codex", "hi", "quukk_direct/glm-5.2", undefined, {
       codexCredential: null,
     })).toEqual([
-      "exec", "hi", "--json", "--skip-git-repo-check",
+      "exec", "--sandbox", "workspace-write", "hi", "--json", "--skip-git-repo-check",
       "-c", "model_provider=quukk_direct", "-m", "glm-5.2",
     ]);
   });
@@ -230,7 +230,7 @@ describe("buildAgentArgs", () => {
     expect(buildAgentArgs("claude", "hi")).toEqual([
       "-p", "hi", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
     ]);
-    expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "hi", "--json", "--skip-git-repo-check"]);
+    expect(buildAgentArgs("codex", "hi")).toEqual(["exec", "--sandbox", "workspace-write", "hi", "--json", "--skip-git-repo-check"]);
     expect(buildAgentArgs("opencode", "hi")).toEqual(["run", "hi", "--format", "json", "--thinking"]);
     expect(buildAgentArgs("openclaw", "hi")).toEqual(["agent", "--local", "--json", "-m", "hi"]);
     expect(buildAgentArgs("hermes", "hi")).toEqual([
@@ -1134,9 +1134,11 @@ describe("runAgentTurn", () => {
   });
 
   it("strategy agents receive the prompt as argv", async () => {
-    // Echo agent prints its first argument (the argv prompt for strategy
-    // agents) instead of stdin.
-    const fixture = createEchoAgentScript("codex", { recordArgs: true, echoArg: 2 });
+    // Echo agent prints the argv prompt position instead of stdin.
+    // WEB-55 起 codex 的 argv 是
+    //   exec --sandbox workspace-write <prompt> --json --skip-git-repo-check
+    // prompt 落在第 4 个位置参数上（以前没有 --sandbox 时是第 2 个）。
+    const fixture = createEchoAgentScript("codex", { recordArgs: true, echoArg: 4 });
     try {
       const out = await runAgentTurn({
         execPath: fixture.agentPath,

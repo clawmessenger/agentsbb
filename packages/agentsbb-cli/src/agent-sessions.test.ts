@@ -76,13 +76,15 @@ describe("各 agent 的续接参数落在正确位置", () => {
     }
     // codex 走子命令形态：没有会话 id 时保持 `exec <prompt>`，绝不能出现 resume
     const codex = buildAgentArgs("codex", "hi", undefined, "cm-group-1", {});
-    expect(codex.slice(0, 2)).toEqual(["exec", "hi"]);
+    // WEB-55：exec 之后紧跟显式的 --sandbox workspace-write（默认是 read-only）
+    expect(codex.slice(0, 4)).toEqual(["exec", "--sandbox", "workspace-write", "hi"]);
     expect(codex).not.toContain("resume");
   });
 
   it("codex 续接是子命令形态：exec resume <id> <prompt>（prompt 必须跟在 id 后）", () => {
     const argv = buildAgentArgs("codex", "问题", undefined, "cm-group-1", { resumeSessionId: SID });
-    expect(argv.slice(0, 4)).toEqual(["exec", "resume", SID, "问题"]);
+    // --sandbox 只属于 exec 这一层，必须夹在 exec 与 resume 之间（WEB-44 的位置约束）
+    expect(argv.slice(0, 6)).toEqual(["exec", "--sandbox", "workspace-write", "resume", SID, "问题"]);
     // 其余开关（--json 等）仍要在，否则思考流/过程流全丢
     expect(argv).toContain("--json");
   });
