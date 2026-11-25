@@ -157,10 +157,15 @@ func firstNonEmptyString(values ...interface{}) string {
 //
 // 融云把转让群主放在 /entrust 命名空间下（不在 /group/* 里），旧后端
 // rongcloud/group.py:transfer_group 用的就是这个路径。
+//
+// WEB-034：新群主字段在融云这边的名字是 `newOwner`，不是业务侧惯用的
+// `newOwnerId`。先前按 `newOwnerId` 提交，融云每次都以 1002
+// 「The parameter newOwner is required.」拒绝，Web 端只会看到一句
+// 「failed to transfer the RongCloud group」，看起来像整条链路坏了。
 func (c *rongcloudAPIClient) transferGroup(ctx context.Context, groupID, newOwnerID string) error {
 	form := url.Values{
-		"groupId":    {groupID},
-		"newOwnerId": {newOwnerID},
+		"groupId":  {groupID},
+		"newOwner": {newOwnerID},
 	}
 	_, err := c.postForm(ctx, "/entrust/group/transfer/owner.json", form)
 	return err

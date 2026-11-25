@@ -1438,8 +1438,14 @@ func TestGroupTransferHappyPath(t *testing.T) {
 	if len(transfers) != 1 {
 		t.Fatalf("transfer calls = %d, want 1", len(transfers))
 	}
-	if transfers[0]["groupId"] != "100001" || transfers[0]["newOwnerId"] != "user-8" {
+	// WEB-034：融云那边这个字段叫 `newOwner`。按 `newOwnerId` 提交会被
+	// 1002「The parameter newOwner is required.」挡回来，Web 只看到一句
+	// 「failed to transfer the RongCloud group」。
+	if transfers[0]["groupId"] != "100001" || transfers[0]["newOwner"] != "user-8" {
 		t.Errorf("transfer form = %#v", transfers[0])
+	}
+	if _, ok := transfers[0]["newOwnerId"]; ok {
+		t.Errorf("transfer form 不该再带 newOwnerId: %#v", transfers[0])
 	}
 	if len(stub.newOwners) != 1 || stub.owners["100001"] != "user-8" {
 		t.Errorf("mirror owner = %#v", stub.owners)
