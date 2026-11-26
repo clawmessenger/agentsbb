@@ -2,6 +2,9 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+
+// 拼多行 TOML 用：避免把换行直接写进字符串字面量（转义一多就容易漏）。
+const NL = String.fromCharCode(10);
 import {
   modelsUrl,
   parseCodebuddyProviderConfig,
@@ -157,6 +160,37 @@ describe("parseCodexConfig", () => {
     expect(config.endpoints).toEqual([]);
     expect(config.defaultModel).toBe("openai/gpt-5.6-codex");
     expect(config.declaredModels).toEqual({ openai: ["gpt-5.6-codex"] });
+  });
+
+  // WEB-048 复测：用 profile 的机器把 model 写在 `[profiles.<name>]` 里，
+  // 顶层没有 model。旧解析只认顶层键，目录因此恒为 0。
+  it("model 写在 [profiles.<name>] 里时按当前 profile 取", () => {
+    const config = parseCodexConfig([
+      'profile = "work"',
+      "[profiles.work]",
+      'model = "gpt-5-codex"',
+      'model_provider = "quukk_direct"',
+      "",
+      "[profiles.solo]",
+      'model = "gpt-5.6-codex"',
+    ].join(NL));
+    expect(config.defaultModel).toBe("quukk_direct/gpt-5-codex");
+    expect(config.declaredModels).toEqual({ quukk_direct: ["gpt-5-codex"] });
+  });
+
+  it("没指定 profile 且只有一个 profile 带 model 时用它", () => {
+    const config = parseCodexConfig(['[profiles.only]', 'model = "gpt-5.6-codex"'].join(NL));
+    expect(config.defaultModel).toBe("openai/gpt-5.6-codex");
+  });
+
+  it("顶层 model 优先于 profile 里的 model", () => {
+    const config = parseCodexConfig([
+      'model = "gpt-5.6-codex"',
+      'profile = "work"',
+      "[profiles.work]",
+      'model = "gpt-5-codex"',
+    ].join(NL));
+    expect(config.defaultModel).toBe("openai/gpt-5.6-codex");
   });
 
   it("有 model_providers 时把 model 归到该 provider 名下", () => {

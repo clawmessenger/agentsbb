@@ -209,6 +209,17 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
   // `api_key` 原值：子表可能出现在主表之后（最常见），那时 endpoint 已 push，
   // 凭据要重新按优先级算一遍，原值得留着。
   const rawKeys = new Map<string, string>();
+  // WEB-048 复测：codex 的 `model` 不只在顶层 —— 用 profile 的机器写的是
+  //   profile = "work"
+  //   [profiles.work]
+  //   model = "gpt-5-codex"
+  // 顶层 model 为空时，目录（以及 defaultModel）要从当前 profile 里取，否则
+  // 面板永远「设备模型目录 · 0」，用户连正在用的模型都看不到。
+  let activeProfile: string | null = null;
+  // 当前所处的 `[profiles.<name>]` 段（不在 profile 段里时为 null）。
+  let profile: string | null = null;
+  const profileModels = new Map<string, string>();
+  const profileProviders = new Map<string, string>();
 
   // 探测用的 token：codex 运行时真正会带的优先（env_key 解析值 > 内联头），
   // `api_key` 只作最后兜底 —— 它是 0.169+ 被忽略的旧形状。
@@ -259,6 +270,7 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
       flush();
       table = header[1];
       headerTable = null;
+      profile = null;
       // 子表必须先判：`[model_providers.x.http_headers]` 里的 `x.http_headers`
       // 会被下面那条 provider 正则的多余点挡掉，但显式判断更不易出错。
       const sub = /^model_providers\.(?:"([^"]+)"|([^.]+))\.http_headers$/.exec(table);
@@ -268,6 +280,9 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
       }
       const provider = /^model_providers\.(?:"([^"]+)"|([^.]+))$/.exec(table);
       if (provider) current.id = provider[1] ?? provider[2];
+      // `[profiles.<name>]`：只收「这个 profile 用哪个模型」，不产生端点。
+      const profileTable = /^profiles\.(?:"([^"]+)"|([^.]+))$/.exec(table);
+      if (profileTable) profile = profileTable[1] ?? profileTable[2];
       continue;
     }
     const kv = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
@@ -276,6 +291,14 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
       const value = unquote(kv[2]);
       if (kv[1] === "model_provider") activeProvider = value;
       else if (kv[1] === "model") model = value;
+      else if (kv[1] === "profile") activeProfile = value;
+      continue;
+    }
+    if (profile !== null) {
+      // profile 段里只关心这两个键；其它（如 approval_policy）与模型目录无关。
+      const value = unquote(kv[2]);
+      if (kv[1] === "model" && value) profileModels.set(profile, value);
+      else if (kv[1] === "model_provider" && value) profileProviders.set(profile, value);
       continue;
     }
     if (headerTable !== null) {
@@ -296,7 +319,20 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
   }
   flush();
 
-  const provider = activeProvider ?? endpoints[0]?.id ?? null;
+  // 顶层没写 model 时用当前 profile（没指定 profile 且只有一个带 model 的
+  // profile 时就用它 —— 那种配置只可能是在说这一个）。
+  let effectiveModel = model;
+  let effectiveProvider = activeProvider;
+  if (!effectiveModel) {
+    const picked = activeProfile && profileModels.get(activeProfile)
+      ? activeProfile
+      : (profileModels.size === 1 ? [...profileModels.keys()][0] : null);
+    if (picked) {
+      effectiveModel = profileModels.get(picked) ?? null;
+      effectiveProvider = effectiveProvider ?? profileProviders.get(picked) ?? null;
+    }
+  }
+  const provider = effectiveProvider ?? endpoints[0]?.id ?? null;
   // WEB-048：把配置里 `model = "<slug>"` 这一条也当成「设备已知的模型」交给
   // 目录。它一定跑得起来（这就是 codex 此刻正在用的模型），而此前目录只由
   // 端点 probe 产生 —— 用 ChatGPT 账号登录、没写 `[model_providers.*]` 的
@@ -308,8 +344,8 @@ export function parseCodexConfig(text: string, env: NodeJS.ProcessEnv = {}): Age
   const declaredProvider = provider ?? "openai";
   return {
     endpoints,
-    defaultModel: provider && model ? `${provider}/${model}` : (model ? `${declaredProvider}/${model}` : null),
-    ...(model ? { declaredModels: { [declaredProvider]: [model] } } : {}),
+    defaultModel: provider && effectiveModel ? `${provider}/${effectiveModel}` : (effectiveModel ? `${declaredProvider}/${effectiveModel}` : null),
+    ...(effectiveModel ? { declaredModels: { [declaredProvider]: [effectiveModel] } } : {}),
   };
 }
 
