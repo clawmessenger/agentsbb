@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { access, constants } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -983,6 +984,64 @@ export function killProcessTree(child: { pid?: number; kill: () => void }): void
     }
   }
   child.kill();
+}
+
+/** 等 serve 优雅退出的宽限（毫秒）。 */
+const SERVE_EXIT_GRACE_MS = 1_500;
+/** SIGKILL 之后再等它落地的窗口（毫秒）。 */
+const SERVE_EXIT_KILL_WAIT_MS = 1_000;
+
+/**
+ * 结束一轮 `opencode serve`，并**等到它真的退出**再返回。
+ *
+ * 只 `kill` 不等它的后果（2026-11-26 线上现场，可复现）：
+ *   - 同一个主持节点、同一个议题，第一批 31.5s 正常给出 3 个角色；
+ *   - 紧接着（隔 8s）发第二批，设备端 `agent turn timeout after 57000ms`，
+ *     deviceMs 57347 与窗口一模一样 —— 整个回合**一个事件都没吐**；
+ *   - 用户换任何模型都一样，因为慢的根本不是模型。
+ *
+ * serve 是「每轮一个新进程」，但它和下一轮共用同一个 opencode 数据目录
+ * （`~/.local/share/opencode`）。SIGTERM 之后 serve 的优雅退出会等手上的连接
+ * drain，进程可能还在；下一轮的 serve 这时已经起来，两边抢同一份数据目录的锁，
+ * 新进程从建会话开始就卡住，直到设备端自己的回合超时。间隔越短越容易撞上
+ * （现场：隔 8s 必失败，隔 40s 常成功）。
+ *
+ * 所以这里不发完 SIGTERM 就返回：先给 grace 让它优雅收尾，超时立刻 SIGKILL，
+ * 再等它真正落地。宁可多花一两秒，也不能把上一轮的残骸留给下一轮。
+ */
+export async function stopServeProcess(
+  child: ChildProcess,
+  graceMs: number = SERVE_EXIT_GRACE_MS,
+): Promise<void> {
+  if (hasExited(child)) return;
+  killProcessTree(child);
+  if (hasExited(child)) return;
+  await waitForChildExit(child, graceMs);
+  if (hasExited(child)) return;
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // 已经退出了（ESRCH），没什么可做的。
+  }
+  await waitForChildExit(child, SERVE_EXIT_KILL_WAIT_MS);
+}
+
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+/** 等子进程 exit 事件，最多 `timeoutMs`；已退出则立即返回。 */
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (hasExited(child)) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      child.off("exit", done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    child.once("exit", done);
+  });
 }
 
 // Drops trailing incomplete UTF-8 sequences (lead byte without its
@@ -2374,8 +2433,65 @@ export function syncAgentPermissionConfig(
   });
 }
 
+/**
+ * 同一份 opencode 安装（同一个可执行文件 + 同一个权限身份）的 serve 回合串行闸。
+ *
+ * 为什么必须串行：每轮 serve 都用同一个 opencode 数据目录（`~/.local/share/opencode`），
+ * 两个 serve 同时活着就会在「建会话 / 载入 provider」那一步互相等锁 —— 表现是
+ * 后起的那一轮**一个事件都不吐**，直到调用方超时（2026-11-26 现场：第一批 31s
+ * 成功，紧接着的第二批 deviceMs=57347 与设备端 57s 上限分毫不差，换任何模型都
+ * 一样）。上一轮被 abort（用户点「重试」顶替旧请求）时最容易撞上：abort 只是
+ * reject，进程还要时间退出，新的一轮已经在起 serve 了。
+ *
+ * 闸门是**进程内**的：它表达的是「这台设备的这个 agent 此刻有没有 serve 在跑」，
+ * 本质是易失状态，进程重启后从零开始才是对的。键里带身份，是为了让 ops 与对话
+ * agent 仍能各跑各的（它们用不同的派生配置）。
+ */
+const serveTurnSerials = new Map<string, Promise<void>>();
+
+function serveSerialKey(opts: Pick<RunAgentTurnOpts, "execPath" | "agentName" | "agentIdentity">): string {
+  return `${opts.execPath}|${opts.agentIdentity ?? opts.agentName ?? ""}`;
+}
+
+/**
+ * 在 `key` 上串行执行 `task`：前一个 task 的 promise 落地（含失败）之后，下一个
+ * 才开始。导出给用例直接验证「两轮不重叠」，也是 runOpenCodeServerTurn 的唯一闸口。
+ */
+export async function withServeSerial<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = serveTurnSerials.get(key) ?? Promise.resolve();
+  let release: () => void = () => {};
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  serveTurnSerials.set(key, previous.then(() => mine).catch(() => mine));
+  await previous.catch(() => {
+    // 上一轮失败与这一轮无关：排队只保证顺序，不传递错误。
+  });
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
 /** 起 `opencode serve` 并等它把监听地址打到 stdout，然后跑完一轮。 */
 async function runOpenCodeServerTurn(
+  opts: RunAgentTurnOpts,
+  timeoutMs: number | undefined,
+  hardLimit: number,
+): Promise<string> {
+  // 先排队，再起 serve：上一轮的进程真的退出之后（它的 finally 走完）才轮到这一轮。
+  // 排队只发生在「同一 agent 上有两轮重叠」时，正常情况下 map 里那条链已经 resolve，
+  // 这一行是零成本的。
+  if (opts.signal?.aborted) throw new Error("agent turn aborted");
+  return withServeSerial(serveSerialKey(opts), () => {
+    // 排队期间被取消（用户点了「重试」，这一轮已被顶替）：不必再起一个 serve。
+    if (opts.signal?.aborted) throw new Error("agent turn aborted");
+    return runOpenCodeServerTurnInner(opts, timeoutMs, hardLimit);
+  });
+}
+
+async function runOpenCodeServerTurnInner(
   opts: RunAgentTurnOpts,
   timeoutMs: number | undefined,
   hardLimit: number,
@@ -2468,6 +2584,12 @@ async function runOpenCodeServerTurn(
     child.on("exit", (code) => {
       finish(() => reject(new Error(`opencode serve exited with code ${code}: ${stderr.slice(-400)}`)));
     });
+  }).catch(async (err: unknown) => {
+    // 启动失败同样要收干净：这条路径过去直接抛出，serve 子进程（以及它拉起的
+    // 东西）留给下一次 — 下一次的 serve 会和它抢同一份数据目录，症状与「第一
+    // 轮正常、第二轮零输出超时」完全一样。见 stopServeProcess。
+    await stopServeProcess(child);
+    throw err;
   });
 
   try {
@@ -2510,7 +2632,9 @@ async function runOpenCodeServerTurn(
     return result.text;
   } finally {
     // serve 是本轮专用进程，收尾必须整棵杀掉：留着就是下一个孤儿端口。
-    killProcessTree(child);
+    // 而且要**等它真的退出**再返回 —— 下一轮的 serve 与它共用同一个 opencode
+    // 数据目录，残骸还在就会让下一轮从头卡到回合超时（见 stopServeProcess）。
+    await stopServeProcess(child);
   }
 }
 
