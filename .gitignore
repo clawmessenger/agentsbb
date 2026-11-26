@@ -91,3 +91,7 @@ perf-report/
 
 # 本地 worktree 目录（git worktree add 的落点，绝不入库）
 _wt/
+# 顶层 worktrees/ 是同一件事的新落点（worktrees/<仓库名>/<名>/）。
+# 它不出现在 ignore 里时，`go build` 会把树判成 dirty（vcs.modified=true），
+# 发布时核对构建来源就多一层噪音。
+worktrees/
