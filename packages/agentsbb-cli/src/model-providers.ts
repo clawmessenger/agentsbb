@@ -1191,36 +1191,118 @@ export function buildDeviceOpencodeConfig(
       : {};
     out.tools = { ...tools, ...FS_DENY_TOOLS };
   }
-  if (opts.lean) {
-    // 只覆盖 build 这一个人格：用户自定义的其它 agent（explore / 各种 subagent）
-    // 原样保留 —— 它们不参与精简回合，删掉反而会让用户的配置"消失"。
-    const agents = (out.agent && typeof out.agent === "object" && !Array.isArray(out.agent))
+  // 精简/发言回合要覆盖 build 人格。opencode 1.x 与 2.x 的配置 schema 不同：
+  //   · 1.x：`agent.build.prompt` + `agent.build.tools={"*":false}`
+  //   · 2.x：`agents.build.system` + `agents.build.permissions=[{action:"*",effect:"deny"}]`
+  //     （官方文档明说 2.x 忽略旧的顶层 `prompt`/`tools`/`permission` 字段）
+  // 两套都写、语义一致，任一版本生效即可 —— 不必猜设备上装的是哪一版。
+  // 2026-11-26 现场：主持设备 opencode 2.1.x，旧代码只写 1.x 键，lean 从未生效，
+  // 模型一直拿完整的 1.9 万 token 系统提示 + 全套工具 + 默认思考跑，单轮 30~45s。
+  const systemPrompt = opts.lean ? LEAN_AGENT_SYSTEM_PROMPT : TERSE_AGENT_SYSTEM_PROMPT;
+  if (opts.lean || opts.terse) {
+    // ---- 1.x 键（agent / prompt / tools）----
+    const agentsLegacy = (out.agent && typeof out.agent === "object" && !Array.isArray(out.agent))
       ? { ...(out.agent as Record<string, unknown>) }
       : {};
-    const build = (agents.build && typeof agents.build === "object" && !Array.isArray(agents.build))
-      ? { ...(agents.build as Record<string, unknown>) }
+    const buildLegacy = (agentsLegacy.build && typeof agentsLegacy.build === "object" && !Array.isArray(agentsLegacy.build))
+      ? { ...(agentsLegacy.build as Record<string, unknown>) }
       : {};
-    agents.build = {
-      ...build,
-      prompt: LEAN_AGENT_SYSTEM_PROMPT,
-      // 通配符关掉全部工具：新增工具不必跟着改这张表（1.19.4 实测生效），
-      // 也不会因为漏了某个新工具名而让模型又开始翻文件。
-      tools: { "*": false },
+    agentsLegacy.build = {
+      ...buildLegacy,
+      prompt: systemPrompt,
+      // 发言回合（terse）只换提示、工具照旧；精简回合（lean）连工具一起关。
+      ...(opts.lean ? { tools: { "*": false } } : {}),
     };
-    out.agent = agents;
-  } else if (opts.terse) {
-    // 只换提示、工具照旧（见 DeviceOpencodeConfigOpts.terse）。必须放在 lean 的
-    // else 分支里：需要 JSON 的短回合若被 terse 覆盖了提示，输出就不是 JSON 了。
-    const agents = (out.agent && typeof out.agent === "object" && !Array.isArray(out.agent))
-      ? { ...(out.agent as Record<string, unknown>) }
+    out.agent = agentsLegacy;
+
+    // ---- 2.x 键（agents / system / permissions）----
+    const agentsV2 = (out.agents && typeof out.agents === "object" && !Array.isArray(out.agents))
+      ? { ...(out.agents as Record<string, unknown>) }
       : {};
-    const build = (agents.build && typeof agents.build === "object" && !Array.isArray(agents.build))
-      ? { ...(agents.build as Record<string, unknown>) }
+    const buildV2 = (agentsV2.build && typeof agentsV2.build === "object" && !Array.isArray(agentsV2.build))
+      ? { ...(agentsV2.build as Record<string, unknown>) }
       : {};
-    agents.build = { ...build, prompt: TERSE_AGENT_SYSTEM_PROMPT };
-    out.agent = agents;
+    agentsV2.build = {
+      ...buildV2,
+      system: systemPrompt,
+      // V2 用 permissions 数组按 action 授权；`*` + deny 等价于 1.x 的 tools 全关。
+      // 只对 lean 写：terse 回合要保留工具，否则群里让 agent 干活就用不了了。
+      ...(opts.lean ? { permissions: [{ action: "*", resource: "*", effect: "deny" }] } : {}),
+    };
+    out.agents = agentsV2;
+
+    // ---- 关思考（reasoning）----
+    // lean 回合只要一段 JSON，思考纯属浪费：2.1.x 官方实测「输入 17 token、思考
+    // 3255 字符、出正文 13.5s」—— 段子级任务也是这个量级。对当前 model 注入
+    // reasoningEffort=none（OpenAI 兼容 provider 认识这个字段），并同时兼容
+    // 1.x 的 options 与 2.x 的 settings 两种键位。只作用于派生的精简配置，
+    // 聊天/发言回合那份配置不受影响。
+    if (opts.lean) {
+      disableReasoningForSelectedModel(out, dropped);
+    }
   }
   return { text: JSON.stringify(out, null, 2), dropped };
+}
+
+/**
+ * 在派生的「精简回合」配置里，给当前选中的模型关掉 reasoning/thinking。
+ *
+ * 只动 `model` 指向的那一个 provider/model（不碰其它模型），这样用户在其它
+ * 场景用同一 provider 的其它模型时行为不变。写入三处兼容键：
+ *   · 2.x `providers.<id>.models.<slug>.settings.reasoningEffort = "none"`
+ *   · 1.x `provider.<id>.models.<slug>.options.reasoningEffort = "none"`
+ *   · 顶层 `model` 的 `#none` variant 不了（会影响调用方传来的 model route），
+ *     故不写 variant，只落到 provider/model 配置层。
+ * 另外 opencode 2.x 的模型名可带 `#variant`，先剥掉再匹配。
+ */
+function disableReasoningForSelectedModel(
+  out: Record<string, unknown>,
+  dropped: string[],
+): void {
+  const route = typeof out.model === "string" ? out.model : "";
+  if (!route || !route.includes("/")) return;
+  const [providerID, rest] = route.split("/", 2);
+  const modelID = rest.split("#", 1)[0];
+  if (!providerID || !modelID) return;
+
+  // 2.x：providers.<id>.models.<slug>.settings
+  const providersV2 = (out.providers && typeof out.providers === "object" && !Array.isArray(out.providers))
+    ? (out.providers as Record<string, unknown>)
+    : null;
+  if (providersV2 && providersV2[providerID] && typeof providersV2[providerID] === "object") {
+    const provider = providersV2[providerID] as Record<string, unknown>;
+    const models = (provider.models && typeof provider.models === "object" && !Array.isArray(provider.models))
+      ? (provider.models as Record<string, unknown>)
+      : null;
+    const model = models?.[modelID] as Record<string, unknown> | undefined;
+    if (model && !Array.isArray(model)) {
+      const settings = (model.settings && typeof model.settings === "object" && !Array.isArray(model.settings))
+        ? { ...(model.settings as Record<string, unknown>) }
+        : {};
+      settings.reasoningEffort = "none";
+      model.settings = settings;
+      dropped.push("reasoning:none@" + providerID + "/" + modelID);
+    }
+  }
+
+  // 1.x：provider.<id>.models.<slug>.options
+  const providersV1 = (out.provider && typeof out.provider === "object" && !Array.isArray(out.provider))
+    ? (out.provider as Record<string, unknown>)
+    : null;
+  if (providersV1 && providersV1[providerID] && typeof providersV1[providerID] === "object") {
+    const provider = providersV1[providerID] as Record<string, unknown>;
+    const models = (provider.models && typeof provider.models === "object" && !Array.isArray(provider.models))
+      ? (provider.models as Record<string, unknown>)
+      : null;
+    const model = models?.[modelID] as Record<string, unknown> | undefined;
+    if (model && !Array.isArray(model)) {
+      const options = (model.options && typeof model.options === "object" && !Array.isArray(model.options))
+        ? { ...(model.options as Record<string, unknown>) }
+        : {};
+      options.reasoningEffort = "none";
+      model.options = options;
+    }
+  }
 }
 
 

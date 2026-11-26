@@ -759,6 +759,45 @@ describe("buildDeviceOpencodeConfig lean 回合", () => {
     expect(parsed.tools.read).toBe(false);
     expect(parsed.permission.bash).toBe("deny");
   });
+
+  // opencode 2.1.x 用复数 schema：agents.build.system + permissions，旧的
+  // agent.build.prompt/tools 被忽略。两套都要写，lean 才能在 2.x 真生效。
+  it("2.x schema：写 agents.build.system + 全 deny permissions，并关掉当前模型的思考", () => {
+    const raw2 = JSON.stringify({
+      model: "zhipuai-coding-plan/glm-5.3-flash",
+      providers: {
+        "zhipuai-coding-plan": {
+          models: {
+            "glm-5.3-flash": { settings: { temperature: 0.5 } },
+            "glm-other": { settings: {} },
+          },
+        },
+      },
+      agents: { build: { system: "原系统提示", tools: { bash: true } }, title: {} },
+    });
+    const built = buildDeviceOpencodeConfig(raw2, { lean: true });
+    const parsed = JSON.parse(built!.text);
+    // 2.x 键生效
+    expect(parsed.agents.build.system).toBe(LEAN_AGENT_SYSTEM_PROMPT);
+    expect(parsed.agents.build.permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }]);
+    // 1.x 键同时写，老版本也认
+    expect(parsed.agent.build.prompt).toBe(LEAN_AGENT_SYSTEM_PROMPT);
+    expect(parsed.agent.build.tools).toEqual({ "*": false });
+    // 只关当前 model 的 reasoning，别的 model 不动；原有 settings 保留
+    expect(parsed.providers["zhipuai-coding-plan"].models["glm-5.3-flash"].settings.reasoningEffort).toBe("none");
+    expect(parsed.providers["zhipuai-coding-plan"].models["glm-5.3-flash"].settings.temperature).toBe(0.5);
+    expect(parsed.providers["zhipuai-coding-plan"].models["glm-other"].settings.reasoningEffort).toBeUndefined();
+  });
+
+  it("2.x schema：带 #variant 的模型名也能关掉思考", () => {
+    const raw2 = JSON.stringify({
+      model: "openai/gpt-5.1-codex#low",
+      providers: { openai: { models: { "gpt-5.1-codex": { settings: {} } } } },
+    });
+    const built = buildDeviceOpencodeConfig(raw2, { lean: true });
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.providers.openai.models["gpt-5.1-codex"].settings.reasoningEffort).toBe("none");
+  });
 });
 
 // --- 发言回合：只换 build 系统提示、工具照旧（讨论组/群聊 2026-11-24）
@@ -785,6 +824,20 @@ describe("buildDeviceOpencodeConfig terse 回合", () => {
     const parsed = JSON.parse(built!.text);
     expect(parsed.agent.build.prompt).toBe(LEAN_AGENT_SYSTEM_PROMPT);
     expect(parsed.agent.build.tools).toEqual({ "*": false });
+  });
+
+  it("2.x schema：terse 换 system 但保留工具，不写全 deny、也不关思考", () => {
+    const raw2 = JSON.stringify({
+      model: "quukk/glm-5.2",
+      providers: { quukk: { models: { "glm-5.2": { settings: {} } } } },
+      agents: { build: { system: "原提示", tools: { bash: true } } },
+    });
+    const built = buildDeviceOpencodeConfig(raw2, { terse: true });
+    const parsed = JSON.parse(built!.text);
+    expect(parsed.agents.build.system).toBe(TERSE_AGENT_SYSTEM_PROMPT);
+    // 发言回合要留工具：terse 不写 permissions，也不碰 reasoning
+    expect(parsed.agents.build.permissions).toBeUndefined();
+    expect(parsed.providers.quukk.models["glm-5.2"].settings.reasoningEffort).toBeUndefined();
   });
 
   it("不带 terse 时不动 agent（私聊轮次保持 build 原人格）", () => {
