@@ -452,6 +452,47 @@ describe("private turn timeout fallback", () => {
     }
   });
 
+  it("WEB-039: an ops turn never times out even after 20 silent minutes", async () => {
+    vi.useFakeTimers();
+    try {
+      const sent: Array<{ to: string; objectName: string; content: string }> = [];
+      const streams: string[] = [];
+      const dispatcher = new MessageDispatcher({
+        send: async (to, objectName, content) => { sent.push({ to, objectName, content }); },
+        sendStream: async (_c, _id, _o, content) => { streams.push(content); },
+        agentName: "opencode",
+      });
+      let aborted = false;
+      // 运维轮全程沉默（查版本/翻配置的长命令，activity=0），模拟悬挂。
+      const pending = dispatcher.handle(
+        {
+          ...inbound("user_ops"),
+          content: JSON.stringify({ content: "查 codex 版本", opsAgent: "codex" }),
+        },
+        {
+          runTurn: async () => "unused",
+          runTurnStreamed: (_p, _m, _d, signal) =>
+            new Promise<string>((_resolve, reject) => {
+              signal?.addEventListener("abort", () => {
+                aborted = true;
+                reject(new Error("agent turn aborted"));
+              }, { once: true });
+            }),
+        },
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1_200_000);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(aborted).toBe(false);
+      expect(streams.some((c) => c.includes("\"failed\"") && c.includes("turn_timeout"))).toBe(false);
+      expect(sent.some((f) => f.objectName === "RC:TxtMsg" && f.content.includes("响应超时"))).toBe(false);
+      // 轮次仍在跑是预期结果：运维长命令只能由用户「停止」或服务端取消收尾。
+      void pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("guard never fires for non-private venues (no placeholder in group turns)", async () => {
     vi.useFakeTimers();
     try {
@@ -3207,10 +3248,10 @@ describe("chat_stream 终帧补发", () => {
   })
 });
 
-// 停滞守卫（2026-11-17 现场）：运维回了半句之后彻底不动，前端 3 分钟就提示
-// 「可能卡住」——判据必须是「无进展」，不是「总时长超了」。
-// 2026-11-19 取消固定墙钟后它是唯一的收尾判据，分两档：产出正文后的停滞用
-// 短窗口（240s），全程零产出的僵死（serve 悬挂）用长窗口（600s）。
+// 停滞守卫（2026-11-17 现场）：回了半句之后彻底不动，前端提示「可能卡住」——
+// 判据必须是「无进展」，不是「总时长超了」。2026-11-19 取消固定墙钟后它是
+// 唯一的自动收尾判据：产出正文后 240s、全程零产出 600s。
+// WEB-039（2026-11-26）：运维轮彻底豁免，不再按任何时间窗口自动中止。
 describe("shouldAbortStalledTurn", () => {
   const base = { aborted: false, terminalSent: false, producedText: true, idleMs: 0 };
 
@@ -3251,13 +3292,15 @@ describe("shouldAbortStalledTurn", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, runningToolMs: 0 })).toBe(true);
   });
 
-  // WEB-39 二次修复（2026-11-25 傍晚）：部分运维轮全程 activity=0（不吐工具步骤），
-  // 落不到「有 running 步骤」那一档，仍会被 240s 增量窗口掐掉。
-  it("运维轮（无 activity）不再按 240s 判卡死，放宽到 15 分钟", () => {
+  // WEB-39 三次修复（2026-11-26）：15 分钟窗口仍挡不住入口标记缺失导致的误杀，
+  // 运维轮改为彻底豁免 —— 无论 idle 多久、有没有 running 工具都不自动中止。
+  it("运维轮永不因停滞被自动中止", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000, opsTurn: true })).toBe(false);
     expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, opsTurn: true })).toBe(false);
     expect(shouldAbortStalledTurn({ ...base, producedText: false, idleMs: 600_000, opsTurn: true })).toBe(false);
-    expect(shouldAbortStalledTurn({ ...base, idleMs: 900_000, opsTurn: true })).toBe(true);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 900_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 3_600_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 3_600_000, runningToolMs: 3_600_000, opsTurn: true })).toBe(false);
   });
 
   it("非运维轮的窗口不受影响", () => {
@@ -3273,10 +3316,19 @@ describe("isOpsTurn", () => {
     expect(isOpsTurn({ conversationId: "om_node1" })).toBe(true);
   });
 
+  it("入口标记丢失时仍认运维作用域抬头与分桶会话键", () => {
+    // 私聊守卫拿到的是发送方用户 id，不是 ops 节点 id —— 这两条才是真兜底。
+    expect(isOpsTurn({ conversationId: "user_a", prompt: "【运维对象】codex\n\n查版本" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "user_a", prompt: "  【运维对象】未指定\n\n查版本" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "user_a", sessionKey: "cm-private-user_a#codex" })).toBe(true);
+  });
+
   it("普通私聊/群聊不算运维轮", () => {
     expect(isOpsTurn({ conversationId: "user-1" })).toBe(false);
     expect(isOpsTurn({ opsAgent: "  ", conversationId: "group_9" })).toBe(false);
     expect(isOpsTurn({})).toBe(false);
+    expect(isOpsTurn({ conversationId: "user-1", prompt: "普通问题" })).toBe(false);
+    expect(isOpsTurn({ conversationId: "user-1", sessionKey: "cm-private-user-1" })).toBe(false);
   });
 });
 

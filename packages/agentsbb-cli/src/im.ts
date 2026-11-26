@@ -490,25 +490,35 @@ export const PRIVATE_TURN_SILENT_STALL_MS = 600_000;
  */
 export const PRIVATE_TURN_TOOL_RUNNING_STALL_MS = 1_800_000;
 
-/**
- * 「运维轮」的停滞窗口（WEB-39 第二次修复，2026-11-25 傍晚）。
- *
- * 前一版只修了「有 running 工具步骤」这一路（PRIVATE_TURN_TOOL_RUNNING_STALL_MS），
- * 但现场证据表明并非所有运维轮都会上报 activity：`relaunch.log` 里部分 ops 轮次
- * 全程 `activity=0`（codex 的某些执行路径只吐正文/思考，不吐工具步骤），这类轮次
- * 落不到长窗口上，仍按 240s（已产正文）/600s（零产出）判 —— 「运维老是超时」
- * 就是这么来的：用户让它查版本、翻配置，它先说一句「我看一下」然后闷头跑命令，
- * 240s 一到就被掐，前端弹「本轮执行超时，已中止」。
- *
- * 所以运维轮单独放宽到 15 分钟：运维本来就是几分钟级的重活（装依赖、跑构建、
- * 批量检查），而它的『停不下来』风险由用户显式「停止」和服务端取消兜住 ——
- * 等错了只是慢，掐早了却要用户重来一遍（还要重跑那 4 分钟的命令）。
- */
-export const PRIVATE_TURN_OPS_STALL_MS = 900_000;
+/** 机器级运维轮在 prompt 前注入的作用域抬头（见 ops-scope.ts 的 opsScopeHeader）。 */
+const OPS_SCOPE_PROMPT_PREFIX = "【运维对象】";
 
-/** 这一轮是不是运维轮：优先看派发信封的 opsAgent，再退回会话 id 的两种运维形态。 */
-export function isOpsTurn(input: { opsAgent?: string | null; conversationId?: string }): boolean {
+/**
+ * 运维轮**不再受无进展停滞守卫自动中止**（WEB-039 第三次修复，2026-11-26）。
+ *
+ * 前两轮先后加了「工具有 running 步骤时 30 分钟」和「运维轮 15 分钟」两档窗口，
+ * 回归仍报「运维老是超时」。原因是识别链路不可靠：私聊守卫拿到的
+ * `conversationId` 是**发送方用户 id**，不是 ops 节点 id，`_ops/ops_/om_` 兜底
+ * 恒不命中；一旦消息没带 `opsAgent`（老会话、会话名被改、服务端代理链路），
+ * 运维轮就退回 240s/600s 被掐，哪怕它正在跑一条几分钟的命令。
+ *
+ * 与其继续调窗口，直接让运维轮豁免停滞守卫：运维本来就是几分钟级的重活
+ * （装依赖、跑构建、批量检查），长命令期间没有增量是常态；它的「停不下来」
+ * 风险由用户显式「停止」和服务端取消兜住 —— 等错了只是慢，掐早了要用户
+ * 重跑那几分钟的命令。
+ */
+export function isOpsTurn(input: {
+  opsAgent?: string | null;
+  conversationId?: string;
+  /** 本轮实际交给 agent 的 prompt；机器级 ops 会带作用域抬头。 */
+  prompt?: string;
+  /** 私聊会话键；运维入口带 entryAgent 时会按 `#<agent>` 分桶。 */
+  sessionKey?: string;
+}): boolean {
   if (input.opsAgent && input.opsAgent.trim() !== "") return true;
+  if (input.prompt?.trimStart().startsWith(OPS_SCOPE_PROMPT_PREFIX)) return true;
+  // privateSessionKey 只有运维入口才带 `#<agent>` 分桶后缀；普通私聊不带。
+  if (/#[^#]+$/.test(input.sessionKey ?? "")) return true;
   const id = input.conversationId ?? "";
   return /_ops$/.test(id) || id.startsWith("ops_") || id.startsWith("om_");
 }
@@ -517,6 +527,7 @@ export function isOpsTurn(input: { opsAgent?: string | null; conversationId?: st
  * 停滞守卫的判定（纯函数，便于单测）。
  *
  * 判据只看「有没有进展」，不看总时长：
+ *   - 运维轮（`opsTurn`）：**永不自动中止**，收尾只认用户停止 / 服务端取消（见上）；
  *   - 有工具正在跑（`runningToolMs` > 0）：按 PRIVATE_TURN_TOOL_RUNNING_STALL_MS
  *     判，工具执行期间没有增量是常态（见上）；
  *   - 已产出过正文：连续 stallMs（默认 PRIVATE_TURN_STALL_MS）无进展 → 掐；
@@ -531,19 +542,19 @@ export function shouldAbortStalledTurn(input: {
   stallMs?: number;
   /** 仍在运行的工具已经跑了多久（ms）；undefined/0 = 当前没有跑着的工具。 */
   runningToolMs?: number;
-  /** 运维轮：窗口整体放宽到 PRIVATE_TURN_OPS_STALL_MS（见该常量的注释）。 */
+  /** 运维轮：豁免停滞守卫，不会被自动判超时。 */
   opsTurn?: boolean;
 }): boolean {
   if (input.aborted || input.terminalSent) return false;
+  // WEB-039：运维轮豁免。放在 runningToolMs 分支之前，确保 activity=0 的
+  // 运维轮和长工具步骤都不会再被任何时间窗口掐断。
+  if (input.opsTurn) return false;
   if (input.runningToolMs !== undefined && input.runningToolMs > 0) {
     return input.runningToolMs >= PRIVATE_TURN_TOOL_RUNNING_STALL_MS;
   }
-  const baseWindow = input.producedText
+  const windowMs = input.producedText
     ? (input.stallMs ?? PRIVATE_TURN_STALL_MS)
     : PRIVATE_TURN_SILENT_STALL_MS;
-  const windowMs = input.opsTurn
-    ? Math.max(baseWindow, PRIVATE_TURN_OPS_STALL_MS)
-    : baseWindow;
   return input.idleMs >= windowMs;
 }
 
@@ -1376,8 +1387,9 @@ export class MessageDispatcher {
     //  零输出僵死的兜底由下面的停滞守卫第二档 PRIVATE_TURN_SILENT_STALL_MS 承担。）
     // 停滞守卫（仅私聊）：判据只看「有没有进展」，不看总时长 —— 正文产出后的
     // 停滞用短窗口（PRIVATE_TURN_STALL_MS），全程无产出的僵死用长窗口
-    // （PRIVATE_TURN_SILENT_STALL_MS）。运维跑长命令时工具步骤会持续上报，
-    // 不停推进的轮次不会被这里掐掉。
+    // （PRIVATE_TURN_SILENT_STALL_MS）。运维轮直接豁免（WEB-039）：长命令期间
+    // 没有增量是常态，窗口怎么调都挡不住入口标记缺失时的误杀，收尾交给用户
+    // 「停止」和服务端取消。
     const stallTimer: ReturnType<typeof setInterval> | null = ctx.conversationType === 1
       ? setInterval(() => {
           try {
@@ -1398,7 +1410,12 @@ export class MessageDispatcher {
               producedText,
               idleMs,
               runningToolMs,
-              opsTurn: isOpsTurn({ opsAgent: opts.opsAgent, conversationId: ctx.conversationId }),
+              opsTurn: isOpsTurn({
+                opsAgent: opts.opsAgent,
+                conversationId: ctx.conversationId,
+                prompt: opts.prompt,
+                sessionKey: opts.sessionKey,
+              }),
             })) return;
             terminalSent = true;
             console.error(
