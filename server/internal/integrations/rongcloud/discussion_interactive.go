@@ -240,6 +240,14 @@ func interactiveRoles(d DiscussionRecord) (ordinary []interactiveRole, host inte
 }
 
 // interactiveHostPrompt 取主持人提示词（host_config_snapshot.discussion_host_prompt）。
+// interactiveHostConsensusRule 是主持人的**运行时**共识纪律。
+//
+// 存量讨论组的人设是建组时的快照，改常量只影响新建的组；把纪律放在派发时
+// 现拼，存量组下一轮就生效（WEB-054 复测实锤：QA 复测的正是建组更早的那一场）。
+const interactiveHostConsensusRule = "【纪实纪律】只有成员**明确表态**（明说接受 / 同意 / 认可某个结论）才写进共识，" +
+	"并注明是谁在哪一轮说的；只补材料、继续论述、没有表态的，一律不算共识，写进分歧或未决，必要时直接写「未明确表态」。" +
+	"「没有反对」「未表异议」不等于同意，不得据此归纳共识；用户设定的讨论口径与成员实际达成的结论要分开写，不要混成一句。"
+
 func interactiveHostPrompt(d DiscussionRecord) string {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(d.HostConfigSnapshot, &raw); err != nil {
@@ -1012,6 +1020,10 @@ func (rt *discussionRuntime) interactiveBuildPrompt(d DiscussionRecord, role int
 		parts = append(parts, role.RoleInstructions)
 	}
 	if role.IsHost {
+		// WEB-054 复测：主持人的人设是**建组时**快照下来的，老讨论组里存的还是
+		// 没有共识纪律的那一版 —— 只改 roundtableHostInstructions 救不了存量组，
+		// 而 QA 复测的正是存量组。所以这条纪律改成每次派发时现拼，不进快照。
+		parts = append(parts, interactiveHostConsensusRule)
 		if hostPrompt := interactiveHostPrompt(d); hostPrompt != "" {
 			parts = append(parts, hostPrompt)
 		}

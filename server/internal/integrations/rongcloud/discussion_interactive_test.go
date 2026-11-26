@@ -924,3 +924,24 @@ func TestInteractiveHostTaskOnlyCountsExplicitAgreement(t *testing.T) {
 		}
 	}
 }
+
+// WEB-054 复测：存量讨论组的人设是建组时的快照，改 roundtableHostInstructions
+// 只影响新建的组。纪律必须每次派发时现拼 —— 主持人拿到、普通成员不拿。
+func TestInteractiveBuildPrompt_InjectsHostConsensusRuleAtDispatchTime(t *testing.T) {
+	d := DiscussionRecord{Topic: "人类是怎么诞生的", Goal: "达成可检验口径", CurrentRound: 3}
+	rt := &discussionRuntime{}
+
+	host := rt.interactiveBuildPrompt(d, interactiveRole{MemberID: "h", RoleName: "主持人", IsHost: true},
+		"本轮（第 3 轮）所有成员已发言完毕。", nil, interactiveHistory{})
+	for _, want := range []string{"【纪实纪律】", "未明确表态", "不等于同意"} {
+		if !strings.Contains(host, want) {
+			t.Errorf("host prompt missing %q:\n%s", want, host)
+		}
+	}
+
+	member := rt.interactiveBuildPrompt(d, interactiveRole{MemberID: "m1", RoleName: "成员"},
+		"这是第 3 轮（交叉质询）。", nil, interactiveHistory{})
+	if strings.Contains(member, "【纪实纪律】") {
+		t.Errorf("consensus rule must not leak into ordinary members' prompt:\n%s", member)
+	}
+}
