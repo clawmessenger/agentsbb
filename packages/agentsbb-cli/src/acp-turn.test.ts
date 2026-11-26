@@ -365,6 +365,37 @@ describe("runAcpTurn", () => {
     expect(reply?.result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
   });
 
+  it("defers the permission reply to onPermissionRequest and uses the user's choice", async () => {
+    const fixture = writeServer("permission-deferred", {
+      askPermission: true,
+      updates: [textChunk("done")],
+    });
+
+    let captured: { permission: string; choices: Array<{ optionId: string; label: string; reply: string }> } | null = null;
+    const answer = await runAcpTurn({
+      execPath: process.execPath,
+      spec: spec({ args: [fixture.path] }),
+      prompt: "写个文件",
+      timeoutMs: 20_000,
+      // 关键：开启二次确认回调后，acp-turn 不得自动批准；只有我们显式
+      // replyOptionId('deny_once') 用户选择（这里是拒绝），agent 才继续。
+      onPermissionRequest: (req) => {
+        captured = { permission: req.permission, choices: req.choices };
+        req.replyOptionId("deny_once");
+      },
+    });
+
+    expect(answer).toContain("done");
+    expect(captured).not.toBeNull();
+    expect(captured!.permission).toBe("write file");
+    expect(captured!.choices.map((c) => c.reply)).toEqual(["once", "reject"]);
+    // agent 收到的必须是用户选的 deny_once，而不是旧的自动 allow_once。
+    const reply = readLog(fixture).find((entry) => entry.method === "permission-reply");
+    expect(reply?.result).toEqual({ outcome: { outcome: "selected", optionId: "deny_once" } });
+    // 一次请求只回写一次：第二条 permission-reply 不应出现。
+    expect(readLog(fixture).filter((e) => e.method === "permission-reply").length).toBe(1);
+  });
+
   it("applies the session config options before switching models (dim)", async () => {
     const fixture = writeServer("config-options");
     await runAcpTurn({

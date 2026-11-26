@@ -81,6 +81,18 @@ export interface RunAgentTurnOpts {
   // 与 text/reasoning 同语义 —— 调用方只管存最新的那份。仅 stream-json 型
   // agent（claude/codex）会产生，其余 agent 一次都不回调。
   onActivity?: (steps: ActivityStep[]) => void;
+  /**
+   * 单聊二次确认（仅 ACP 类 agent 生效）：把权限请求抛给调用方，用户点选后
+   * 通过 replyOptionId 回写。未设置 = 维持自动批准。类型与 acp-turn 一致，
+   * 在此重复声明是为了避免 agents.ts 反向依赖 acp-turn 的内部类型。
+   */
+  onPermissionRequest?: (req: {
+    id: string;
+    permission: string;
+    choices: Array<{ optionId: string; label: string; reply: "once" | "always" | "reject" }>;
+    replyOptionId: (optionId: string) => void;
+    reject: () => void;
+  }) => void;
   signal?: AbortSignal;
   // 会话隔离键（可选）。多个会话形态共用同一个 agent 二进制，而 agent CLI
   // 默认把它们全塞进自己的「主会话」：openclaw 的默认键就是 agent:main:main，
@@ -2750,6 +2762,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       ...(opts.onReasoningChunk ? { onReasoningChunk: opts.onReasoningChunk } : {}),
       ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
       ...(opts.onSessionId ? { onSessionId: opts.onSessionId } : {}),
+      ...(opts.onPermissionRequest ? { onPermissionRequest: opts.onPermissionRequest } : {}),
       logger: (message) => console.warn(message),
     }).catch((err: unknown) => {
       if (!(err instanceof AcpStartupError) || opts.disableAcp) throw err;

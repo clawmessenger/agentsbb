@@ -3407,3 +3407,113 @@ describe("MessageDispatcher 群聊/讨论组的新开会话（广播）", () => 
     expect(called).toBe(0);
   });
 });
+
+describe("MessageDispatcher 单聊二次确认", () => {
+  function permCardAction(permissionId: string, reply: string, fromUserId = "user-1", conversationType = 1) {
+    return {
+      objectName: "card_action",
+      fromUserId,
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType,
+      content: JSON.stringify({
+        cardId: permissionId,
+        action: { type: "permission", permissionId, reply },
+      }),
+    };
+  }
+
+  it("发出 permission 卡片，用户点选后把选择回灌给 agent 并更新卡片", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let repliedOption: string | null = null;
+
+    // 私聊触发 agent；runTurnStreamed 收到我们注入的 onPermissionRequest 后
+    // 登记 pending + 发卡片。这里在回调里不立即答复，模拟"等用户点"。
+    const run = dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "帮我删个文件" }),
+    }, {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        opts?.onPermissionRequest?.({
+          id: "900",
+          permission: "delete file",
+          choices: [
+            { optionId: "allow_once", label: "允许一次", reply: "once" },
+            { optionId: "deny_once", label: "拒绝", reply: "reject" },
+          ],
+          replyOptionId: (optionId) => { repliedOption = optionId; },
+          reject: () => { repliedOption = "rejected"; },
+        });
+        return "done";
+      },
+    });
+    await run;
+
+    // 卡片已发出（含 permission section）。
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const permSection = card.sections.find((s: { kind: string }) => s.kind === "permission");
+    expect(permSection.permission).toBe("delete file");
+    expect(repliedOption).toBeNull(); // 还没点，不能提前回灌
+
+    // 用户点"拒绝" → 回灌 deny_once，并发 card_update。
+    await dispatcher.handle(permCardAction(permSection.permissionId, "reject"), {
+      runTurn: async () => "should not be used",
+    });
+    expect(repliedOption).toBe("deny_once");
+    const update = deps.sent.find((s) => s.objectName === "card_update");
+    expect(update).toBeDefined();
+  });
+
+  it("拒绝跨用户与重复点击：只有发起者能决策，且只回灌一次", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let replyCount = 0;
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "删文件" }),
+    }, {
+      runTurn: async (_p, _m, _sk, opts) => {
+        opts?.onPermissionRequest?.({
+          id: "901",
+          permission: "delete",
+          choices: [{ optionId: "allow_once", label: "允许一次", reply: "once" }],
+          replyOptionId: () => { replyCount += 1; },
+          reject: () => {},
+        });
+        return "done";
+      },
+    });
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message")!;
+    const permSection = JSON.parse(cardMsg.content).card.sections.find((s: { kind: string }) => s.kind === "permission");
+
+    // 别的用户点 → 不回灌
+    await dispatcher.handle(permCardAction(permSection.permissionId, "once", "user-2"), { runTurn: async () => "" });
+    expect(replyCount).toBe(0);
+    // 发起者点 → 回灌一次
+    await dispatcher.handle(permCardAction(permSection.permissionId, "once"), { runTurn: async () => "" });
+    expect(replyCount).toBe(1);
+    // 重复点（离线重放）→ 不二次回灌
+    await dispatcher.handle(permCardAction(permSection.permissionId, "once"), { runTurn: async () => "" });
+    expect(replyCount).toBe(1);
+  });
+
+  it("群聊的 permission card_action 被忽略（范围仅限单聊）", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(permCardAction("perm-x", "once", "user-1", 3), {
+      runTurn: async () => "",
+    });
+    expect(deps.sent.length).toBe(0);
+  });
+});

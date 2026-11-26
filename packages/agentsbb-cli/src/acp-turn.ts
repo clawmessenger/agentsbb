@@ -3,6 +3,7 @@ import { resolve as resolvePath } from "node:path";
 
 import { createActivityTracker, type ActivityStep } from "./agent-activity.js";
 import { buildSpawnInvocation, killProcessTree } from "./agents.js";
+import { mapAcpOptionsToChoices } from "./interaction.js";
 
 // ACP turn 通道（设备端）。
 //
@@ -69,6 +70,19 @@ export interface AcpTurnOpts {
   onReasoningChunk?: (chunk: string) => void;
   onActivity?: (steps: ActivityStep[]) => void;
   onSessionId?: (sessionId: string) => void;
+  /**
+   * 单聊二次确认：收到 session/request_permission 时不自动批准，把选项抛给调用方。
+   * 回调里：id 是 ACP 请求 id（作 permissionId），choices 是映射好的三按钮，
+   * replyOptionId(optionId) 用来在用户点选后回写给 agent（延后的那次 write）。
+   * 未设置 = 维持旧的自动批准行为（群聊/讨论组/运维轮次不受影响）。
+   */
+  onPermissionRequest?: (req: {
+    id: string;
+    permission: string;
+    choices: Array<{ optionId: string; label: string; reply: "once" | "always" | "reject" }>;
+    replyOptionId: (optionId: string) => void;
+    reject: () => void;
+  }) => void;
   logger?: (message: string) => void;
   /** 测试注入点。 */
   spawnImpl?: typeof spawn;
@@ -567,10 +581,64 @@ export function runAcpTurn(opts: AcpTurnOpts): Promise<string> {
       write({ jsonrpc: "2.0", id, error: { code, message } });
     };
 
+    // 延后回复的守卫：用户点选回调可能晚到（进程已关/权限已应答），重复 write
+    // 一个已结束的 JSON-RPC id 没有意义。按请求 id 追踪，一轮多次权限请求互不干扰。
+    const permissionReplied = new Set<string>();
+    const sendPermissionReply = (id: unknown, optionId: string | null): void => {
+      const key = String(id ?? "");
+      if (permissionReplied.has(key)) return;
+      permissionReplied.add(key);
+      if (optionId === null) {
+        replyError(id, -32603, "permission request rejected by user");
+        return;
+      }
+      write({
+        jsonrpc: "2.0",
+        id,
+        result: { outcome: { outcome: "selected", optionId } },
+      });
+    };
+
     const handleAgentRequest = (msg: Record<string, unknown>): void => {
       const method = asString(msg.method);
       const id = msg.id;
       if (method === "session/request_permission") {
+        // 单聊：把选择权交给用户。agent 会一直阻塞等这个 JSON-RPC 的回复，
+        // 所以这里的 write 必须延后到 onPermissionRequest 的回调里发出。
+        if (opts.onPermissionRequest) {
+          const record = asRecord(msg.params);
+          const rawOptions = Array.isArray(record?.options)
+            ? (record!.options as unknown[])
+              .map((item) => asRecord(item))
+              .filter((item): item is Record<string, unknown> => item !== null)
+              .map((item) => ({ optionId: asString(item.optionId), kind: asString(item.kind) }))
+              .filter((item) => item.optionId.length > 0)
+            : [];
+          const choices = mapAcpOptionsToChoices(rawOptions);
+          // fsRestricted 仍需强制拒绝：只读会话不该因为开了二次确认就能写盘。
+          if (opts.fsRestricted || !choices) {
+            const fallback = selectAcpPermissionOption(msg.params, {
+              ...(opts.fsRestricted ? { fsRestricted: true } : {}),
+            });
+            sendPermissionReply(id, fallback?.optionId ?? null);
+            return;
+          }
+          const toolCall = record ? asRecord(record.toolCall) : null;
+          const permission = asString(toolCall?.title)
+            || asString(toolCall?.name)
+            || asString(record?.title)
+            || asString(record?.description)
+            || "执行一个操作";
+          opts.onPermissionRequest({
+            id: String(id ?? ""),
+            permission,
+            choices,
+            replyOptionId: (optionId) => sendPermissionReply(id, optionId),
+            reject: () => sendPermissionReply(id, null),
+          });
+          return;
+        }
+        // 未开二次确认（群聊/讨论组/运维）：维持原自动批准行为。
         const choice = selectAcpPermissionOption(msg.params, {
           ...(opts.fsRestricted ? { fsRestricted: true } : {}),
         });
