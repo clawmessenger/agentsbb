@@ -58,6 +58,70 @@ export interface PendingInteraction {
   timer: ReturnType<typeof setTimeout>;
   /** 融云离线重放去重：已消费的交互不再二次回灌。 */
   consumed: boolean;
+  /**
+   * permission 的回灌方式：
+   *  - protocol：ACP 真协议，选择映射回 optionId 写回阻塞中的 agent；
+   *  - soft：headless 降级，选择作为新一轮用户输入续流。
+   */
+  permissionMode?: "protocol" | "soft";
+}
+
+// ---- 指令层软确认协议（headless agent 无双向控制通道时的降级方案） --------
+
+/**
+ * 注入私聊 behaviorPrompt 的指令：让 agent 在执行不可逆/敏感操作前主动输出
+ * permission 标记并停下来。headless 的 -p/exec/run 一次性调用没有 stdin 双向
+ * 通道，无法像 ACP 那样在协议层阻塞等待；这是唯一对所有 headless agent 都
+ * 生效、且不依赖真机抓包各家控制协议的方案。
+ */
+export const PERMISSION_PROTOCOL_INSTRUCTION = [
+  "【操作确认协议】",
+  "当你准备执行删除文件、发送消息、支付、修改系统设置或其它不可逆/敏感操作时，",
+  "不要直接执行；先在回复末尾另起一段输出如下标记，然后停止本轮（不要继续执行该操作）：",
+  '[interaction:permission] {"permission":"用一句话说明你要执行的操作","options":[{"reply":"once","label":"允许一次"},{"reply":"always","label":"始终允许"},{"reply":"reject","label":"拒绝"}]} [/interaction]',
+  "用户选择后会把决定作为新消息发给你：若允许则继续执行该操作，若拒绝则取消并说明。",
+].join("\n");
+
+const PERMISSION_MARKER_RE = /\[interaction:permission\]\s*([\s\S]*?)\s*\[\/interaction\]/g;
+
+export interface ParsedPermission {
+  permission: string;
+  choices: Array<{ optionId: string; label: string; reply: "once" | "always" | "reject" }>;
+}
+
+/** 从正文解析 headless 的 permission 软确认标记。坏标记静默跳过。 */
+export function parsePermissionMarkers(text: string): ParsedPermission[] {
+  if (!text) return [];
+  const out: ParsedPermission[] = [];
+  let match: RegExpExecArray | null;
+  PERMISSION_MARKER_RE.lastIndex = 0;
+  while ((match = PERMISSION_MARKER_RE.exec(text)) !== null) {
+    try {
+      const raw = JSON.parse(match[1] ?? "") as Record<string, unknown>;
+      const permission = typeof raw.permission === "string" ? raw.permission.trim() : "";
+      const rawOptions = Array.isArray(raw.options) ? raw.options : [];
+      const choices = rawOptions
+        .map((item) => {
+          const o = item as Record<string, unknown>;
+          const reply = typeof o.reply === "string" ? o.reply.trim() : "";
+          if (reply !== "once" && reply !== "always" && reply !== "reject") return null;
+          const label = typeof o.label === "string" && o.label.trim() ? o.label.trim() : reply;
+          // optionId 就用 reply：软确认没有真实协议 id，回灌时按 reply 续流。
+          return { optionId: reply, label, reply };
+        })
+        .filter((c): c is { optionId: string; label: string; reply: "once" | "always" | "reject" } => c !== null);
+      if (!permission || choices.length === 0) continue;
+      out.push({ permission, choices });
+    } catch {
+      // 坏标记：跳过。
+    }
+  }
+  return out;
+}
+
+/** 从正文剥掉 permission 标记，避免把协议原文上屏。 */
+export function stripPermissionMarkers(text: string): string {
+  return text.replace(PERMISSION_MARKER_RE, "").trim();
 }
 
 // ---- 选项提问的文本标记协议 ------------------------------------------------

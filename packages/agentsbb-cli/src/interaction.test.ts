@@ -4,7 +4,10 @@ import {
   buildPermissionCard,
   buildQuestionCard,
   mapAcpOptionsToChoices,
+  parsePermissionMarkers,
   parseQuestionMarkers,
+  PERMISSION_PROTOCOL_INSTRUCTION,
+  stripPermissionMarkers,
   resolvePermissionOptionId,
   stripQuestionMarkers,
 } from "./interaction.js";
@@ -95,5 +98,32 @@ describe("question markers", () => {
     const text = '[interaction:question] not json [/interaction] 正文保留';
     expect(parseQuestionMarkers(text).length).toBe(0);
     expect(stripQuestionMarkers(text)).toContain("正文保留");
+  });
+});
+
+
+describe("headless soft permission markers", () => {
+  it("parses a permission marker with three choices and strips it from text", () => {
+    const text = [
+      "我准备删除临时文件。",
+      '[interaction:permission] {"permission":"删除 /tmp/a.txt","options":[{"reply":"once","label":"允许一次"},{"reply":"always","label":"始终允许"},{"reply":"reject","label":"拒绝"}]} [/interaction]',
+    ].join("\n");
+    const parsed = parsePermissionMarkers(text);
+    expect(parsed.length).toBe(1);
+    expect(parsed[0]!.permission).toBe("删除 /tmp/a.txt");
+    expect(parsed[0]!.choices.map((c) => c.reply)).toEqual(["once", "always", "reject"]);
+    const stripped = stripPermissionMarkers(text);
+    expect(stripped).not.toContain("interaction:permission");
+    expect(stripped).toContain("我准备删除临时文件");
+  });
+
+  it("ignores malformed permission markers", () => {
+    expect(parsePermissionMarkers('[interaction:permission] bad [/interaction]').length).toBe(0);
+    expect(parsePermissionMarkers('[interaction:permission] {"permission":"x","options":[]} [/interaction]').length).toBe(0);
+  });
+
+  it("instruction tells the agent to output the marker and stop", () => {
+    expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("[interaction:permission]");
+    expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("停止本轮");
   });
 });

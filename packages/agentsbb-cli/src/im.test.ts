@@ -3517,3 +3517,50 @@ describe("MessageDispatcher 单聊二次确认", () => {
     expect(deps.sent.length).toBe(0);
   });
 });
+
+describe("MessageDispatcher headless 软确认", () => {
+  it("agent 输出 permission 标记时发卡片，用户点允许后续流继续执行", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const prompts: string[] = [];
+
+    const marker = '[interaction:permission] {"permission":"删除 /tmp/a.txt","options":[{"reply":"once","label":"允许一次"},{"reply":"reject","label":"拒绝"}]} [/interaction]';
+    // 降级路径（无 sendStream）：runTurn 返回带标记的正文。
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "删掉临时文件" }),
+    }, {
+      runTurn: async () => `我准备删除该文件。\n${marker}`,
+    });
+
+    // 卡片已发出，且标记未上屏（fallback 的整包文本被剥掉标记）。
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const permSection = card.sections.find((s: { kind: string }) => s.kind === "permission");
+    expect(permSection.permission).toBe("删除 /tmp/a.txt");
+    const delivered = deps.sent.find((s) => s.objectName === "RC:TxtMsg");
+    expect(delivered?.content).not.toContain("interaction:permission");
+
+    // 用户点「允许一次」→ 续流，续流提示词含用户决定。
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "permission", permissionId: permSection.permissionId, reply: "once" },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "已删除。"; },
+    });
+    expect(prompts.length).toBe(1);
+    expect(prompts[0]).toContain("允许一次");
+    expect(prompts[0]).toContain("继续执行");
+  });
+});

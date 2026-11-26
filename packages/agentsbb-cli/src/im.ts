@@ -2,6 +2,7 @@ import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
+import { acpTurnSpecFor } from "./agent-acp-providers.js";
 import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type WorkdirSnapshot } from "./artifacts.js";
 import type { ActivityStep } from "./agent-activity.js";
 import type { AnsweredTurn, AnsweredTurnStore } from "./answered-turns.js";
@@ -17,8 +18,12 @@ import {
   buildPermissionCard,
   buildQuestionCard,
   mapAcpOptionsToChoices,
+  parsePermissionMarkers,
   parseQuestionMarkers,
+  PERMISSION_PROTOCOL_INSTRUCTION,
+  type ParsedPermission,
   resolvePermissionOptionId,
+  stripPermissionMarkers,
   stripQuestionMarkers,
   type InteractionReply,
   type PendingInteraction,
@@ -899,7 +904,18 @@ export class MessageDispatcher {
         sessionKey: privateSessionKey,
         // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
         // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
-        turnOptions: gate.behaviorPrompt ? { behaviorPrompt: gate.behaviorPrompt } : {},
+        // headless agent 无 ACP 双向权限通道：追加操作确认协议指令，让它在
+        // 敏感操作前输出标记并停下（软确认）。ACP agent 走真协议，不注入。
+        turnOptions: (() => {
+          const behaviorPrompt = gate.behaviorPrompt || "";
+          // 只有明确是 headless agent（有名字且非 ACP）才注入软确认指令；agentName
+          // 缺省（测试夹具/未指定执行器）时不注入，避免误伤既有行为契约。
+          const headless = Boolean(this.deps.agentName) && !acpTurnSpecFor(this.deps.agentName);
+          const withProtocol = headless
+            ? [behaviorPrompt, PERMISSION_PROTOCOL_INSTRUCTION].filter(Boolean).join("\n\n---\n\n")
+            : behaviorPrompt;
+          return withProtocol ? { behaviorPrompt: withProtocol } : {};
+        })(),
         // 运维入口 agent：随流帧与整包回包带回去，web 端据此把回复归属到
         // 对应 agent 的运维面板（会话按入口 agent 分桶的另一半）。
         opsAgent: entryAgent,
@@ -1450,16 +1466,10 @@ export class MessageDispatcher {
           const uploaded = await this.collectArtifacts(artifactSnapshot);
           let plainText = this.ensureVisibleReply(out, uploaded);
           if (ctx.conversationType === 1) {
-            const questions = parseQuestionMarkers(plainText);
-            if (questions.length > 0) {
-              plainText = stripQuestionMarkers(plainText);
-              for (const q of questions) {
-                this.registerQuestionInteraction(q, {
-                  requesterId: ctx.requesterId,
-                  sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
-                });
-              }
-            }
+            plainText = this.emitInteractionCardsFromText(plainText, {
+              requesterId: ctx.requesterId,
+              sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+            });
           }
           await opts.fallback(plainText);
           await this.sendArtifactMessages(ctx, uploaded);
@@ -1646,20 +1656,14 @@ export class MessageDispatcher {
       // （lib/ai-message-lifecycle.ts 的 streamEchoIndex），两者正文一旦不同，
       // 群里就会出现一对重复气泡。
       const uploaded = await this.collectArtifacts(artifactSnapshot);
-      // 单聊选项提问：agent 正文里的 [interaction:question] 标记解析成 question
-      // 卡片，并把协议原文从正文剥掉（不把标记上屏）。
+      // 单聊二次确认：agent 正文里的 permission / question 标记解析成交互卡片，
+      // 并把协议原文从正文剥掉（不把标记上屏）。
       let visibleText = this.ensureVisibleReply(finalText || snapshot, uploaded);
       if (ctx.conversationType === 1) {
-        const questions = parseQuestionMarkers(visibleText);
-        if (questions.length > 0) {
-          visibleText = stripQuestionMarkers(visibleText);
-          for (const q of questions) {
-            this.registerQuestionInteraction(q, {
-              requesterId: ctx.requesterId,
-              sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
-            });
-          }
-        }
+        visibleText = this.emitInteractionCardsFromText(visibleText, {
+          requesterId: ctx.requesterId,
+          sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+        });
       }
       // 每轮一行诊断（不含正文）：排查「某个会话看不到思考/过程」时先看这里
       // —— 设备端唯一一处把三路快照的长度写进日志的地方。reasoning=0 说明
@@ -2506,6 +2510,70 @@ export class MessageDispatcher {
       expiresAt: Date.now() + MessageDispatcher.INTERACTION_TTL_MS,
       timer,
       consumed: false,
+      permissionMode: "protocol",
+    });
+    void this.deps.send(
+      ctx.requesterId,
+      "card_message",
+      JSON.stringify({ msg_type: "card_message", card: buildPermissionCard(request) }),
+    );
+    return permissionId;
+  }
+
+  /**
+   * 从 agent 正文中解析 permission / question 标记并注册交互卡片，返回剥掉
+   * 标记后的正文。仅单聊调用；流式与非流式降级路径共用。
+   */
+  private emitInteractionCardsFromText(
+    text: string,
+    ctx: { requesterId: string; sessionKey: string },
+  ): string {
+    let out = text;
+    const permissions = parsePermissionMarkers(out);
+    if (permissions.length > 0) {
+      out = stripPermissionMarkers(out);
+      for (const p of permissions) this.registerSoftPermissionInteraction(p, ctx);
+    }
+    const questions = parseQuestionMarkers(out);
+    if (questions.length > 0) {
+      out = stripQuestionMarkers(out);
+      for (const q of questions) this.registerQuestionInteraction(q, ctx);
+    }
+    return out;
+  }
+
+  /**
+   * headless 软确认：agent 在正文里输出 permission 标记并停下，本轮结束后
+   * 发卡片；用户点选作为新一轮用户输入续流（无协议级回写通道）。
+   */
+  private registerSoftPermissionInteraction(
+    req: ParsedPermission,
+    ctx: { requesterId: string; sessionKey: string },
+  ): string {
+    const permissionId = `perm-soft-${ctx.sessionKey}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const request: PermissionInteractionRequest = {
+      kind: "permission",
+      permissionId,
+      permission: req.permission,
+      choices: req.choices,
+      requesterId: ctx.requesterId,
+      sessionKey: ctx.sessionKey,
+    };
+    const timer = setTimeout(() => {
+      const pending = this.pendingInteractions.get(permissionId);
+      if (!pending || pending.consumed) return;
+      pending.consumed = true;
+      this.pendingInteractions.delete(permissionId);
+      void this.sendInteractionCardUpdate(ctx.requesterId, permissionId, "已超时，操作已取消。");
+    }, MessageDispatcher.INTERACTION_TTL_MS);
+    timer.unref?.();
+    this.pendingInteractions.set(permissionId, {
+      request,
+      reply: () => { /* 软确认的续流在 handleInteractionAction 里处理 */ },
+      expiresAt: Date.now() + MessageDispatcher.INTERACTION_TTL_MS,
+      timer,
+      consumed: false,
+      permissionMode: "soft",
     });
     void this.deps.send(
       ctx.requesterId,
@@ -2668,8 +2736,28 @@ export class MessageDispatcher {
         console.warn(`interaction: permission ${permissionId} from wrong user ${msg.fromUserId}`);
         return;
       }
+      const replyLabel = reply === "reject" ? "拒绝" : reply === "always" ? "始终允许" : "允许一次";
+      if (pending.permissionMode === "soft") {
+        // headless 软确认：消费 pending，把用户决定作为新一轮输入续流。
+        pending.consumed = true;
+        clearTimeout(pending.timer);
+        this.pendingInteractions.delete(permissionId);
+        await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${replyLabel}`);
+        const decisionText = reply === "reject"
+          ? `你刚才请求确认的操作，用户选择了「拒绝」。请取消该操作并说明。`
+          : `你刚才请求确认的操作，用户选择了「${replyLabel}」。请继续执行该操作。`;
+        try {
+          const out = await turns.runTurn(decisionText, undefined, pending.request.sessionKey);
+          await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: `继续执行失败: ${message}` }));
+        }
+        return;
+      }
+      // ACP 真协议：回写 optionId 给阻塞中的 agent。
       pending.reply({ kind: "permission", reply });
-      await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${reply === "reject" ? "拒绝" : reply === "always" ? "始终允许" : "允许一次"}`);
+      await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${replyLabel}`);
       return;
     }
 
