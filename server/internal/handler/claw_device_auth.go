@@ -305,6 +305,8 @@ func (h *Handler) ClawBindPairingByCode(w http.ResponseWriter, r *http.Request) 
 	}
 	var req struct {
 		Agents []string `json:"agents"`
+		// Force 见 ClawBindPairing：用户确认换绑后才由前端置真。
+		Force bool `json:"force"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || len(req.Agents) == 0 {
 		clawJSON(w, 400, 400, "请至少选择一个智能体", nil)
@@ -334,8 +336,16 @@ func (h *Handler) ClawBindPairingByCode(w http.ResponseWriter, r *http.Request) 
 		clawJSON(w, 503, 503, "RongCloud 集成未配置", nil)
 		return
 	}
-	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents, userID)
+	// 绑定既要读归属（判断「已绑定用户 X」）又要写投影（换绑后清旧归属），
+	// 全靠 NodeService 手里的连接池；漏挂就会静默退化回「谁都能加好友、谁也
+	// 看不到对方」的旧行为。
+	h.clawAttachNodeClaimDB()
+	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents, userID, req.Force)
 	if err != nil {
+		if conflicts := clawBindOwnerConflicts(err); conflicts != nil {
+			clawJSON(w, http.StatusConflict, clawCodeAgentOwnedByOther, "该智能体已绑定其他账号", map[string]interface{}{"conflicts": conflicts})
+			return
+		}
 		switch {
 		case errors.Is(err, rongcloud.ErrPairingSessionNotClaimed):
 			clawJSON(w, 409, 409, "设备尚未完成配对", nil)

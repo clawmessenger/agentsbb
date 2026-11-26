@@ -45,6 +45,22 @@ type clawEnvelope struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
+// clawCodeAgentOwnedByOther 是「选中的 agent 已被别的账号绑定」的业务码。
+//
+// 前端据此（而不是 409 本身）弹「是否解绑并改绑」确认框：同一个 409 还被
+// 「设备尚未完成配对」占用，只看 HTTP 状态会把两种情况混为一谈。
+const clawCodeAgentOwnedByOther = 40901
+
+// clawBindOwnerConflicts 把服务端的 AgentOwnedByOtherError 摊平成可下发的
+// 冲突清单；不是这类错误时返回 nil，调用方照常走其它分支。
+func clawBindOwnerConflicts(err error) []rongcloud.AgentOwnerConflict {
+	var target *rongcloud.AgentOwnedByOtherError
+	if errors.As(err, &target) {
+		return target.Conflicts
+	}
+	return nil
+}
+
 func clawJSON(w http.ResponseWriter, status, code int, message string, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1208,6 +1224,9 @@ func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Agents []string `json:"agents"`
+		// Force 由前端在用户确认「解绑并改绑到当前账号」后置真：不带它时，
+		// 已被别的账号拥有的 agent 会被 409 挡住，不会静默抢归属。
+		Force bool `json:"force"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || len(req.Agents) == 0 {
 		clawJSON(w, 400, 400, "缺少要绑定的智能体", nil)
@@ -1224,8 +1243,12 @@ func (h *Handler) ClawBindPairing(w http.ResponseWriter, r *http.Request) {
 	}
 	// 绑定时 bindAgentsToMachine 会写好 claimed_by_user_id 投影列，需要连接池。
 	h.clawAttachNodeClaimDB()
-	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents, userID)
+	results, err := h.RongCloudNode.BindAgents(r.Context(), session, req.Agents, userID, req.Force)
 	if err != nil {
+		if conflicts := clawBindOwnerConflicts(err); conflicts != nil {
+			clawJSON(w, http.StatusConflict, clawCodeAgentOwnedByOther, "该智能体已绑定其他账号", map[string]interface{}{"conflicts": conflicts})
+			return
+		}
 		switch {
 		case errors.Is(err, rongcloud.ErrPairingSessionNotClaimed):
 			clawJSON(w, 409, 409, "设备尚未完成配对", nil)

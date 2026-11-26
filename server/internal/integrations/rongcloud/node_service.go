@@ -1752,7 +1752,12 @@ type MachineAgentCredential struct {
 // device's machine, idempotent on (machine_id, ai_type). ownerRongCloudID is
 // the bound human user's rongcloud id; when set, each newly bound agent (except
 // the internal ops agent) is added to that user's IM friend list.
-func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairingSession, agents []string, ownerRongCloudID string) ([]BoundAgentResult, error) {
+//
+// force=false（默认）时，若某个选中的 agent 已经归另一个账号所有，直接返回
+// *AgentOwnedByOtherError 且**一个节点都不建** —— 调用方据此把「已绑定用户
+// xxx，是否解绑并改绑」问给用户。force=true 才真正换绑：撤销原账号的好友边、
+// 清归属投影，再挂到当前账号名下。
+func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairingSession, agents []string, ownerRongCloudID string, force bool) ([]BoundAgentResult, error) {
 	if session.Status == "expired" || session.ExpiresAt.Time.Before(time.Now()) {
 		return nil, ErrPairingSessionExpired
 	}
@@ -1767,7 +1772,7 @@ func (s *NodeService) BindAgents(ctx context.Context, session db.RongcloudPairin
 	if err != nil {
 		return nil, fmt.Errorf("rongcloud: get machine node: %w", err)
 	}
-	results, err := s.bindAgentsToMachine(ctx, machineNode, agents, ownerRongCloudID)
+	results, err := s.bindAgentsToMachine(ctx, machineNode, agents, ownerRongCloudID, force)
 	if err != nil {
 		return nil, err
 	}
@@ -1814,15 +1819,16 @@ func (s *NodeService) BindAgentsByDeviceCredential(ctx context.Context, machineN
 		return nil, ErrInvalidDeviceCredential
 	}
 	// Device-credential binds have no owning human user in scope, so no friend
-	// relation is created here (the ops agent is bound this way anyway).
-	return s.bindAgentsToMachine(ctx, machineNode, agents, "")
+	// relation is created here (the ops agent is bound this way anyway) and
+	// there is nothing to conflict with while ownerRongCloudID is empty.
+	return s.bindAgentsToMachine(ctx, machineNode, agents, "", true)
 }
 
 // bindAgentsToMachine resolves the machine identity and materialises one
 // node per agent, idempotent on (machine_id, ai_type). When ownerRongCloudID
 // is set, each bound agent (except the internal ops agent) is also added to
 // that user's IM friend list so it shows up in the contact list.
-func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.RongcloudNode, agents []string, ownerRongCloudID string) ([]BoundAgentResult, error) {
+func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.RongcloudNode, agents []string, ownerRongCloudID string, force bool) ([]BoundAgentResult, error) {
 	if s.queries == nil {
 		return nil, errors.New("rongcloud: database not configured")
 	}
@@ -1837,6 +1843,18 @@ func (s *NodeService) bindAgentsToMachine(ctx context.Context, machineNode db.Ro
 	}
 	if machineID == "" {
 		return nil, fmt.Errorf("rongcloud: machine node has no machine identity")
+	}
+
+	// 换绑前先问：被别的账号占着的 agent 一律先拦下来（不建任何节点），
+	// 由前端把「现在归谁」摆给用户选。force=true 才继续往下走换绑。
+	if !force {
+		conflicts, err := s.pendingBindConflicts(ctx, machineNode, machineID, agents, ownerRongCloudID)
+		if err != nil {
+			return nil, fmt.Errorf("rongcloud: check bind owner conflicts: %w", err)
+		}
+		if len(conflicts) > 0 {
+			return nil, &AgentOwnedByOtherError{Conflicts: conflicts}
+		}
 	}
 
 	seen := map[string]bool{}

@@ -186,7 +186,7 @@ func TestDeviceCodePairingEndToEnd(t *testing.T) {
 	// reported, attributed to the owner's RongCloud identity.
 	ownerRongCloudID := "rc_owner_" + strings.ReplaceAll(machineID, ".", "")
 	before := len(env.friendEdgeSnapshot())
-	bound, err := env.nodes.BindAgents(ctx, afterRegister, reported, ownerRongCloudID)
+	bound, err := env.nodes.BindAgents(ctx, afterRegister, reported, ownerRongCloudID, false)
 	if err != nil {
 		t.Fatalf("BindAgents: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestDeviceCodePairingRejectsBindBeforeClaim(t *testing.T) {
 		t.Fatalf("CreateDeviceSession: %v", err)
 	}
 
-	_, err = env.nodes.BindAgents(ctx, session, []string{"hermes"}, "rc_owner_unclaimed")
+	_, err = env.nodes.BindAgents(ctx, session, []string{"hermes"}, "rc_owner_unclaimed", false)
 	if err == nil {
 		t.Fatal("BindAgents on a pending session must fail")
 	}
