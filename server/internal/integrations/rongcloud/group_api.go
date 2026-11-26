@@ -171,6 +171,27 @@ func (c *rongcloudAPIClient) transferGroup(ctx context.Context, groupID, newOwne
 	return err
 }
 
+// importGroupEntrust 把「非托管创建」的老群导入为融云托管群。
+//
+// WEB-056 / WEB-034 复测实锤（线上日志）：转让群主走的是 `/entrust/*` 托管
+// 接口，而本平台的群是 `/group/create.json` 创建的非托管群，融云直接回
+// `25429 The old group does not support calling group entrust interfaces.
+// Please import first and then try again.` —— 用户只看到一句转瞬即逝的
+// 「failed to transfer the RongCloud group」，群主身份、成员名单全没变。
+//
+// 这个接口只补「群主 + 默认权限」，不改成员关系、不触发任何回调，失败可重试；
+// 已经在托管里的群再导入一次也只是把资料重设成同样的值（owner/name 由本地
+// 镜像给出，不会把群主改歪）。
+func (c *rongcloudAPIClient) importGroupEntrust(ctx context.Context, groupID, groupName, ownerID string) error {
+	form := url.Values{
+		"groupId": {groupID},
+		"name":    {groupName},
+		"owner":   {ownerID},
+	}
+	_, err := c.postForm(ctx, "/entrust/group/import.json", form)
+	return err
+}
+
 // refreshGroupInfo refreshes a group's name and portrait.
 func (c *rongcloudAPIClient) refreshGroupInfo(ctx context.Context, groupID, groupName, portraitURI string) error {
 	form := url.Values{"groupId": {groupID}}

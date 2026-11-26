@@ -192,7 +192,37 @@ func (h *systemHandler) handleGroupMembers(ctx context.Context, msg NormalizedMe
 		// 进出时与镜像重新对齐。
 		return h.sendWebOK(ctx, msg, cmd, groupMemberViews(nil, mirrored))
 	}
-	return h.sendWebOK(ctx, msg, cmd, groupMemberViews(ids, mirrored))
+	// WEB-056：融云偶尔会返回「比本地镜像少」的成员集合（线上复测：转让失败后
+	// A、B 各自只看得到自己，成员数双双变成 1）。名单少人比多一个待清理的旧行
+	// 严重得多 —— 用户会以为对方被踢了。这里取并集：融云顺序在前（它是成员关系
+	// 的权威来源），镜像里多出来的人补在后面，并留一条 warn 供事后核对。
+	merged := ids
+	if extra := memberIDsMissingFrom(ids, mirrored); len(extra) > 0 {
+		merged = append(append([]string{}, ids...), extra...)
+		h.logger.Warn("rongcloud: group member query returned fewer members than mirror",
+			"group_id", groupID, "rc_count", len(ids), "mirror_count", len(mirrored), "extra", len(extra))
+	}
+	return h.sendWebOK(ctx, msg, cmd, groupMemberViews(merged, mirrored))
+}
+
+// memberIDsMissingFrom 返回镜像里有、融云结果里没有的成员 id（保持镜像顺序）。
+func memberIDsMissingFrom(ids []string, mirrored []GroupMember) []string {
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		seen[id] = struct{}{}
+	}
+	extra := make([]string, 0, len(mirrored))
+	for _, member := range mirrored {
+		if member.UserID == "" {
+			continue
+		}
+		if _, ok := seen[member.UserID]; ok {
+			continue
+		}
+		seen[member.UserID] = struct{}{}
+		extra = append(extra, member.UserID)
+	}
+	return extra
 }
 
 // groupMemberViews 把「融云给出的成员 id」与「本地镜像的补充信息」合成 C 端契约的
@@ -383,6 +413,35 @@ func groupProfileView(profile GroupProfile, viewerID string) map[string]interfac
 
 // ---- transfer ----------------------------------------------------------------
 
+// ---- transfer ----------------------------------------------------------------
+
+// rongCloudOldGroupNotEntrust 是融云对「非托管创建的老群调托管接口」的业务码。
+// 原样含义：The old group does not support calling group entrust interfaces.
+// Please import first and then try again.
+const rongCloudOldGroupNotEntrust = 25429
+
+// importGroupForEntrust 把群导入融云托管体系，供转让/踢人这类托管接口使用。
+//
+// 群名从本地镜像取（融云导入接口 name 必填）；镜像没名字时用 groupId 兜底 ——
+// 宁可群资料里的名字丑一点，也不要因为缺一个必填字段让转让永远失败。
+func (h *systemHandler) importGroupForEntrust(ctx context.Context, groupID, ownerID string) error {
+	name := ""
+	if h.groupMirror.GroupProfiles != nil {
+		if profiles, err := h.groupMirror.GroupProfiles(ctx, []string{groupID}); err == nil {
+			for _, profile := range profiles {
+				if profile.GroupID == groupID {
+					name = strings.TrimSpace(profile.GroupName)
+					break
+				}
+			}
+		}
+	}
+	if name == "" {
+		name = groupID
+	}
+	return h.client.importGroupEntrust(ctx, groupID, name, ownerID)
+}
+
 func (h *systemHandler) handleGroupTransfer(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
 	groupID := strings.TrimSpace(getString(cmd.Params, "groupId"))
 	newOwnerID := strings.TrimSpace(getStringAny(cmd.Params, "newOwnerId", "newOwnerUserId"))
@@ -414,6 +473,24 @@ func (h *systemHandler) handleGroupTransfer(ctx context.Context, msg NormalizedM
 	}
 
 	if err := h.client.transferGroup(ctx, groupID, newOwnerID); err != nil {
+		// WEB-056：老群（/group/create.json 创建、没导入托管）调托管接口必定
+		// 25429。这不是「转让参数错了」，是「这个群还没进托管体系」—— 先补一次
+		// 导入再重试，用户点一次「确认转让」就该成，不该要求他理解融云的分层。
+		code, message, ok := RongCloudAPIError(err)
+		if ok && code == rongCloudOldGroupNotEntrust {
+			h.logger.Info("rongcloud: group is not entrusted yet, importing before transfer",
+				"group_id", groupID, "owner_id", ownerID, "detail", message)
+			if importErr := h.importGroupForEntrust(ctx, groupID, ownerID); importErr != nil {
+				h.logger.Error("rongcloud: group entrust import before transfer",
+					"error", importErr, "group_id", groupID)
+			} else if retryErr := h.client.transferGroup(ctx, groupID, newOwnerID); retryErr == nil {
+				err = nil
+			} else {
+				err = retryErr
+			}
+		}
+	}
+	if err != nil {
 		h.logger.Error("rongcloud: group transfer", "error", err, "group_id", groupID)
 		return h.sendWebError(ctx, msg, cmd, 500, "failed to transfer the RongCloud group")
 	}

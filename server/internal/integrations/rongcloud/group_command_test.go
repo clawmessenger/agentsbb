@@ -28,6 +28,10 @@ type groupTestServer struct {
 	// 最后一项不带游标；用完后再查返回空页。用来验证服务端翻页与去重。
 	membersPages [][]string
 	membersCalls int
+
+	// transferFailNotEntrust > 0 时，接下来这么多次转让都回 25429（老群未导入
+	// 托管），用来验证「导入后重试」这条自愈路径。
+	transferFailNotEntrust int
 }
 
 func newGroupTestServer(t *testing.T) (*groupTestServer, *httptest.Server) {
@@ -68,6 +72,18 @@ func newGroupTestServer(t *testing.T) (*groupTestServer, *httptest.Server) {
 		if r.URL.Path == "/message/private/publish.json" {
 			fmt.Fprint(w, `{"code":200,"msgUID":"uid-1"}`)
 			return
+		}
+		if r.URL.Path == "/entrust/group/transfer/owner.json" {
+			rec.mu.Lock()
+			notEntrust := rec.transferFailNotEntrust
+			if notEntrust > 0 {
+				rec.transferFailNotEntrust--
+			}
+			rec.mu.Unlock()
+			if notEntrust > 0 {
+				fmt.Fprint(w, `{"code":25429,"errorMessage":"The old group does not support calling group entrust interfaces. Please import first and then try again."}`)
+				return
+			}
 		}
 		if r.URL.Path == "/group/user/query.json" {
 			// 融云 v3 的形状：data.members[].id + data.next 游标。
@@ -1600,5 +1616,67 @@ func TestParseGroupMemberPageShapes(t *testing.T) {
 				t.Fatalf("cursor = %q, want %q", cursor, tc.wantCursor)
 			}
 		})
+	}
+}
+
+// WEB-056：老群（/group/create.json 创建）调托管转让接口会被 25429 挡回来。
+// 正确做法不是让用户重试，而是自动导入托管再重试一次 —— 用户点一次「确认转让」
+// 就该成。这里验证：第一次 25429 → 调 /entrust/group/import.json → 再转让成功。
+func TestGroupTransferImportsOldGroupThenRetries(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	rec.transferFailNotEntrust = 1
+	stub := newGroupMirrorStub()
+	stub.owners["100001"] = "user-7"
+	stub.member("100001", "user-7", "owner")
+	stub.member("100001", "user-8", "member")
+	stub.profiles["100001"] = GroupProfile{GroupID: "100001", GroupName: "先有鸡还是先有蛋", OwnerID: "user-7"}
+	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
+
+	msg := groupCommand("transfer", "user-7", `{"groupId":"100001","newOwnerId":"user-8"}`)
+	if err := handler.handleCommand(context.Background(), msg); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+	if result := rec.lastCommandResult(t); result["code"] != float64(200) {
+		t.Fatalf("expected 200 after import+retry, got %#v", result)
+	}
+	imports := rec.calls("/entrust/group/import.json")
+	if len(imports) != 1 {
+		t.Fatalf("import calls = %d, want 1", len(imports))
+	}
+	// 导入时群主必须是当前群主（不是新群主），否则等于绕过权限校验改群主。
+	if imports[0]["groupId"] != "100001" || imports[0]["owner"] != "user-7" || imports[0]["name"] != "先有鸡还是先有蛋" {
+		t.Errorf("import form = %#v", imports[0])
+	}
+	transfers := rec.calls("/entrust/group/transfer/owner.json")
+	if len(transfers) != 2 {
+		t.Fatalf("transfer calls = %d, want 2 (fail + retry)", len(transfers))
+	}
+	if stub.owners["100001"] != "user-8" {
+		t.Errorf("mirror owner = %q, want user-8", stub.owners["100001"])
+	}
+}
+
+// WEB-056：融云成员查询偶尔会返回比本地镜像少的集合（线上复测：转让失败后两端
+// 各自只看得到自己）。名单少人比多一条旧行严重，这里取并集兜住。
+func TestGroupGetMembersUnionsMirrorWhenRongCloudReturnsFewer(t *testing.T) {
+	rec, srv := newGroupTestServer(t)
+	defer srv.Close()
+	rec.membersPages = [][]string{{"user-7"}}
+	stub := newGroupMirrorStub()
+	stub.member("100001", "user-7", "owner")
+	stub.member("100001", "user-8", "member")
+	handler := newGroupCommandHandler(t, rec, srv, stub.mirror())
+
+	if err := handler.handleCommand(context.Background(),
+		groupCommand("getMembers", "user-7", `{"groupId":"100001"}`)); err != nil {
+		t.Fatalf("handleCommand: %v", err)
+	}
+	members := memberList(t, groupResultData(t, rec))
+	if len(members) != 2 {
+		t.Fatalf("members = %#v, want the mirror member to be kept", members)
+	}
+	if members[0]["userId"] != "user-7" || members[1]["userId"] != "user-8" {
+		t.Errorf("members order = %#v（融云顺序在前，镜像补在后）", members)
 	}
 }
