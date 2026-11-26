@@ -3568,6 +3568,66 @@ describe("MessageDispatcher 单聊二次确认", () => {
     });
     expect(deps.sent.length).toBe(0);
   });
+
+  it("原生 question 工具卡住时换成选择卡片，并中止这一轮", async () => {
+    const sent: Array<{ to: string; objectName: string; content: string }> = [];
+    const dispatcher = new MessageDispatcher({
+      send: async (to, objectName, content) => { sent.push({ to, objectName, content }); },
+      sendStream: async () => {},
+      agentName: "opencode",
+    });
+    let aborted = false;
+    const step: ActivityStep = {
+      id: "call-q",
+      kind: "tool",
+      label: "question",
+      status: "running",
+      inputDetail: JSON.stringify({
+        questions: [{ question: "晚饭吃什么？", options: ["番茄炒蛋", "可乐鸡翅"], multiple: false }],
+      }),
+    };
+    const pending = dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "帮我选个晚饭" }),
+    }, {
+      runTurn: async () => "unused",
+      runTurnStreamed: (_p, _m, onDelta, signal) => new Promise<string>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("agent turn aborted"));
+        }, { once: true });
+        void onDelta("", undefined, [step]);
+      }),
+    });
+    await pending;
+    expect(aborted).toBe(true);
+    const cardMsg = sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const q = card.sections.find((s: { kind: string }) => s.kind === "question");
+    expect(q.question).toBe("晚饭吃什么？");
+    expect(q.options.map((o: { label: string }) => o.label)).toEqual(["番茄炒蛋", "可乐鸡翅"]);
+
+    // 点选后沿用 question 语义：作为新一轮用户输入续流。
+    const prompts: string[] = [];
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "answer", questionId: q.questionId, value: ["可乐鸡翅"] },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "好，就这个。"; },
+    });
+    expect(prompts[0]).toBe("我选择：可乐鸡翅");
+  });
 });
 
 describe("MessageDispatcher headless 软确认", () => {

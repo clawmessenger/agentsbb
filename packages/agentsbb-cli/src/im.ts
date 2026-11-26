@@ -18,6 +18,7 @@ import {
   buildPermissionCard,
   buildQuestionCard,
   mapAcpOptionsToChoices,
+  parseNativeQuestionToolInput,
   parsePermissionMarkers,
   parseQuestionMarkers,
   PERMISSION_PROTOCOL_INSTRUCTION,
@@ -1530,6 +1531,9 @@ export class MessageDispatcher {
       // （内容在 activitySnapshot 里），这样同一份信息不会在帧里存两遍。
       // web 端按它渲染「思考卡片 ↔ 工具卡片」交错的流式时间线。
       const timeline: ChatStreamTimelineEntry[] = [];
+      // 原生 question 工具兜底只做一次：中止后中止帧还会带最后一次 activity，
+      // 没有这个闸门就会重复发卡片、重复 abort。
+      let nativeQuestionHandled = false;
       const activeReasoningEntry = (): number | null => {
         const last = timeline[timeline.length - 1];
         return last && last[0] === "r" ? timeline.length - 1 : null;
@@ -1580,6 +1584,15 @@ export class MessageDispatcher {
           activitySnapshot = activity;
           // 同一份快照交给停滞守卫：它只看「有没有 running 的步骤」，不落盘。
           latestActivity = activity;
+          // headless 的原生 question 工具没有应答方：立刻换成卡片交互并中止轮次。
+          if (ctx.conversationType === 1 && !nativeQuestionHandled
+            && this.handleNativeQuestionActivity(activity, {
+              requesterId: ctx.requesterId,
+              sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+            }, () => controller.abort())) {
+            nativeQuestionHandled = true;
+            return;
+          }
         }
         const now = Date.now();
         // 只有「纯正文增量」才走短窗口，并且这一帧不带思考/过程流（见上）。
@@ -2640,6 +2653,43 @@ export class MessageDispatcher {
       JSON.stringify({ msg_type: "card_message", card: buildQuestionCard(request) }),
     );
     return questionId;
+  }
+
+  /**
+   * 兜底：agent 直接调用了原生 question / ask_user 交互工具。
+   *
+   * headless serve 没有 TUI 应答方，工具会永远停在 running，用户只看到「正在
+   * question」转圈（2026-11-26 现场）。这里把工具入参转成可点击卡片，并中止
+   * 卡住的轮次；用户点选后沿用 question 语义作为新一轮输入续流。
+   * 返回 true 表示这一轮已改成卡片交互，调用方应停止继续上屏正文。
+   */
+  private handleNativeQuestionActivity(
+    steps: ActivityStep[] | undefined,
+    ctx: { requesterId: string; sessionKey: string },
+    abortTurn: () => void,
+  ): boolean {
+    if (!steps) return false;
+    const step = steps.find((item) =>
+      /^(question|ask_user)$/i.test(item.label)
+      && item.status === "running"
+      && Boolean(item.inputDetail || item.detail),
+    );
+    if (!step) return false;
+    const questions = parseNativeQuestionToolInput(step.inputDetail ?? step.detail);
+    if (questions.length > 0) {
+      for (const question of questions) this.registerQuestionInteraction(question, ctx);
+    } else {
+      // 入参解析不出来也别让它永远挂着：中止并提示用户用文字回答。
+      void this.deps.send(
+        ctx.requesterId,
+        "RC:TxtMsg",
+        JSON.stringify({
+          content: "检测到智能体使用了本设备不支持的原生提问工具，已中止这一轮。请直接用文字告诉我你的选择，我会继续。",
+        }),
+      );
+    }
+    abortTurn();
+    return true;
   }
 
   /** 把交互卡片替换成「已决策/已超时」的只读态。 */

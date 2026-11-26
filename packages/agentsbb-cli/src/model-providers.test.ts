@@ -928,3 +928,29 @@ describe("新增四家的 config 路径与能力登记", () => {
     expect(agentModelCapability("codearts")).toEqual({ catalogSource: "cli", modelInjection: "argv" });
   });
 });
+
+describe("设备端派生配置：禁用 headless 下会卡死的原生交互工具", () => {
+  it("noInteractiveTools 写 1.x build.tools 与 2.x agents.build.permissions，不动整机限制键", () => {
+    const built = buildDeviceOpencodeConfig(JSON.stringify({
+      model: "quukk/glm-5.2",
+      agents: { build: { permissions: [{ action: "bash", resource: "*", effect: "deny" }] } },
+    }), { noInteractiveTools: true });
+    const config = JSON.parse(built!.text) as Record<string, any>;
+    expect(config.permission).toBeUndefined();
+    expect(config.tools).toBeUndefined();
+    expect(config.agent.build.tools.question).toBe(false);
+    expect(config.agent.build.tools.ask_user).toBe(false);
+    expect(config.agents.build.permissions).toEqual(expect.arrayContaining([
+      { action: "question", resource: "*", effect: "deny" },
+      { action: "ask_user", resource: "*", effect: "deny" },
+    ]));
+    // 用户原有规则保留，且 deny 追加在末尾（opencode「最后匹配优先」）
+    expect(config.agents.build.permissions[0]).toEqual({ action: "bash", resource: "*", effect: "deny" });
+  });
+
+  it("不传 noInteractiveTools 时派生配置没有交互工具拒绝键", () => {
+    const config = JSON.parse(buildDeviceOpencodeConfig('{"model":"a/x"}', {})!.text) as Record<string, any>;
+    expect(config.agent).toBeUndefined();
+    expect(config.agents).toBeUndefined();
+  });
+});

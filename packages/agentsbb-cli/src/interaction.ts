@@ -80,6 +80,12 @@ export const PERMISSION_PROTOCOL_INSTRUCTION = [
   "不要直接执行；先在回复末尾另起一段输出如下标记，然后停止本轮（不要继续执行该操作）：",
   '[interaction:permission] {"permission":"用一句话说明你要执行的操作","options":[{"reply":"once","label":"允许一次"},{"reply":"always","label":"始终允许"},{"reply":"reject","label":"拒绝"}]} [/interaction]',
   "用户选择后会把决定作为新消息发给你：若允许则继续执行该操作，若拒绝则取消并说明。",
+  "",
+  "【提问协议】",
+  "设备端没有交互界面：绝对不要调用内置的 question / ask_user 交互工具（调用后没有任何人能回答，会永久卡住）。",
+  "需要让用户从选项里做选择时，直接在回复末尾另起一段输出如下标记并停止本轮：",
+  '[interaction:question] {"question":"一句话说明要问什么","options":["选项一","选项二"],"multiple":false} [/interaction]',
+  "用户选择后会作为新消息发给你，届时再按用户的选择继续；不要为了等答案而调用任何工具。",
 ].join("\n");
 
 const PERMISSION_MARKER_RE = /\[interaction:permission\]\s*([\s\S]*?)\s*\[\/interaction\]/g;
@@ -171,6 +177,50 @@ export function parseQuestionMarkers(text: string): ParsedQuestion[] {
 /** 从正文里剥掉 question 标记块，避免把协议原文上屏给用户。 */
 export function stripQuestionMarkers(text: string): string {
   return text.replace(QUESTION_MARKER_RE, "").trim();
+}
+
+/**
+ * 解析 agent 原生 question / ask_user 工具的入参（headless 下它会挂着等 TUI，
+ * 永远等不到答案）。兼容两种常见形状：
+ *   {"questions":[{"question":"...","options":[{"label":"A"},"B"],"multiple":false}]}
+ *   {"question":"...","options":["A","B"],"multiple":false}
+ * 解析不出来返回空数组 —— 宁可不发卡片，也不发一张点不动的假卡片。
+ */
+export function parseNativeQuestionToolInput(raw: string | undefined): ParsedQuestion[] {
+  if (!raw || !raw.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const root = parsed as Record<string, unknown>;
+  const candidates = Array.isArray(root.questions)
+    ? root.questions
+    : (typeof root.question === "string" ? [root] : []);
+  const out: ParsedQuestion[] = [];
+  for (const candidate of candidates) {
+    const item = candidate as Record<string, unknown>;
+    const question = typeof item.question === "string"
+      ? item.question.trim()
+      : (typeof item.header === "string" ? item.header.trim() : "");
+    const rawOptions = Array.isArray(item.options) ? item.options : [];
+    const options = rawOptions
+      .map((option) => {
+        if (typeof option === "string") return option.trim();
+        const record = option as Record<string, unknown>;
+        return typeof record.label === "string" ? record.label.trim() : "";
+      })
+      .filter((label) => label.length > 0);
+    if (!question || options.length === 0) continue;
+    out.push({
+      questionId: `native-q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      question,
+      options,
+      multiple: item.multiple === true,
+    });
+  }
+  return out;
 }
 
 // ---- 卡片构造 --------------------------------------------------------------

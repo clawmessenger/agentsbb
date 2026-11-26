@@ -4,6 +4,7 @@ import {
   buildPermissionCard,
   buildQuestionCard,
   mapAcpOptionsToChoices,
+  parseNativeQuestionToolInput,
   parsePermissionMarkers,
   parseQuestionMarkers,
   PERMISSION_PROTOCOL_INSTRUCTION,
@@ -124,6 +125,30 @@ describe("headless soft permission markers", () => {
 
   it("instruction tells the agent to output the marker and stop", () => {
     expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("[interaction:permission]");
+    expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("[interaction:question]");
     expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("停止本轮");
+    expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("不要调用内置的 question");
+  });
+});
+
+describe("原生 question 工具入参兜底解析", () => {
+  it("解析 opencode questions 数组（label 对象 / 字符串混合）", () => {
+    const parsed = parseNativeQuestionToolInput(JSON.stringify({
+      questions: [{
+        question: "选一个",
+        options: [{ label: "A" }, "B"],
+        multiple: false,
+      }],
+    }));
+    expect(parsed.length).toBe(1);
+    expect(parsed[0]!.question).toBe("选一个");
+    expect(parsed[0]!.options).toEqual(["A", "B"]);
+  });
+
+  it("解析扁平 question 形状；坏输入静默跳过", () => {
+    const parsed = parseNativeQuestionToolInput('{"question":"怎么办？","options":[{"label":"继续"},{"label":"取消"}]}');
+    expect(parsed[0]!.options).toEqual(["继续", "取消"]);
+    expect(parseNativeQuestionToolInput("not json").length).toBe(0);
+    expect(parseNativeQuestionToolInput('{"question":"x","options":[]}').length).toBe(0);
   });
 });

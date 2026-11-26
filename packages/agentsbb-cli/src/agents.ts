@@ -2386,6 +2386,9 @@ function ensureDeviceOpencodeConfig(
     instructions: behaviorFile ? [behaviorFile] : [],
     ...(input.lean ? { lean: true } : {}),
     ...(!input.lean && input.terse ? { terse: true } : {}),
+    // headless serve 没有 TUI 接 question/ask_user 的弹窗：模型一调就永久挂在
+    // running，整轮再也不出正文。设备端派生配置统一禁用，改走文本标记卡片。
+    noInteractiveTools: true,
   });
   if (!built) return null;
   const target = deviceOpencodeConfigPath(

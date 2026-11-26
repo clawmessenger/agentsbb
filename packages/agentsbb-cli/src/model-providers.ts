@@ -1080,6 +1080,16 @@ export interface DeviceOpencodeConfigOpts {
    * 都要重新 prefill，并且诱导模型长篇展开。换掉它，工具不动，能力不降。
    */
   terse?: boolean;
+  /**
+   * 禁用 opencode 的原生 question / ask_user 交互工具。
+   *
+   * 设备端是 headless serve，没有 TUI 去接这两种工具的弹窗；模型一旦调用就会
+   * 永远挂在 `running`，整轮不产出正文（2026-11-26 现场：单聊里模型问「三选
+   * 一」，卡片一直转圈直到设备端停滞提示）。替代方案是行为指令里的
+   * `[interaction:question]` 文本标记——CLI 收到后发可点击卡片，用户选择作为
+   * 新一轮用户输入续流。两套工具键位都写，兼容 1.x/2.x。
+   */
+  noInteractiveTools?: boolean;
 }
 
 /** 精简回合的 `build` agent：只输出用户要的 JSON，零工具、零寒暄。 */
@@ -1240,6 +1250,46 @@ export function buildDeviceOpencodeConfig(
     if (opts.lean) {
       disableReasoningForSelectedModel(out, dropped);
     }
+  }
+  if (opts.noInteractiveTools) {
+    const INTERACTIVE_TOOL_NAMES = ["question", "ask_user"] as const;
+    // 1.x：只写 `agent.build.tools`，不碰顶层 `permission`/`tools` —— 后两者是
+    // 「整机限制态」的契约键（见 fsRestricted 用例），留空才能与限制态区分。
+    const agentsLegacy = (out.agent && typeof out.agent === "object" && !Array.isArray(out.agent))
+      ? { ...(out.agent as Record<string, unknown>) }
+      : {};
+    const buildLegacy = (agentsLegacy.build && typeof agentsLegacy.build === "object" && !Array.isArray(agentsLegacy.build))
+      ? { ...(agentsLegacy.build as Record<string, unknown>) }
+      : {};
+    const legacyTools = (buildLegacy.tools && typeof buildLegacy.tools === "object" && !Array.isArray(buildLegacy.tools))
+      ? { ...(buildLegacy.tools as Record<string, unknown>) }
+      : {};
+    for (const name of INTERACTIVE_TOOL_NAMES) legacyTools[name] = false;
+    agentsLegacy.build = { ...buildLegacy, tools: legacyTools };
+    out.agent = agentsLegacy;
+
+    // 2.x：agents.build.permissions 是数组，按 action 覆盖；保留用户已有规则，
+    // 只在末尾追加 deny（opencode 的规则是「最后匹配优先」）。
+    const agentsV2 = (out.agents && typeof out.agents === "object" && !Array.isArray(out.agents))
+      ? { ...(out.agents as Record<string, unknown>) }
+      : {};
+    const buildV2 = (agentsV2.build && typeof agentsV2.build === "object" && !Array.isArray(agentsV2.build))
+      ? { ...(agentsV2.build as Record<string, unknown>) }
+      : {};
+    const existingPermissions = Array.isArray(buildV2.permissions)
+      ? buildV2.permissions.filter((rule) => {
+        const record = rule as Record<string, unknown>;
+        return !INTERACTIVE_TOOL_NAMES.includes(record.action as (typeof INTERACTIVE_TOOL_NAMES)[number]);
+      })
+      : [];
+    agentsV2.build = {
+      ...buildV2,
+      permissions: [
+        ...existingPermissions,
+        ...INTERACTIVE_TOOL_NAMES.map((action) => ({ action, resource: "*", effect: "deny" })),
+      ],
+    };
+    out.agents = agentsV2;
   }
   return { text: JSON.stringify(out, null, 2), dropped };
 }
