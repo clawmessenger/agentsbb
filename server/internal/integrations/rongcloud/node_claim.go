@@ -324,7 +324,7 @@ func (s *NodeService) setNodeOwner(ctx context.Context, nodeRCID, owner string) 
 		return
 	}
 	// 1) 迁移归属：撤销旧边 + 清投影（无旧 owner / 同一个 owner 时是 no-op）。
-	s.reassignNodeOwnerOnBind(ctx, nodeRCID, owner)
+	oldOwner, moved := s.reassignNodeOwnerOnBind(ctx, nodeRCID, owner)
 	// 2) 建新 owner → node 好友边（幂等：已是好友返回 25460 也算成功）。
 	if s.client != nil {
 		if _, err := s.client.addFriend(ctx, owner, nodeRCID, ""); err != nil {
@@ -338,20 +338,26 @@ func (s *NodeService) setNodeOwner(ctx context.Context, nodeRCID, owner string) 
 		s.log().Warn("rongcloud: sync node claim after bind failed",
 			"owner", owner, "node_rc", nodeRCID, "error", err)
 	}
+	// 4) 真的换了主人时通知原账号：否则 agent 会从他设备列表里无声消失。
+	// 放在归属写完之后，消息里的「现在归谁」才与库里的状态一致。
+	if moved {
+		s.notifyNodeRebound(ctx, nodeRCID, oldOwner, owner)
+	}
 }
 
 // reassignNodeOwnerOnBind 维护「一个 agent 只有一个拥有者」：查出节点当前归属，
 // 若属于另一个账号，就撤销该账号到节点的好友边并清掉归属投影，让 agent 从旧
-// 拥有者的设备列表消失。返回是否真的发生了迁移。
-func (s *NodeService) reassignNodeOwnerOnBind(ctx context.Context, nodeRCID, newOwner string) bool {
+// 拥有者的设备列表消失。返回被迁走的原拥有者（供换绑后通知）与是否真的发生了
+// 迁移 —— 调用方只有拿到 moved=true 才需要发消息。
+func (s *NodeService) reassignNodeOwnerOnBind(ctx context.Context, nodeRCID, newOwner string) (string, bool) {
 	nodeRCID = strings.TrimSpace(nodeRCID)
 	newOwner = strings.TrimSpace(newOwner)
 	if nodeRCID == "" || newOwner == "" {
-		return false
+		return "", false
 	}
 	oldOwner := s.currentOwnerForReassign(ctx, nodeRCID)
 	if oldOwner == "" || oldOwner == newOwner {
-		return false
+		return "", false
 	}
 	// 撤销旧 owner → agent 的单向好友边，与绑定写入的边界一致（owner → node）。
 	if err := s.RevokeFriendship(ctx, oldOwner, nodeRCID); err != nil {
@@ -366,7 +372,7 @@ func (s *NodeService) reassignNodeOwnerOnBind(ctx context.Context, nodeRCID, new
 	}
 	s.log().Info("rongcloud: node ownership reassigned on bind",
 		"node_rc", nodeRCID, "from", oldOwner, "to", newOwner)
-	return true
+	return oldOwner, true
 }
 
 // currentOwnerForReassign 读出节点当前归属账号。投影列命中即返回（绑定路径写过

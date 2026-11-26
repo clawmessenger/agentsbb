@@ -137,7 +137,7 @@ func (s *NodeService) ownerDisplay(ctx context.Context, ownerRCID string) (name,
 			}
 		}
 	}
-	if name == "" {
+	if name == "" && s.queries != nil {
 		if u, err := s.GetUserByRongCloudID(ctx, ownerRCID); err == nil {
 			name = strings.TrimSpace(u.Name.String)
 		}

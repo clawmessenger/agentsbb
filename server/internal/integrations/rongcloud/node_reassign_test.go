@@ -25,6 +25,13 @@ type friendDelCall struct {
 	targets []string
 }
 
+// privatePublishCall 记录一次私聊下发，断言「换绑后通知了原账号」用。
+type privatePublishCall struct {
+	from    string
+	to      string
+	content string
+}
+
 // rebindAPIServer 是覆盖 get/add/delete 三个好友端点的桩：真实维护 friends，
 // 并记录 add/delete 调用，便于断言「撤销了谁的边、给谁建了边」。get 之外的调用
 // 不计入任何计数，避免干扰复用 claimFriendServer 的既有测试。
@@ -33,6 +40,7 @@ type rebindAPIServer struct {
 	friends map[string][]string
 	adds    []friendAddCall
 	dels    []friendDelCall
+	pubs    []privatePublishCall
 	delFail bool
 }
 
@@ -87,6 +95,17 @@ func (f *rebindAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 200})
 		}
+	case "/message/private/publish.json":
+		f.mu.Lock()
+		var body textContent
+		_ = json.Unmarshal([]byte(r.PostForm.Get("content")), &body)
+		f.pubs = append(f.pubs, privatePublishCall{
+			from:    r.PostForm.Get("fromUserId"),
+			to:      r.PostForm.Get("toUserId"),
+			content: body.Content,
+		})
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 200, "msgUID": "msg-1"})
 	default:
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 200})
 	}
@@ -96,6 +115,12 @@ func (f *rebindAPIServer) calls() ([]friendAddCall, []friendDelCall) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]friendAddCall(nil), f.adds...), append([]friendDelCall(nil), f.dels...)
+}
+
+func (f *rebindAPIServer) publishes() []privatePublishCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]privatePublishCall(nil), f.pubs...)
 }
 
 func newRebindService(t *testing.T, api *rebindAPIServer, store *claimStoreDB) (*NodeService, func()) {
@@ -235,7 +260,8 @@ func TestSetNodeOwnerRevokeFailureDoesNotBlock(t *testing.T) {
 	}
 }
 
-// reassignNodeOwnerOnBind 的返回值语义：只有真的换了 owner 才返回 true。
+// reassignNodeOwnerOnBind 的返回值语义：只有真的换了 owner 才报迁移，并把被
+// 迁走的原拥有者一并交回（换绑后通知要用）。
 func TestReassignNodeOwnerOnBindReportsMigration(t *testing.T) {
 	old := "user-a"
 	api := &rebindAPIServer{friends: map[string][]string{"user-a": {"rc_node_x"}}}
@@ -253,17 +279,70 @@ func TestReassignNodeOwnerOnBindReportsMigration(t *testing.T) {
 		store.mu.Unlock()
 	}
 
-	if !svc.reassignNodeOwnerOnBind(ctx, "rc_node_x", "user-b") {
-		t.Error("expected true when moving from user-a to user-b")
+	prev, moved := svc.reassignNodeOwnerOnBind(ctx, "rc_node_x", "user-b")
+	if !moved || prev != "user-a" {
+		t.Errorf("expected (user-a, true) when moving from user-a to user-b, got (%q, %v)", prev, moved)
 	}
 	// 再换一次：投影已是 user-b，换到 user-c 仍应报告迁移。
 	setClaim("user-b")
-	if !svc.reassignNodeOwnerOnBind(ctx, "rc_node_x", "user-c") {
-		t.Error("expected true when moving from user-b to user-c")
+	if prev, moved := svc.reassignNodeOwnerOnBind(ctx, "rc_node_x", "user-c"); !moved || prev != "user-b" {
+		t.Errorf("expected (user-b, true) when moving from user-b to user-c, got (%q, %v)", prev, moved)
 	}
-	// 同一个 owner：false。
+	// 同一个 owner：不迁移，也不报原拥有者。
 	setClaim("user-c")
-	if svc.reassignNodeOwnerOnBind(ctx, "rc_node_x", "user-c") {
-		t.Error("expected false for the same owner")
+	if prev, moved := svc.reassignNodeOwnerOnBind(ctx, "rc_node_x", "user-c"); moved || prev != "" {
+		t.Errorf("expected (\"\", false) for the same owner, got (%q, %v)", prev, moved)
+	}
+}
+
+// 换绑后给原账号发一条私聊：告诉 A「opencode 已被 xxx 绑定」，而不是让它从
+// A 的设备列表里无声消失。发件人是 agent 自己的融云账号（C 端按对端解析昵称，
+// 用平台系统账号会落进一个没有标题的陌生人会话）。
+func TestSetNodeOwnerNotifiesPreviousOwner(t *testing.T) {
+	old := "user-a"
+	api := &rebindAPIServer{friends: map[string][]string{"user-a": {"rc_node_x"}}}
+	store := &claimStoreDB{claims: map[string]*string{"rc_node_x": &old}, users: []string{"user-a"}}
+	svc, close := newRebindService(t, api, store)
+	defer close()
+
+	svc.setNodeOwner(context.Background(), "rc_node_x", "user-b")
+
+	pubs := api.publishes()
+	if len(pubs) != 1 {
+		t.Fatalf("expected exactly one notice to the previous owner, got %+v", pubs)
+	}
+	p := pubs[0]
+	if p.from != "rc_node_x" || p.to != "user-a" {
+		t.Errorf("notice must come from the agent itself to the old owner, got from=%q to=%q", p.from, p.to)
+	}
+	// queries 为 nil 时展示名退回融云 id，正文仍要点到「原拥有者不再拥有」「新账号」。
+	for _, want := range []string{"rc_node_x", "user-b", "不再拥有"} {
+		if !strings.Contains(p.content, want) {
+			t.Errorf("notice %q must mention %q", p.content, want)
+		}
+	}
+}
+
+// 同一个账号重复绑定 / 首次绑定（无旧 owner）：不发任何通知，别打扰用户。
+func TestSetNodeOwnerDoesNotNotifyWithoutMigration(t *testing.T) {
+	old := "user-a"
+	api := &rebindAPIServer{friends: map[string][]string{"user-a": {"rc_node_x"}}}
+	store := &claimStoreDB{claims: map[string]*string{"rc_node_x": &old}, users: []string{"user-a"}}
+	svc, close := newRebindService(t, api, store)
+	defer close()
+
+	svc.setNodeOwner(context.Background(), "rc_node_x", "user-a")
+	if pubs := api.publishes(); len(pubs) != 0 {
+		t.Errorf("same owner must not be notified, got %+v", pubs)
+	}
+
+	// 无旧 owner 的首次绑定同样不发。
+	api2 := &rebindAPIServer{friends: map[string][]string{}}
+	store2 := &claimStoreDB{claims: map[string]*string{"rc_node_x": nil}, users: []string{"user-b"}}
+	svc2, close2 := newRebindService(t, api2, store2)
+	defer close2()
+	svc2.setNodeOwner(context.Background(), "rc_node_x", "user-b")
+	if pubs := api2.publishes(); len(pubs) != 0 {
+		t.Errorf("first bind must not send a notice, got %+v", pubs)
 	}
 }
