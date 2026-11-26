@@ -17,9 +17,18 @@ import (
 
 // roundtableHostRoleName / roundtableHostInstructions 对齐 Python 的
 // ROUNDTABLE_HOST_ROLE / ROUNDTABLE_HOST_INSTRUCTIONS。
+//
+// WEB-054 复测：主持人为了四段纪要「好看」，会把「没表示反对」写成「三方接受」，
+// 而回看发言人原话根本找不到任何表态。这条失真比漏记更危险 —— 用户读到的结论
+// 比现场强。所以把「共识只收明确表态」写进主持人常驻人设，纪要任务提示词
+// （interactiveHostTask）里再压一遍，两条路径都堵住。
 const (
-	roundtableHostRoleName     = "中立主持人"
-	roundtableHostInstructions = "保持中立，控制讨论节奏；每轮汇总共识、分歧与开放问题，不替普通成员表达立场。"
+	roundtableHostRoleName = "中立主持人"
+	roundtableHostInstructions = "保持中立，控制讨论节奏；每轮汇总共识、分歧与开放问题，不替普通成员表达立场。" +
+		"记录共识只认**明确表态**（成员明说接受 / 同意 / 认可某个结论，并写清是谁在哪一轮说的）；" +
+		"只补充材料、继续论述、没有表态的，一律不算共识，按性质归入分歧或未决，必要时直接写「未明确表态」。" +
+		"「没有反对」「未表异议」不等于同意，不得据此归纳共识；" +
+		"同时区分「用户指定的讨论口径」与「成员实际达成的结论」，两者不能混写。"
 )
 
 // roundtableNewChatroomID 对齐 _new_chatroom_id：确定性 uuid5。
