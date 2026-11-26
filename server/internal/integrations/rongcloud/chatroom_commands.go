@@ -1073,11 +1073,17 @@ func (h *systemHandler) actionChatroomSetMemberRole(ctx context.Context, cmd Com
 	if err != nil {
 		return errResult(404, "成员不存在")
 	}
+	// 没带 model 的 patch（只改角色名/职责）保持原行为：回读成员表里的现值。
+	// 带了 model 时必须用「写入模型」那一步的返回值 —— updated 来自只改
+	// 角色名/职责的 UPDATE，它的 DiscussionModel 还是本次修改前的旧值，
+	// 回给前端会让界面刷新后弹回旧模型，看起来像「保存没生效」。
+	appliedModel := updated.DiscussionModel
 	if modelProvided {
 		applied, err := h.queries.UpdateRongCloudChatroomMemberDiscussionModel(ctx, modelText, room.ID, node.ID)
 		if err != nil {
 			return errResult(500, "保存角色模型失败")
 		}
+		appliedModel = applied
 		// 角色板才是派发模型（your_turn 的 model 参数）的唯一来源，光改成员表
 		// 会让下一轮又按旧模型跑；这一句把两处拉齐，失败只记日志不阻断保存。
 		h.syncDiscussionRoleModel(ctx, rcID, textStr(updated.MemberID), textStr(applied))
@@ -1086,7 +1092,7 @@ func (h *systemHandler) actionChatroomSetMemberRole(ctx context.Context, cmd Com
 		"nodeId":           nodeID,
 		"roleName":         roleName,
 		"roleInstructions": roleInstructions,
-		"model":            textStr(updated.DiscussionModel),
+		"model":            textStr(appliedModel),
 		"speakingOrder":    updated.SpeakingOrder.Int32,
 		"capabilities":     capsToInterface(node.Capabilities),
 		"enabled":          enabled,
