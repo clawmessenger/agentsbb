@@ -1036,7 +1036,14 @@ func (h *chatroomRelayHub) buildPrompt(s *relaySession, member relayMember) stri
 	// 被读到的内容，压得住前面的接龙惯性。
 	summary := ""
 	if relaySummaryRequest(s.userText) {
-		summary = "\n\n【总结要求】用户要的是「总结整场讨论」，不是接着往下聊。逐条照做：" +
+		// 议题必须在指令里再点名一次（WEB-050 复测）：上下文段里的「本群的议题」
+		// 会参与预算裁剪，且它离指令最远、最容易被接龙惯性盖过去。把原始议题
+		// 直接写进总结要求，模型不必回头翻上文也能看到「要回答的是什么」。
+		anchorTopic := ""
+		if topic := strings.TrimSpace(s.topic); topic != "" {
+			anchorTopic = fmt.Sprintf("这场讨论最初的议题是「%s」。", relayClipToRoom(topic, 120))
+		}
+		summary = "\n\n【总结要求】" + anchorTopic + "用户要的是「总结整场讨论」，不是接着往下聊。逐条照做：" +
 			"① 第一句话直接回答这场讨论**最初提出**的那个问题（从对话最开头的议题算起，不是最近几段的话题），给出明确结论；" +
 			"② 再列支撑依据、已达成的一致、仍然存在的分歧（分点，别写成流水账）；" +
 			"③ 与主问题无关的延伸话题（例如临时决定、续期、结账、追责、举证清单）单独归入「延伸讨论」，可以一两句带过，**不得取代主问题**；" +

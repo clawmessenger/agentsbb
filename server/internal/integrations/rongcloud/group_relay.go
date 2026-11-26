@@ -98,6 +98,12 @@ func (h *chatroomRelayHub) startGroupRelay(ctx context.Context, groupID, request
 	if targeted {
 		rounds = 1
 	}
+	// WEB-050：群聊这条路径此前**根本不传议题**（StartGroupOrQueue 没有 topic
+	// 参数，session.topic 恒为空），于是群里的提示词只有「用户起的头」这一句，
+	// 拿不到整场讨论的主题。用户说「你来总结一下」时，模型看到的最近几段全是
+	// 临时决定 / 续期 / 追责，就不会回头答群名里那个原始问题 —— 这正是 QA 在
+	// 「先有鸡还是先有蛋」群里复测到的现象。议题取群名（群名通常就是议题），
+	// 群名为空时退回群简介。
 	started, queued := h.StartGroupOrQueue(bgCtx, groupID, speakers, text, requesterRCID, rounds, targeted)
 	// 记下触发消息 id：用户撤回它时按这个 id 精确中止（QA5-DEF-06 尾巴）。
 	if started || queued {
@@ -208,6 +214,34 @@ func (h *chatroomRelayHub) groupPaused(ctx context.Context, groupID string) bool
 	return stopped
 }
 
+// groupTopic 返回群聊的议题文案（群名优先，群名为空退回群简介）。
+//
+// 为什么群聊也需要议题：群里的接龙提示词靠 `session.topic` 注入「本群的议题：
+// X」，它是整场讨论的锚点。群聊路径过去一直传空串，模型只能看到「用户起的头」
+// 和最近几段接龙，话题一旦漂移就再也拉不回来（WEB-050）。
+//
+// 查询失败 / 群已解散时返回空串：议题只是提示词里的加分项，缺了照样能聊。
+func (h *chatroomRelayHub) groupTopic(ctx context.Context, groupID string) string {
+	if h.groupMirror == nil || h.groupMirror.GroupProfiles == nil {
+		return ""
+	}
+	profiles, err := h.groupMirror.GroupProfiles(ctx, []string{groupID})
+	if err != nil {
+		h.rt.logger.Warn("relay: group topic lookup", "group", groupID, "error", err)
+		return ""
+	}
+	for _, profile := range profiles {
+		if profile.GroupID != groupID {
+			continue
+		}
+		if name := strings.TrimSpace(profile.GroupName); name != "" {
+			return name
+		}
+		return strings.TrimSpace(profile.Description)
+	}
+	return ""
+}
+
 // StartGroup 发起一次群中继（复用 hub 的 sessions 表，键即群 id）。
 // rounds 是该群的「AI 对话轮数」设置：一次中继要跑几轮全员发言。
 func (h *chatroomRelayHub) StartGroup(ctx context.Context, groupID string, members []relayMember, userText, requesterRCID string, rounds int) bool {
@@ -227,6 +261,11 @@ func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string
 	// 按入口解析后的实际可发言成员数收敛轮数：单智能体群不跑多轮自问自答。
 	// contextRounds 仍用原 rounds（那是历史窗口长度，语义不同，不能一并收口）。
 	total := effectiveGroupRelayRounds(rounds, len(members))
+	// WEB-050：群聊这条路径此前**根本不设议题**（session.topic 恒为空），提示词
+	// 里只剩「用户起的头」这一句，模型拿不到整场讨论的主题。用户说「你来总结
+	// 一下」时，它看到的最近几段全是临时决定 / 续期 / 追责，就不会回头答群名
+	// 里那个原始问题 —— 这正是 QA 在「先有鸡还是先有蛋」群里复测到的现象。
+	topic := h.groupTopic(ctx, groupID)
 	h.mu.Lock()
 	if existing, busy := h.sessions[groupID]; busy {
 		enqueueLocked(existing, userText, requesterRCID, total, normalizeContextRounds(rounds), members, targeted)
@@ -238,6 +277,7 @@ func (h *chatroomRelayHub) StartGroupOrQueue(ctx context.Context, groupID string
 		members:       members,
 		userText:      userText,
 		isGroup:       true,
+		topic:         topic,
 		requesterRCID: requesterRCID,
 		contextRounds: normalizeContextRounds(rounds),
 		totalRounds:   total,

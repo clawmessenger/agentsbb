@@ -1109,3 +1109,49 @@ func TestRelaySummaryRequest(t *testing.T) {
 		}
 	}
 }
+
+// WEB-050 复测：群聊路径过去不传议题，总结要求只能笼统说「最初的议题」，
+// 模型看不到那个议题是什么。现在议题要直接写进总结要求里（不依赖上下文段
+// 是否被预算裁掉）。
+func TestBuildPrompt_SummaryDirectiveCarriesTheTopic(t *testing.T) {
+	hub := &chatroomRelayHub{rt: nilRelayRuntime()}
+	s := &relaySession{
+		chatroomRCID: "room1",
+		userText:     "你来总结一下",
+		isGroup:      true,
+		topic:        "先有鸡还是先有蛋",
+		members:      []relayMember{{rcID: "rc_a", roleName: "A"}},
+	}
+	prompt := hub.buildPrompt(s, s.members[0])
+	summaryAt := strings.Index(prompt, "【总结要求】")
+	if summaryAt < 0 {
+		t.Fatalf("missing summary directive: %q", prompt)
+	}
+	directive := prompt[summaryAt:]
+	if !strings.Contains(directive, "先有鸡还是先有蛋") {
+		t.Fatalf("summary directive must name the original topic: %q", directive)
+	}
+}
+
+// WEB-050：群议题取群名；群名为空才退回群简介，名字和简介都空就返回空串
+// （宁可不带议题，也不要把群 id 当议题喂给模型）。
+func TestGroupTopicFallsBackToDescription(t *testing.T) {
+	stub := newGroupMirrorStub()
+	stub.profiles["g1"] = GroupProfile{GroupID: "g1", GroupName: "先有鸡还是先有蛋", OwnerID: "u1"}
+	stub.profiles["g2"] = GroupProfile{GroupID: "g2", Description: "讨论人类起源", OwnerID: "u1"}
+	stub.profiles["g3"] = GroupProfile{GroupID: "g3", OwnerID: "u1"}
+	hub := &chatroomRelayHub{rt: nilRelayRuntime(), groupMirror: stub.mirror()}
+	ctx := context.Background()
+	if got := hub.groupTopic(ctx, "g1"); got != "先有鸡还是先有蛋" {
+		t.Errorf("topic(g1) = %q", got)
+	}
+	if got := hub.groupTopic(ctx, "g2"); got != "讨论人类起源" {
+		t.Errorf("topic(g2) = %q", got)
+	}
+	if got := hub.groupTopic(ctx, "g3"); got != "" {
+		t.Errorf("topic(g3) = %q, want empty", got)
+	}
+	if got := hub.groupTopic(ctx, "missing"); got != "" {
+		t.Errorf("topic(missing) = %q, want empty", got)
+	}
+}
