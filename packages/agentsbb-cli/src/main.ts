@@ -30,15 +30,18 @@ import { agentNameFromRcUser, ensureOpencodeInstalled, opsScopeAgentName, OPS_AG
 import { readOpsScopeSync } from "./ops-scope.js";
 import {
   ALLOW_DUPLICATE_SUPERVISOR_ENV,
+  clearSupervisorLock,
   clearSupervisorState,
   createDaemon,
   defaultDaemonPaths,
   findLiveSupervisor,
   formatDaemonStatus,
+  readSupervisorLockOwner,
   readSupervisorState,
   supervisorSpawnArgv,
   WATCHDOG_INTERVAL_MINUTES,
   WATCHDOG_TASK_NAME,
+  writeSupervisorLock,
   writeSupervisorState,
   type Daemon,
   type DaemonPaths,
@@ -251,7 +254,7 @@ export interface BuildProgramOpts {
   // Injectable for tests; defaults to acquireSupervisorLock (loopback port
   // singleton). Tests substitute an in-memory fake so parallel test processes
   // don't collide on the real port.
-  acquireLock?: (port: number) => Promise<SupervisorLock | null>;
+  acquireLock?: (port: number, paths?: DaemonPaths) => Promise<SupervisorLock | null>;
   /**
    * Injectable for tests; how `__relaunch`硬杀一个不肯退出的旧 supervisor
    * （默认 taskkill /T /F 或 SIGKILL）。测试里绝不能碰真实进程。
@@ -430,7 +433,10 @@ export function relaunchLockWaitMs(
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
-export async function acquireSupervisorLock(port: number = SUPERVISOR_LOCK_PORT): Promise<SupervisorLock | null> {
+export async function acquireSupervisorLock(
+  port: number = SUPERVISOR_LOCK_PORT,
+  paths?: DaemonPaths,
+): Promise<SupervisorLock | null> {
   const server = createNetServer();
   return await new Promise<SupervisorLock | null>((resolve, reject) => {
     server.once("error", (err: NodeJS.ErrnoException) => {
@@ -443,7 +449,16 @@ export async function acquireSupervisorLock(port: number = SUPERVISOR_LOCK_PORT)
     server.listen(port, "127.0.0.1", () => {
       server.removeAllListeners("error");
       // 监听 socket 只作租约，不接收连接。
-      resolve({ release: () => server.close() });
+      // 拿到锁的同时登记持有者 PID：这份登记只由持锁进程写、随 release 删，
+      // start 的失败路径不会碰它（pid/state 会被清）。stop/status 靠它发现
+      // 「有锁无登记」的孤儿 supervisor（见 daemon.readSupervisorLockOwner）。
+      if (paths) writeSupervisorLock(paths, process.pid);
+      resolve({
+        release: () => {
+          server.close();
+          if (paths) clearSupervisorLock(paths, process.pid);
+        },
+      });
     });
   });
 }
@@ -1116,7 +1131,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           const lockDeadline = Date.now() + lockWaitMs;
           for (;;) {
             try {
-              lock = await acquire(SUPERVISOR_LOCK_PORT);
+              lock = await acquire(SUPERVISOR_LOCK_PORT, daemonPaths);
             } catch (err) {
               // 非 EADDRINUSE 的绑定失败（端口段被策略占掉、权限不足……）。
               //
@@ -1144,11 +1159,17 @@ export function buildProgram(opts: BuildProgramOpts): Command {
           lockHeld = lock !== null;
           singletonLock = lock;
           if (!lock && !lockCheckError) {
+            // 端口锁被占但 pid/state 查不到活进程 —— 这正是「有锁无登记」的孤儿。
+            // lock 文件只有持锁者写，把它的 PID 直接报出来，用户就不用再手工
+            // netstat + taskkill 猜哪个进程（原来那句提示只能让人对着任务管理器发呆）。
+            const orphanPid = readSupervisorLockOwner(daemonPaths, opts.pidAlive ?? processAlive);
+            const who = orphanPid !== null ? ` (PID ${orphanPid})` : "";
             opts.stdout.write(
-              "another agentsbb supervisor is already running (singleton lock held, no live pid file —\n" +
+              `another agentsbb supervisor is already running${who} (singleton lock held, no live pid file —\n` +
                 "an orphaned supervisor from an earlier start is still alive). Refusing a second one: both\n" +
                 "would log in as the same RongCloud nodes and answer every private message twice.\n\n" +
-                "  find and stop it: agentsbb stop (or kill the stale agentsbb.exe processes)\n" +
+                `  stop it          : agentsbb stop${orphanPid !== null ? ` (finds PID ${orphanPid} via the port lock)` : ""}\n` +
+                "  or force-kill    : taskkill /PID " + (orphanPid ?? "<pid>") + " /T /F\n" +
                 `  start anyway     : set ${ALLOW_DUPLICATE_SUPERVISOR_ENV}=1\n`,
             );
             process.exitCode = 1;
@@ -1639,7 +1660,7 @@ export function buildProgram(opts: BuildProgramOpts): Command {
       let probeError: string | null = null;
       for (;;) {
         try {
-          heldLock = await acquire(SUPERVISOR_LOCK_PORT);
+          heldLock = await acquire(SUPERVISOR_LOCK_PORT, daemonPaths);
           probeError = null;
         } catch (err) {
           // 区分「端口被别人占着」和「探测本身报错」：两者的处置完全不同，写进
