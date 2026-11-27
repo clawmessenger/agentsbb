@@ -67,6 +67,15 @@ import {
   ROLE_RECOMMEND_TURN_TIMEOUT_MS,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
+import {
+  buildTitleSummarizeError,
+  buildTitleSummarizePrompt,
+  buildTitleSummarizeResponse,
+  parseTitleOutput,
+  parseTitleSummarizeRequest,
+  STALE_TITLE_SUMMARIZE_REQUEST_MS,
+  SUMMARIZE_TITLE_ACTION,
+} from "./title-summarize.js";
 import { formatUseModelAck, parseUseModelCommand, routeInCatalog, type UseModelCommand } from "./use-model.js";
 import { isNewSessionCommand, newSessionAck } from "./session-command.js";
 import type { UserModelStore } from "./user-models.js";
@@ -617,6 +626,9 @@ export class MessageDispatcher {
   // Same guard for the admin role-recommendation preview: a replayed request
   // must not spend a whole agent turn again. Bounded: evicts oldest.
   private readonly answeredRoleRecommendRequests = new Set<string>();
+  // Same guard for the discussion-title summary exchange: a replayed request
+  // must not spend another agent turn. Bounded: evicts oldest.
+  private readonly answeredTitleSummarizeRequests = new Set<string>();
   // 当前在飞的那一轮角色推荐（同一节点同时只允许一个）。
   //
   // 推荐绕过会话队列并发执行，服务端却只等 60s 就作废这一批：用户点重试时，
@@ -994,6 +1006,10 @@ export class MessageDispatcher {
       }
       if (cmd.action === ROLE_RECOMMEND_ACTION) {
         await this.handleRoleRecommend(msg, cmd, turns);
+        return;
+      }
+      if (cmd.action === SUMMARIZE_TITLE_ACTION) {
+        await this.handleTitleSummarize(msg, cmd, turns);
         return;
       }
       // 服务端下发的「新开会话」：群聊/讨论组里用户发的指令由服务端识别，
@@ -2454,6 +2470,63 @@ export class MessageDispatcher {
       const oldest = this.answeredRoleRecommendRequests.values().next().value;
       if (oldest === undefined) break;
       this.answeredRoleRecommendRequests.delete(oldest);
+    }
+  }
+
+  /**
+   * 讨论组标题总结：主持节点跑一个精简回合，把议题压成 ≤10 字的一句话标题。
+   * 与角色推荐同族（command 往返 + 精简回合），但更短、更轻，失败只影响标题。
+   */
+  async handleTitleSummarize(
+    msg: InboundIMMessage,
+    cmd: { request_id: string; params?: Record<string, unknown> },
+    turns: TurnRunner,
+  ): Promise<void> {
+    const request = parseTitleSummarizeRequest({
+      request_id: cmd.request_id,
+      service: "discussion",
+      action: SUMMARIZE_TITLE_ACTION,
+      params: cmd.params,
+    });
+    if (!request) return;
+    if (request.timestamp !== undefined) {
+      const ageMs = Date.now() - request.timestamp;
+      if (ageMs > STALE_TITLE_SUMMARIZE_REQUEST_MS) {
+        console.log(`title summarize: skipping stale request ${request.requestId} (${ageMs}ms old)`);
+        return;
+      }
+    }
+    if (this.answeredTitleSummarizeRequests.has(request.requestId)) {
+      console.log(`title summarize: skipping replayed request ${request.requestId}`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    let reply: string;
+    try {
+      const output = await turns.runTurn(buildTitleSummarizePrompt(request), request.model, undefined, {
+        timeoutMs: request.timeoutMs,
+        lean: true,
+      });
+      const title = parseTitleOutput(output);
+      reply = title
+        ? buildTitleSummarizeResponse(request.requestId, title, Date.now() - startedAt)
+        : buildTitleSummarizeError(request.requestId, "title summary invalid", Date.now() - startedAt);
+      if (title) {
+        console.log(`title summarize: answered ${request.requestId} with "${title}" in ${Date.now() - startedAt}ms`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "agent turn failed";
+      console.error(`title summarize: agent turn failed for ${request.requestId}: ${message}`);
+      reply = buildTitleSummarizeError(request.requestId, message, Date.now() - startedAt);
+    }
+
+    await this.deps.send(msg.fromUserId, "command", reply);
+    this.answeredTitleSummarizeRequests.add(request.requestId);
+    while (this.answeredTitleSummarizeRequests.size > 256) {
+      const oldest = this.answeredTitleSummarizeRequests.values().next().value;
+      if (oldest === undefined) break;
+      this.answeredTitleSummarizeRequests.delete(oldest);
     }
   }
 
