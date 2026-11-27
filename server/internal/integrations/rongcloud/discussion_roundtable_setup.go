@@ -240,7 +240,7 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 		// 同 topic 的重复提交按幂等成功接受；其它回 409 让前端重同步。
 		if row.SetupStep == setupStepRoles && row.Topic == topic {
 			// 幂等重放也补一次名字：上一次可能在改名那步之前就断了。
-			rt.nameDiscussionGroupFromTopic(ctx, chatroomID, topic)
+			rt.nameDiscussionGroupAsync(ctx, chatroomID, topic)
 			return okResult(map[string]interface{}{"accepted": true})
 		}
 		return errResult(409, "DISCUSSION_SETUP_STEP_CONFLICT")
@@ -248,7 +248,9 @@ func (rt *discussionRuntime) actionSubmitSetupTopic(ctx context.Context, cmd Com
 	rt.touchSetup(ctx, row.DiscussionID)
 	// 有了议题才有名字：建房（createRoundtableShell）时还什么都不知道，只能先落
 	// 占位「讨论组」，于是会话列表整排同名、根本分不出哪个是哪个。
-	rt.nameDiscussionGroupFromTopic(ctx, chatroomID, topic)
+	// 先用议题截断名兜底（会话列表立刻可读），再异步让主持 AI 总结一句更短的
+	// 标题覆盖它 —— AI 往返慢且可能失败，绝不能卡在建组回调里。
+	rt.nameDiscussionGroupAsync(ctx, chatroomID, topic)
 	// 异步推荐：detached context（命令回调结束不取消后台管线）。attempt 取
 	// 「已发出的 roles 卡数 + 1」，与换一批同一口径 —— 用户在 S2 回上一步改题
 	// 重提时，新推荐卡的幂等键才不会撞上旧卡（撞键会被当重放丢弃，前端永远
@@ -340,7 +342,18 @@ func discussionGroupNameFromTopic(topic string) string {
 // 改名失败只记日志 —— 名字是锦上添花，不能让它把建组主流程带崩（此刻讨论行已经
 // CAS 成功，回错误会让前端以为议题没提交、反复重试）。
 func (rt *discussionRuntime) nameDiscussionGroupFromTopic(ctx context.Context, chatroomID, topic string) {
-	if rt == nil || rt.queries == nil || chatroomID == "" {
+	rt.writeDiscussionGroupName(ctx, chatroomID, discussionGroupNameFromTopic(topic))
+}
+
+// writeDiscussionGroupName 把会话名从占位替换成 name。只在名字仍是占位时改：
+// 用户自己起过名（旧创建链路 / 后台改名 / AI 标题已写入）一律不覆盖。
+// 改名失败只记日志 —— 名字是锦上添花，不能把建组主流程带崩。
+//
+// AI 标题写入也走这里，靠「占位名闸门」保证截断名 → AI 名的覆盖顺序天然成立：
+// 截断名先写入后名字已非占位，AI 名到达时会被闸门挡掉 —— 所以 AI 写入必须先
+// 用一个特殊放行参数绕过闸门（见 nameDiscussionGroupAsync 里的 force 分支）。
+func (rt *discussionRuntime) writeDiscussionGroupName(ctx context.Context, chatroomID, name string) {
+	if rt == nil || rt.queries == nil || chatroomID == "" || strings.TrimSpace(name) == "" {
 		return
 	}
 	view, err := rt.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
@@ -351,8 +364,7 @@ func (rt *discussionRuntime) nameDiscussionGroupFromTopic(ctx context.Context, c
 	if !discussionGroupPlaceholderNames[current] {
 		return
 	}
-	name := discussionGroupNameFromTopic(topic)
-	if name == "" || name == current {
+	if name == current {
 		return
 	}
 	// 复用现有 profile 更新：需要把头像/轮数原值带回去（该 UPDATE 是整行写）。
@@ -363,10 +375,83 @@ func (rt *discussionRuntime) nameDiscussionGroupFromTopic(ctx context.Context, c
 		MaxRounds:           view.MaxRounds,
 	}); err != nil {
 		if rt.logger != nil {
-			rt.logger.Warn("discussion: rename chatroom from topic failed",
-				"chatroomId", chatroomID, "error", err)
+			rt.logger.Warn("discussion: rename chatroom failed",
+				"chatroomId", chatroomID, "name", name, "error", err)
 		}
 	}
+}
+
+// forceWriteDiscussionGroupName 覆盖写入 AI 标题：仅当当前名字是「议题截断名」
+// 或占位名时才写，避免覆盖用户手改的名字。用当前讨论的议题重建截断名做比对。
+func (rt *discussionRuntime) forceWriteDiscussionGroupName(ctx context.Context, chatroomID, topic, aiTitle string) {
+	if rt == nil || rt.queries == nil || chatroomID == "" {
+		return
+	}
+	title := normalizeDiscussionTitle(aiTitle)
+	if title == "" {
+		return
+	}
+	view, err := rt.queries.GetActiveRongCloudChatroomViewByRongCloudID(ctx, chatroomID)
+	if err != nil {
+		return
+	}
+	current := strings.TrimSpace(view.Name)
+	truncated := discussionGroupNameFromTopic(topic)
+	// 只在名字仍是占位或「我们刚写下的截断名」时覆盖；用户/后台改过的名字不动。
+	if !discussionGroupPlaceholderNames[current] && current != truncated {
+		return
+	}
+	if _, err := rt.queries.UpdateRongCloudChatroomProfileByRongCloudID(ctx, db.UpdateRongCloudChatroomProfileByRongCloudIDParams{
+		RongcloudChatroomID: chatroomID,
+		Name:                title,
+		PortraitUri:         view.PortraitUri,
+		MaxRounds:           view.MaxRounds,
+	}); err != nil {
+		if rt.logger != nil {
+			rt.logger.Warn("discussion: ai title rename failed",
+				"chatroomId", chatroomID, "title", title, "error", err)
+		}
+	}
+}
+
+// nameDiscussionGroupAsync 先落议题截断名兜底，再异步让主持 AI 把议题总结成
+// 一句 ≤10 字标题覆盖它。AI 往返慢（十几秒）且可能失败，全部在 detached
+// goroutine 里完成，建组回调立即返回，成功覆盖、失败静默保留截断名。
+func (rt *discussionRuntime) nameDiscussionGroupAsync(ctx context.Context, chatroomID, topic string) {
+	// 1) 兜底：立即给一个可读的名字。
+	rt.nameDiscussionGroupFromTopic(ctx, chatroomID, topic)
+	if rt == nil || rt.nodeRequests == nil || rt.roundtable == nil || chatroomID == "" {
+		return
+	}
+	// 2) 异步 AI 标题。detached context：命令回调结束不取消后台管线。
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil && rt.logger != nil {
+				rt.logger.Warn("discussion: ai title generation panicked", "panic", rec)
+			}
+		}()
+		host, hostErr := rt.roundtable.resolveHost(context.Background())
+		if hostErr != "" {
+			return // 主持离线/未配置：静默保留截断名
+		}
+		bctx, cancel := context.WithTimeout(context.Background(), time.Duration(titleWaitCapSeconds+5)*time.Second)
+		defer cancel()
+		title, code := rt.nodeRequests.SummarizeTitle(bctx, NodeRequestHost{
+			AIUserID:       host.aiUserID,
+			DisplayName:    host.displayName,
+			Avatar:         host.avatar,
+			TimeoutSeconds: titleWaitCapSeconds,
+			Model:          host.model,
+		}, topic, "")
+		if code != "" || title == "" {
+			if rt.logger != nil {
+				rt.logger.Info("discussion: ai title skipped, keeping truncated name",
+					"chatroomId", chatroomID, "code", code)
+			}
+			return
+		}
+		rt.forceWriteDiscussionGroupName(context.Background(), chatroomID, topic, title)
+	}()
 }
 
 // ---- requestRoleRecommend --------------------------------------------------
