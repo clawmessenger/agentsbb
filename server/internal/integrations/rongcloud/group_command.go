@@ -183,6 +183,28 @@ func (h *systemHandler) announceGroupNotice(ctx context.Context, fromUserID, gro
 	}
 }
 
+// announceGroupDismiss 在解散群之前往群里发一条自定义 group_dismissed 消息。
+//
+// 融云的 /group/dismiss.json 只删群关系，既不向 SDK 推 RC:GrpNtf，也不删成员本地
+// 会话（官方明确："解散后客户端仍可查看已保存到本地的群组历史消息"）。于是解散后
+// 所有成员的 web 会话列表照旧显示这个群，直到手动刷新触发 getMyGroups 才被摘掉。
+// 这条消息让在线成员收到即按 groupId 清理会话；离线的成员下次登录仍靠成员门禁兜底。
+//
+// 两条硬约束：
+//   - 必须在 dismissGroup 之前发 —— 群一旦解散就再也发不进去了；
+//   - 发送者必须是群成员（融云会校验），这里用群主本人，不能用 system。
+//
+// 发布失败只记日志不回滚：群已解散是既成事实，重发通知无意义，不能因此回包失败。
+func (h *systemHandler) announceGroupDismiss(ctx context.Context, fromUserID, groupID string) {
+	if h.client == nil || fromUserID == "" || groupID == "" {
+		return
+	}
+	if _, err := h.client.sendGroupMessage(ctx, fromUserID, groupID, objectNameGroupDismissed, encodeGroupDismissedContent(groupID)); err != nil {
+		h.logger.Warn("rongcloud: group dismiss notice publish failed",
+			"group_id", groupID, "from_user_id", fromUserID, "error", err)
+	}
+}
+
 func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
 	groupName := strings.TrimSpace(getString(cmd.Params, "groupName"))
 	if groupName == "" {

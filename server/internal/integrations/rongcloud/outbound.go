@@ -16,3 +16,14 @@ func encodeOpsTextContent(text, opsAgent string) string {
 	b, _ := json.Marshal(opsTextContent{Content: text, OpsAgent: opsAgent})
 	return string(b)
 }
+
+// groupDismissedContent 是解散通知的正文。只带 groupId：收到了就按这个 id 摘会话，
+// 不信任任何其它字段（也不带群名，避免乱序消息把已解散群的旧信息写回）。
+type groupDismissedContent struct {
+	GroupID string `json:"groupId"`
+}
+
+func encodeGroupDismissedContent(groupID string) string {
+	b, _ := json.Marshal(groupDismissedContent{GroupID: groupID})
+	return string(b)
+}

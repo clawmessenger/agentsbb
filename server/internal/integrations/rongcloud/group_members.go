@@ -580,6 +580,9 @@ func (h *systemHandler) handleGroupDismiss(ctx context.Context, msg NormalizedMe
 		h.logger.Error("rongcloud: group mirror dismiss", "error", err, "group_id", groupID)
 		return h.sendWebError(ctx, msg, cmd, 503, "group service is unavailable")
 	}
+	// 必须在 dismissGroup 之前发：群一旦解散就再发不进去了。这条通知让所有在线
+	// 成员立刻摘掉本地残留会话，不必等刷新时的 getMyGroups 门禁。
+	h.announceGroupDismiss(ctx, senderID, groupID)
 	if err := h.client.dismissGroup(ctx, groupID, senderID); err != nil {
 		h.logger.Warn("rongcloud: group dismiss", "error", err, "group_id", groupID)
 	}

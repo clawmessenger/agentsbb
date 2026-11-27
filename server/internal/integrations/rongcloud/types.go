@@ -11,11 +11,15 @@ const TypeRongCloud channel.Type = "rongcloud"
 
 // RongCloud message objectName constants.
 const (
-	objectNameText    = "RC:TxtMsg"
-	objectNameImage   = "RC:ImgMsg"
-	objectNameCommand = "command"
-	objectNameStream  = "RC:StreamMsg"
-	objectNameTyping  = "RC:TypSts"
+	objectNameText     = "RC:TxtMsg"
+	objectNameImage    = "RC:ImgMsg"
+	objectNameCommand  = "command"
+	objectNameStream   = "RC:StreamMsg"
+	objectNameTyping   = "RC:TypSts"
+	// group_dismissed 是解散群聊的自定义通知：融云服务端 dismiss 群不会向客户端
+	// 推 RC:GrpNtf，也不删本地会话，成员要等刷新才摘掉残留群聊。解散前以群主
+	// 身份往群里发这条轻量消息，各端收到即按 groupId 清理会话。
+	objectNameGroupDismissed = "group_dismissed"
 )
 
 // NormalizedMessage represents a parsed RongCloud webhook payload.
