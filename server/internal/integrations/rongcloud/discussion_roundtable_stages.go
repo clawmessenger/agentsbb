@@ -340,9 +340,28 @@ func (s *roundtableCreationService) ensureChatroom(ctx context.Context, request 
 		Nickname:         validated.host.displayName,
 		RoleName:         pgtype.Text{String: roundtableHostRoleName, Valid: true},
 		RoleInstructions: pgtype.Text{String: roundtableHostInstructions, Valid: true},
-		PortraitUri:      DefaultUserPortrait(),
+		PortraitUri:      s.memberPortraitFor(ctx, validated.host.aiUserID),
 	})
 	return nil
+}
+
+// memberPortraitFor 取成员的融云头像（设备/账号真实头像，形如
+// agent-avatars/<kind>-256.png），查不到或为空时回退统一默认图。
+//
+// 历史行为是把每个讨论成员头像写死成 DefaultUserPortrait()，导致成员表的
+// portrait_uri 全是一张默认图；前端 ChatAvatar 判为默认图后丢弃，只能按 kind
+// 出品牌图，而角色板补齐路径又把 kind 写死 opencode —— 整墙成员便都成了同一
+// 枚黑色 opencode 图标。写入真实头像后，成员表与融云用户表一致，各端都能拿到
+// 正确头像。查询失败只回退默认图，不阻断建组主流程。
+func (s *roundtableCreationService) memberPortraitFor(ctx context.Context, rongcloudUserID string) string {
+	if s == nil || s.queries == nil || rongcloudUserID == "" {
+		return DefaultUserPortrait()
+	}
+	user, err := s.queries.GetRongCloudUserByRongCloudID(ctx, rongcloudUserID)
+	if err != nil {
+		return DefaultUserPortrait()
+	}
+	return DefaultPortraitIfEmpty(user.PortraitUri.String)
 }
 
 // ensureMembers 对齐 _ensure_members：把推荐的角色落成 AI 成员行。
@@ -373,7 +392,7 @@ func (s *roundtableCreationService) ensureMembers(ctx context.Context, chatroomI
 			Enabled:          true,
 			DiscussionModel:  model,
 			SpeakingOrder:    pgtype.Int4{Int32: int32(role.SpeakingOrder), Valid: true},
-			PortraitUri:      DefaultUserPortrait(),
+			PortraitUri:      s.memberPortraitFor(ctx, node.RongcloudUserID),
 		})
 		if err != nil {
 			return roundtableErr("CREATE_ROUNDTABLE_RECOVERABLE")
