@@ -93,6 +93,10 @@ func (h *systemHandler) handleGroupAddMember(ctx context.Context, msg Normalized
 		h.logger.Error("rongcloud: group mirror add members", "error", err, "group_id", groupID)
 	}
 
+	// 与建群同理：加人只改成员关系，补一条通知让新加入者的会话列表立刻
+	// 出现该群，并让群内其他人看到「有新成员加入」。
+	h.announceGroupNotice(ctx, senderID, groupID, "有新成员加入群聊")
+
 	data := map[string]interface{}{
 		"groupId":    groupID,
 		"userIds":    joinable,

@@ -161,6 +161,28 @@ func (h *systemHandler) handleGroupCommand(ctx context.Context, msg NormalizedMe
 	}
 }
 
+// announceGroupNotice 在群内发一条持久化文本，作为建群 / 加人的入群通知。
+//
+// 融云的会话列表是「有消息才有会话」：建群和加人只改成员关系、不产生消息，
+// 于是被邀请者既收不到任何提示，会话列表里也不会出现这个群，必须等群里
+// 第一条真实消息才补出会话行。补一条文本同时解决两件事 —— 消息本身就是
+// 通知，落库、计数后所有成员的会话列表立刻出现该群，web / uniapp / App
+// 通用，不需要各端各自打补丁。
+//
+// 发送者必须是群成员（融云会校验）：建群用群主、加人用邀请者。不能用
+// system —— 它既不是群成员，web 还会过滤掉来自 system 的私聊。发布失败
+// 只记日志不回滚：群 / 成员关系已经写成功，会话列表后续靠真实消息也能
+// 补出来，重发通知是幂等无害的。
+func (h *systemHandler) announceGroupNotice(ctx context.Context, fromUserID, groupID, text string) {
+	if h.client == nil || fromUserID == "" || groupID == "" || text == "" {
+		return
+	}
+	if _, err := h.client.sendGroupMessage(ctx, fromUserID, groupID, objectNameText, encodeTextContent(text)); err != nil {
+		h.logger.Warn("rongcloud: group notice publish failed",
+			"group_id", groupID, "from_user_id", fromUserID, "error", err)
+	}
+}
+
 func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMessage, cmd CommandContent) error {
 	groupName := strings.TrimSpace(getString(cmd.Params, "groupName"))
 	if groupName == "" {
@@ -280,6 +302,10 @@ func (h *systemHandler) handleGroupCreate(ctx context.Context, msg NormalizedMes
 	}); err != nil {
 		h.logger.Error("rongcloud: group mirror save", "error", err, "group_id", groupID)
 	}
+
+	// 建群只写成员关系、不产生消息；补一条持久化入群通知，让被邀请者的会话
+	// 列表立刻出现该群，而不是等第一条真实消息才补出会话行。
+	h.announceGroupNotice(ctx, ownerID, groupID, fmt.Sprintf("群聊「%s」已创建，欢迎加入", groupName))
 
 	h.logger.Info("rongcloud: group created",
 		"group_id", groupID, "owner_id", ownerID, "members", len(userIDs))
