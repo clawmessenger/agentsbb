@@ -8,6 +8,7 @@ import {
   parsePermissionMarkers,
   parseQuestionMarkers,
   PERMISSION_PROTOCOL_INSTRUCTION,
+  QUESTION_PROTOCOL_INSTRUCTION,
   stripPermissionMarkers,
   resolvePermissionOptionId,
   stripQuestionMarkers,
@@ -128,6 +129,14 @@ describe("headless soft permission markers", () => {
     expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("[interaction:question]");
     expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("停止本轮");
     expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain("不要调用内置的 question");
+  });
+
+  it("question protocol is exported standalone and omits the permission part", () => {
+    expect(QUESTION_PROTOCOL_INSTRUCTION).toContain("[interaction:question]");
+    expect(QUESTION_PROTOCOL_INSTRUCTION).toContain("不要调用内置的 question");
+    expect(QUESTION_PROTOCOL_INSTRUCTION).not.toContain("[interaction:permission]");
+    // headless 完整协议 = 操作确认 + 独立提问协议，两段都在。
+    expect(PERMISSION_PROTOCOL_INSTRUCTION).toContain(QUESTION_PROTOCOL_INSTRUCTION);
   });
 });
 

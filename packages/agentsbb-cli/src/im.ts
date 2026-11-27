@@ -22,6 +22,7 @@ import {
   parsePermissionMarkers,
   parseQuestionMarkers,
   PERMISSION_PROTOCOL_INSTRUCTION,
+  QUESTION_PROTOCOL_INSTRUCTION,
   type ParsedPermission,
   resolvePermissionOptionId,
   stripPermissionMarkers,
@@ -928,17 +929,20 @@ export class MessageDispatcher {
         sessionKey: privateSessionKey,
         // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
         // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
-        // headless agent 无 ACP 双向权限通道：追加操作确认协议指令，让它在
-        // 敏感操作前输出标记并停下（软确认）。ACP agent 走真协议，不注入。
+        // 协议注入按 agent 类型分流：
+        //   · headless（无 ACP 双向通道）：注入完整协议（操作确认 + 提问）；
+        //   · ACP（走真权限协议）：只注入【提问协议】—— ACP 没有 question 事件，
+        //     原生 question/ask_user 工具也无人应答；behaviorPrompt 会被拼进
+        //     userText（agents.ts runAcpTurn 分支），文本标记协议对 ACP 同样生效。
+        //   · agentName 缺省（测试夹具/未指定执行器）：不注入，避免误伤既有契约。
         turnOptions: (() => {
           const behaviorPrompt = gate.behaviorPrompt || "";
-          // 只有明确是 headless agent（有名字且非 ACP）才注入软确认指令；agentName
-          // 缺省（测试夹具/未指定执行器）时不注入，避免误伤既有行为契约。
-          const headless = Boolean(this.deps.agentName) && !acpTurnSpecFor(this.deps.agentName);
-          const withProtocol = headless
-            ? [behaviorPrompt, PERMISSION_PROTOCOL_INSTRUCTION].filter(Boolean).join("\n\n---\n\n")
-            : behaviorPrompt;
-          return withProtocol ? { behaviorPrompt: withProtocol } : {};
+          const agentName = this.deps.agentName;
+          if (!agentName) return behaviorPrompt ? { behaviorPrompt } : {};
+          const isAcp = Boolean(acpTurnSpecFor(agentName));
+          const protocol = isAcp ? QUESTION_PROTOCOL_INSTRUCTION : PERMISSION_PROTOCOL_INSTRUCTION;
+          const withProtocol = [behaviorPrompt, protocol].filter(Boolean).join("\n\n---\n\n");
+          return { behaviorPrompt: withProtocol };
         })(),
         // 运维入口 agent：随流帧与整包回包带回去，web 端据此把回复归属到
         // 对应 agent 的运维面板（会话按入口 agent 分桶的另一半）。

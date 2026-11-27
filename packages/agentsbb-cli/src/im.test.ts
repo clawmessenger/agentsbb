@@ -3728,3 +3728,68 @@ describe("MessageDispatcher headless 软确认", () => {
     expect(prompts[0]).not.toContain("interaction:question");
   });
 });
+
+// 全平台提问协议注入：headless 注入完整协议（操作确认+提问），ACP 只注入提问协议。
+// ACP 的 behaviorPrompt 会被拼进 userText（agents.ts runAcpTurn 分支），所以提问
+// 标记协议对 ACP 同样生效——这是 ACP 6 家能弹 question 卡片的关键。
+describe("private question protocol injection by agent type", () => {
+  const snapshotWith = (agent: string, behaviorPrompt: string): PermissionSnapshot => ({
+    ownerUserId: "owner_1",
+    ownerUserIdPresent: true,
+    agents: [{ agent, nodeId: "node_x", allowPrivate: true, behaviorPrompt, version: 1 }],
+    updatedAt: Date.now(),
+  });
+  const inbound = (): Parameters<MessageDispatcher["handle"]>[0] => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user_q",
+    toUserId: "rc_node_x",
+    targetId: "rc_node_x",
+    conversationType: 1,
+    content: JSON.stringify({ content: "你好" }),
+  });
+
+  const captureBehaviorPrompt = async (agentName: string): Promise<string | undefined> => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName,
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => snapshotWith(agentName, "用户自定义行为"),
+    });
+    let seen: string | undefined;
+    await dispatcher.handle(inbound(), {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        seen = opts?.behaviorPrompt;
+        return "ok";
+      },
+    });
+    return seen;
+  };
+
+  it("headless agent gets both the operation-confirm and the question protocol", async () => {
+    const prompt = await captureBehaviorPrompt("kimi");
+    expect(prompt).toContain("用户自定义行为");
+    expect(prompt).toContain("[interaction:permission]");
+    expect(prompt).toContain("[interaction:question]");
+    expect(prompt).toContain("不要调用内置的 question");
+  });
+
+  it("ACP agent gets only the question protocol, not the operation-confirm one", async () => {
+    const prompt = await captureBehaviorPrompt("kiro-cli");
+    expect(prompt).toContain("用户自定义行为");
+    expect(prompt).toContain("[interaction:question]");
+    expect(prompt).toContain("不要调用内置的 question");
+    expect(prompt).not.toContain("[interaction:permission]");
+  });
+
+  it("agentName missing keeps the old contract (no protocol injected)", async () => {
+    // agentName 缺省（未指定执行器的测试夹具）不注入，避免误伤既有行为契约。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seen: string | undefined;
+    await dispatcher.handle(inbound(), {
+      runTurn: async (_p, _m, _sk, opts) => { seen = opts?.behaviorPrompt; return "ok"; },
+    });
+    expect(seen).toBeUndefined();
+  });
+});

@@ -69,10 +69,32 @@ export interface PendingInteraction {
 // ---- 指令层软确认协议（headless agent 无双向控制通道时的降级方案） --------
 
 /**
- * 注入私聊 behaviorPrompt 的指令：让 agent 在执行不可逆/敏感操作前主动输出
- * permission 标记并停下来。headless 的 -p/exec/run 一次性调用没有 stdin 双向
- * 通道，无法像 ACP 那样在协议层阻塞等待；这是唯一对所有 headless agent 都
- * 生效、且不依赖真机抓包各家控制协议的方案。
+ * 【提问协议】—— 全平台通用，不依赖 ACP 双向通道。
+ *
+ * headless 与 ACP agent 都没有可应答原生 question / ask_user 工具的界面（ACP
+ * 只有 session/request_permission，没有 question 事件），所以无论哪类 agent，
+ * 需要用户从选项里做选择时都必须改用文本标记。ACP 的 behaviorPrompt 会被拼进
+ * userText（agents.ts 的 runAcpTurn 分支），因此这段指令对 ACP 同样生效。
+ *
+ * 这段单独导出，供 im.ts 给 ACP agent 单独注入（ACP 走真权限协议，不注入
+ * 操作确认软协议，但仍需要提问协议）。
+ */
+export const QUESTION_PROTOCOL_INSTRUCTION = [
+  "【提问协议】",
+  "设备端没有交互界面：绝对不要调用内置的 question / ask_user 交互工具（调用后没有任何人能回答，会永久卡住）。",
+  "需要让用户从选项里做选择时，直接在回复末尾另起一段输出如下标记并停止本轮：",
+  '[interaction:question] {"question":"一句话说明要问什么","options":["选项一","选项二"],"multiple":false} [/interaction]',
+  "用户选择后会作为新消息发给你，届时再按用户的选择继续；不要为了等答案而调用任何工具。",
+].join("\n");
+
+/**
+ * 注入私聊 behaviorPrompt 的指令（headless 专用）：让 agent 在执行不可逆/敏感
+ * 操作前主动输出 permission 标记并停下来。headless 的 -p/exec/run 一次性调用
+ * 没有 stdin 双向通道，无法像 ACP 那样在协议层阻塞等待；这是唯一对所有
+ * headless agent 都生效、且不依赖真机抓包各家控制协议的方案。
+ *
+ * 包含【操作确认协议】+【提问协议】两段，等于 PERMISSION_ONLY + QUESTION。
+ * ACP agent 不注入这段（它有真权限协议），只注入 QUESTION_PROTOCOL_INSTRUCTION。
  */
 export const PERMISSION_PROTOCOL_INSTRUCTION = [
   "【操作确认协议】",
@@ -81,11 +103,7 @@ export const PERMISSION_PROTOCOL_INSTRUCTION = [
   '[interaction:permission] {"permission":"用一句话说明你要执行的操作","options":[{"reply":"once","label":"允许一次"},{"reply":"always","label":"始终允许"},{"reply":"reject","label":"拒绝"}]} [/interaction]',
   "用户选择后会把决定作为新消息发给你：若允许则继续执行该操作，若拒绝则取消并说明。",
   "",
-  "【提问协议】",
-  "设备端没有交互界面：绝对不要调用内置的 question / ask_user 交互工具（调用后没有任何人能回答，会永久卡住）。",
-  "需要让用户从选项里做选择时，直接在回复末尾另起一段输出如下标记并停止本轮：",
-  '[interaction:question] {"question":"一句话说明要问什么","options":["选项一","选项二"],"multiple":false} [/interaction]',
-  "用户选择后会作为新消息发给你，届时再按用户的选择继续；不要为了等答案而调用任何工具。",
+  QUESTION_PROTOCOL_INSTRUCTION,
 ].join("\n");
 
 const PERMISSION_MARKER_RE = /\[interaction:permission\]\s*([\s\S]*?)\s*\[\/interaction\]/g;
