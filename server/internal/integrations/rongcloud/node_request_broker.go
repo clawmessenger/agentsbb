@@ -119,6 +119,20 @@ const (
 	// 设备端的 sample 已经是 400 字符内的单行片段，这里再兜一层：detail 是任意
 	// JSON，不该由它决定日志行有多长。
 	nodeErrorDetailMaxChars = 500
+
+	// 讨论组标题总结请求族。与 roles_ 共用 command_result 信封和 pending 表，
+	// 靠 request_id 前缀区分；设备端 CLI 的 title-summarize.ts 应答。
+	titleService  = "discussion"
+	titleAction   = "summarize_title"
+	titlePrefix   = "title_"
+	titleMaxChars = 10
+	// titleWaitCapSeconds 是标题总结的服务端等待上限。标题只是会话列表里的
+	// 一个名字，不该像角色推荐那样等满 60s：超过这个窗口就放弃、回落议题截断名。
+	titleWaitCapSeconds   = 25
+	titleFallbackTimeoutS = 20
+	// 标题失败只影响名字、不阻塞建组，错误码不外露给用户，仅供日志与调用方降级。
+	titleErrorCodeTimeout = "DISCUSSION_TITLE_TIMEOUT"
+	titleErrorCodeInvalid = "DISCUSSION_TITLE_INVALID"
 )
 
 type pendingNodeRequest struct {
@@ -144,6 +158,8 @@ type pendingNodeRequest struct {
 	// catalog 是 MODEL_CATALOG 族请求的终态（roles 族恒为零值）。两者共用
 	// status/errorCode，靠 kind 区分，避免再造一套等待机制。
 	catalog DiscussionModelCatalog
+	// title 是 summarize_title 族请求的终态（roles / catalog 族恒为零值）。
+	title string
 }
 
 func NewNodeRequestBroker(logger *slog.Logger) *NodeRequestBroker {
@@ -303,6 +319,179 @@ func (b *NodeRequestBroker) RecommendRoles(ctx context.Context, host NodeRequest
 		return nil, code
 	}
 	return b.AwaitRecommendation(ctx, requestID)
+}
+
+// ---- 讨论组标题总结请求族 -------------------------------------------------
+//
+// 创建讨论组时把议题发给主持节点，让模型压成一句 ≤10 字的短标题，用作会话
+// 列表里的组名。与 roles_ 共用 command_result 信封、pending 表和等待机制，
+// 靠 title_ 前缀隔离。旧设备不认 summarize_title action，会静默忽略 → 本族
+// 超时 → 调用方回落到议题截断名，建组主流程不受影响。
+
+// StartTitle records a pending title request and sends it to the host.
+// 返回 request id 或对外错误码。超时按主持配置值与 title 窗口上限取小。
+func (b *NodeRequestBroker) StartTitle(ctx context.Context, host NodeRequestHost, topic, goal string) (string, string) {
+	if host.AIUserID == "" {
+		return "", NodeRequestCodeHostNotConfigured
+	}
+
+	requestID := titlePrefix + uuid.NewString()
+	timeout := time.Duration(host.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = titleFallbackTimeoutS * time.Second
+	}
+	if cap := titleWaitCapSeconds * time.Second; timeout > cap {
+		timeout = cap
+	}
+
+	params := map[string]interface{}{
+		"topic":            topic,
+		"goal":             goal,
+		"protocol_version": "v1",
+		"timeout_seconds":  int(timeout.Seconds()),
+		"timestamp":        b.now().UnixMilli(),
+	}
+	// 与推荐同口径：只在配了模型时才下发，老 CLI 忽略未知键但空串会被当「指定了空模型」。
+	if model := strings.TrimSpace(host.Model); model != "" {
+		params["model"] = model
+	}
+
+	content, err := json.Marshal(map[string]interface{}{
+		"request_id": requestID,
+		"service":    titleService,
+		"action":     titleAction,
+		"params":     params,
+	})
+	if err != nil {
+		return "", titleErrorCodeInvalid
+	}
+
+	b.mu.Lock()
+	if b.send == nil {
+		b.mu.Unlock()
+		b.logger.Warn("discussion title: no sender bound, reporting host offline",
+			"ai_user_id", host.AIUserID)
+		return "", NodeRequestCodeHostOffline
+	}
+	send := b.send
+	b.pending[requestID] = &pendingNodeRequest{
+		requestID:      requestID,
+		kind:           titleAction,
+		host:           host,
+		targetAIUserID: host.AIUserID,
+		sentAt:         b.now(),
+		expiresAt:      b.now().Add(timeout),
+		done:           make(chan struct{}),
+		status:         "pending",
+	}
+	b.mu.Unlock()
+
+	if err := send(ctx, host.AIUserID, string(content)); err != nil {
+		b.settleTitle(requestID, "", titleErrorCodeInvalid, "")
+		b.forgetRequest(requestID)
+		b.logger.Warn("discussion title: send failed",
+			"request_id", requestID, "ai_user_id", host.AIUserID, "error", err)
+		return "", titleErrorCodeInvalid
+	}
+	b.logger.Info("discussion title: request sent",
+		"request_id", requestID, "ai_user_id", host.AIUserID)
+	return requestID, ""
+}
+
+// AwaitTitle blocks until the node answers, expires, or ctx is cancelled.
+func (b *NodeRequestBroker) AwaitTitle(ctx context.Context, requestID string) (string, string) {
+	b.mu.Lock()
+	record, ok := b.pending[requestID]
+	b.mu.Unlock()
+	if !ok {
+		return "", titleErrorCodeInvalid
+	}
+
+	timer := time.NewTimer(time.Until(record.expiresAt))
+	defer timer.Stop()
+
+	select {
+	case <-record.done:
+	case <-timer.C:
+		b.settleTitle(requestID, "", titleErrorCodeTimeout, "")
+		<-record.done
+	case <-ctx.Done():
+		b.settleTitle(requestID, "", titleErrorCodeTimeout, "")
+		<-record.done
+	}
+
+	b.mu.Lock()
+	delete(b.pending, requestID)
+	status, errorCode, title := record.status, record.errorCode, record.title
+	b.mu.Unlock()
+
+	if status != "completed" {
+		if errorCode == "" {
+			errorCode = titleErrorCodeTimeout
+		}
+		return "", errorCode
+	}
+	return title, ""
+}
+
+// SummarizeTitle runs a full start + await round trip. Best-effort: the caller
+// decides how to degrade when a code comes back (host usually offline).
+func (b *NodeRequestBroker) SummarizeTitle(ctx context.Context, host NodeRequestHost, topic, goal string) (string, string) {
+	requestID, code := b.StartTitle(ctx, host, topic, goal)
+	if code != "" {
+		return "", code
+	}
+	return b.AwaitTitle(ctx, requestID)
+}
+
+// settleTitle records the terminal state for the title family (same lock and
+// first-settle-wins semantics as settle / settleCatalog).
+func (b *NodeRequestBroker) settleTitle(requestID, status, errorCode, title string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.pending[requestID]
+	if !ok || record.settled {
+		return
+	}
+	record.settled = true
+	record.status = status
+	record.errorCode = errorCode
+	record.title = title
+	close(record.done)
+}
+
+// settleTitleForKind 在 AcceptResponse 的超时分支按族结算：标题族走
+// settleTitle，其余（roles）走原 settle，避免把超时失败写进错误的终态字段。
+func (b *NodeRequestBroker) settleTitleForKind(record *pendingNodeRequest, requestID string) {
+	if record.kind == titleAction {
+		b.settleTitle(requestID, "", titleErrorCodeTimeout, "")
+		return
+	}
+	b.settle(requestID, "", NodeRequestCodeRecommendTimeout, nil)
+}
+
+// normalizeDiscussionTitle 是标题的服务端兜底清洗（设备端已清洗一次，这里
+// 再收一层，防止旧设备/被改写的回包带来多行、引号或超长文本进会话列表）。
+// 返回空串表示不可用。
+func normalizeDiscussionTitle(raw string) string {
+	text := strings.TrimSpace(strings.SplitN(strings.ReplaceAll(raw, "\r\n", "\n"), "\n", 2)[0])
+	// 先去尾部标点，再剥包裹符号，循环几轮处理「《标题》。」。
+	for i := 0; i < 3; i += 1 {
+		cleaned := strings.TrimSpace(strings.TrimRight(text, "，。！？、；：,.!?;: "))
+		cleaned = strings.Trim(cleaned, "\"'“”‘’「」『』《》*_`# ")
+		if cleaned == text {
+			break
+		}
+		text = cleaned
+	}
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) > titleMaxChars {
+		text = string(runes[:titleMaxChars])
+	}
+	return strings.TrimSpace(text)
 }
 
 // ---- 模型目录请求族（protocolVersion 2）---------------------------------
@@ -735,7 +924,25 @@ func (b *NodeRequestBroker) AcceptResponse(senderID, content string) bool {
 		return true
 	}
 	if b.now().After(record.expiresAt) {
-		b.settle(result.RequestID, "", NodeRequestCodeRecommendTimeout, nil)
+		b.settleTitleForKind(record, result.RequestID)
+		return true
+	}
+
+	// 标题总结族：回包带 payload.title，按 title_ 前缀归属（record.kind）。
+	if record.kind == titleAction {
+		rawTitle, _ := result.Payload["title"].(string)
+		title := normalizeDiscussionTitle(rawTitle)
+		if title == "" {
+			b.logger.Warn("discussion title: invalid payload",
+				"request_id", result.RequestID, "node", senderID,
+				"error", result.Payload["error"])
+			b.settleTitle(result.RequestID, "", titleErrorCodeInvalid, "")
+			return true
+		}
+		b.logger.Info("discussion title: answered",
+			"request_id", result.RequestID, "node", senderID, "title", title,
+			"serverMs", b.now().Sub(record.sentAt).Milliseconds())
+		b.settleTitle(result.RequestID, "completed", "", title)
 		return true
 	}
 
