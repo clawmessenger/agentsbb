@@ -111,6 +111,33 @@ describe("buildAgentArgs", () => {
     ]);
   });
 
+  // WEB-057：设备端全局 workdir 必须显式传给 codex，覆盖 resume 时从 rollout
+  // 恢复的旧 cwd。--cd 的位置是硬约束：exec 层（--sandbox 之后、resume/prompt
+  // 之前），放 resume 后面 codex 会判非法参数直接退出。
+  it("codex 带 workdir 时把 --cd 放在 exec 层（首次会话）", () => {
+    expect(buildAgentArgs("codex", "hi", "gpt-5", undefined, { cwd: "D:\\工作\\虾说" })).toEqual([
+      "exec", "--sandbox", "workspace-write", "--cd", "D:\\工作\\虾说",
+      "hi", "--json", "--skip-git-repo-check", "-m", "gpt-5",
+    ]);
+  });
+
+  it("codex resume 时 --cd 仍在 resume 之前，覆盖 rollout 保存的旧目录", () => {
+    const args = buildAgentArgs("codex", "hi", "gpt-5", "cm-single-1", {
+      cwd: "D:\\工作\\虾说", resumeSessionId: "11111111-2222-3333-4444-555555555555", fsRestricted: true,
+    });
+    expect(args).toEqual([
+      "exec", "--sandbox", "read-only", "--cd", "D:\\工作\\虾说",
+      "resume", "11111111-2222-3333-4444-555555555555", "hi",
+      "--json", "--skip-git-repo-check", "-m", "gpt-5",
+    ]);
+    // --cd 必须在 resume 之前（否则 codex 判非法参数）
+    expect(args.indexOf("--cd")).toBeLessThan(args.indexOf("resume"));
+  });
+
+  it("codex 没有 workdir 时不传 --cd（保持旧行为）", () => {
+    expect(buildAgentArgs("codex", "hi", "gpt-5").includes("--cd")).toBe(false);
+  });
+
   it("opencode uses run subcommand with --model", () => {
     expect(buildAgentArgs("opencode", "hi", "glm-4.7")).toEqual([
       "run", "hi", "--format", "json", "--thinking", "--model", "glm-4.7",

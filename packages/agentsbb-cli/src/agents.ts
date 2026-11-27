@@ -81,6 +81,18 @@ export interface RunAgentTurnOpts {
   // 与 text/reasoning 同语义 —— 调用方只管存最新的那份。仅 stream-json 型
   // agent（claude/codex）会产生，其余 agent 一次都不回调。
   onActivity?: (steps: ActivityStep[]) => void;
+  /**
+   * 单聊二次确认（仅 ACP 类 agent 生效）：把权限请求抛给调用方，用户点选后
+   * 通过 replyOptionId 回写。未设置 = 维持自动批准。类型与 acp-turn 一致，
+   * 在此重复声明是为了避免 agents.ts 反向依赖 acp-turn 的内部类型。
+   */
+  onPermissionRequest?: (req: {
+    id: string;
+    permission: string;
+    choices: Array<{ optionId: string; label: string; reply: "once" | "always" | "reject" }>;
+    replyOptionId: (optionId: string) => void;
+    reject: () => void;
+  }) => void;
   signal?: AbortSignal;
   // 会话隔离键（可选）。多个会话形态共用同一个 agent 二进制，而 agent CLI
   // 默认把它们全塞进自己的「主会话」：openclaw 的默认键就是 agent:main:main，
@@ -186,6 +198,16 @@ export interface AgentArgvContext {
    * 随本机 config.toml 变形。
    */
   codexCredential?: CodexCredentialPlan | null;
+  /**
+   * WEB-057：本轮 agent 应该使用的**工作目录根**（设备端全局 workdir）。
+   *
+   * codex 的 `exec resume <id>` 会从 rollout 里恢复会话自己保存的旧 cwd，覆盖
+   * 子进程 spawn 时传入的 cwd —— 表现为虾说平台切换工作目录后，Codex 会话仍
+   * 在旧目录读文件。实测（codex-cli 0.169.0）：`codex exec --cd <DIR> … resume
+   * <id>` 的参数位置合法，`--cd` 放在 exec 层（resume 之前）对首次与续接会话
+   * 都生效。这里由真正 spawn 的调用方把 workdir 传进来，策略只负责拼 argv。
+   */
+  cwd?: string;
 }
 type AgentArgvStrategy = (
   prompt: string,
@@ -495,6 +517,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     ...(ctx?.fsRestricted
       ? ["--sandbox", "read-only"]
       : ["--sandbox", "workspace-write"]),
+    // WEB-057：显式把设备端全局 workdir 传给 codex，作为会话工作目录根。
+    // 必须在 exec 层（resume 之前）给出：`codex exec resume <id>` 会从 rollout
+    // 里恢复会话自己保存的旧 cwd，覆盖 spawn 的 cwd —— 这正是「平台换了工作目录，
+    // Codex 会话还在旧目录读文件」的根因。实测 codex-cli 0.169.0：`--cd` 放在
+    // `--sandbox` 之后、`resume` 之前，首次会话和续接会话都接受（参数位置合法，
+    // 假 id 时只报 no rollout found，不会判非法参数）。没有配置 workdir 时不传，
+    // 保持旧行为（codex 用自己那套默认目录）。
+    ...(ctx?.cwd ? ["--cd", ctx.cwd] : []),
     // 续接要换成 `exec resume <id> <prompt>` 的子命令形态（prompt 必须跟在 id
     // 后面）。实测 0.144.6：`codex exec resume <uuid> "hi" --json` 会被正常接受，
     // 不存在的 id 报 `no rollout found for thread id …`（见 agent-sessions.ts 的
@@ -2374,6 +2404,9 @@ function ensureDeviceOpencodeConfig(
     instructions: behaviorFile ? [behaviorFile] : [],
     ...(input.lean ? { lean: true } : {}),
     ...(!input.lean && input.terse ? { terse: true } : {}),
+    // headless serve 没有 TUI 接 question/ask_user 的弹窗：模型一调就永久挂在
+    // running，整轮再也不出正文。设备端派生配置统一禁用，改走文本标记卡片。
+    noInteractiveTools: true,
   });
   if (!built) return null;
   const target = deviceOpencodeConfigPath(
@@ -2750,6 +2783,7 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
       ...(opts.onReasoningChunk ? { onReasoningChunk: opts.onReasoningChunk } : {}),
       ...(opts.onActivity ? { onActivity: opts.onActivity } : {}),
       ...(opts.onSessionId ? { onSessionId: opts.onSessionId } : {}),
+      ...(opts.onPermissionRequest ? { onPermissionRequest: opts.onPermissionRequest } : {}),
       logger: (message) => console.warn(message),
     }).catch((err: unknown) => {
       if (!(err instanceof AcpStartupError) || opts.disableAcp) throw err;
@@ -2809,6 +2843,8 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         fsRestricted,
         ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
         ...(codexPlan ? { codexCredential: codexPlan } : {}),
+        // WEB-057：把设备端 workdir 传给 argv 策略（codex 用它拼 --cd）。
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
       })
       : [];
     const argvMode = strategyArgs.length > 0;

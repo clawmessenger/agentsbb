@@ -633,6 +633,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // 发言回合：只换提示、留工具（见 TurnOptions.terse）。
         ...(!turnOpts?.lean && turnOpts?.terse ? { terse: true } : {}),
         ...(turnOpts?.onUsage ? { onUsage: turnOpts.onUsage } : {}),
+        ...(turnOpts?.onPermissionRequest ? { onPermissionRequest: turnOpts.onPermissionRequest } : {}),
       })),
     // Streaming variant: the agent's stdout is decoded chunk by chunk
     // (agents.ts onChunk, UTF-8 boundary safe); the dispatcher turns those
@@ -665,6 +666,7 @@ export async function startRunLoop(opts: StartRunLoopOpts): Promise<void> {
         // 流式路径必须单独传 —— 之前只给 runTurn 传了 lean，流式回合（也就是
         // 线上真正在跑的讨论/群聊）一直吃满 2.9 万 token 的 build 提示。
         ...(turnOpts?.terse ? { terse: true } : {}),
+        ...(turnOpts?.onPermissionRequest ? { onPermissionRequest: turnOpts.onPermissionRequest } : {}),
       })),
     // 用户发「新开会话」：只清「会话键 → agent 会话 id」的映射，下一轮没有
     // resumeSessionId 自然就是新会话。agent 自己的会话文件保持原样（历史不销毁）。

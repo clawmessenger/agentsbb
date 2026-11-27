@@ -218,6 +218,12 @@ export interface DaemonPaths {
   logDir: string;
   pidFile: string;
   stateFile: string;
+  /**
+   * 端口单例锁的持有者登记。刻意与 pidFile / stateFile 分开：那两个会被
+   * `daemon.start()` 在 spawn 后覆盖、失败路径又清掉，正是「进程活着但 pid
+   * 文件指向死进程」的孤儿来源。这个文件只由真正拿到端口锁的进程写/删。
+   */
+  lockFile: string;
 }
 
 /** supervisor 自己写下的运行详情；`status` 的全部依据。 */
@@ -254,6 +260,11 @@ export interface DaemonStatusReport {
   serviceName: string;
   /** pid 文件与状态文件指向不同进程时的说明（两个来源分叉，见 status()）。 */
   note?: string;
+  /**
+   * 「有锁无登记」的孤儿 supervisor：pid/state 文件查不到活进程，但端口锁仍被
+   * 它持有。running 仍为 false（不撒谎说在跑），但给出了可处置的目标 PID。
+   */
+  orphanPid?: number;
 }
 
 export interface Daemon {
@@ -376,6 +387,7 @@ export function defaultDaemonPaths(stateDir = stateHome()): DaemonPaths {
     logDir,
     pidFile: join(stateDir, "supervisor.pid"),
     stateFile: join(stateDir, "supervisor.json"),
+    lockFile: join(stateDir, "supervisor.lock"),
   };
 }
 
@@ -514,6 +526,62 @@ export function clearSupervisorState(paths: DaemonPaths = defaultDaemonPaths()):
       // 忽略：清不掉就不是致命问题。
     }
   }
+}
+
+// ---------------------------------------------------------------- 单例锁持有者登记
+//
+// 为什么单独一个文件：pid / state 文件由 `daemon.start()` 在 spawn 后先写、
+// 子进程拿到端口锁后再写。一次失败的 start（子进程撞到已有的端口锁而自杀）
+// 会走 `clearSupervisorState()` 把 pid/state 全删掉 —— 于是真正持有端口锁的
+// 那份 supervisor 变成「有锁无登记」的孤儿：stop/status 看不见它，任何新
+// start 又被端口锁拒绝，设备永久卡死。
+//
+// lock 文件只能由**真正拿到端口锁的进程**写（见 main.ts acquireSupervisorLock），
+// 并随它的 release 删除；start 的失败路径不会碰它。于是它是「谁持有端口锁」
+// 的权威记录，stop/status 靠它能找到并处置孤儿。
+
+/** 由持锁进程写入自己的 PID。 */
+export function writeSupervisorLock(paths: DaemonPaths = defaultDaemonPaths(), pid: number = process.pid): void {
+  try {
+    mkdirSync(paths.stateDir, { recursive: true });
+    writeFileSync(paths.lockFile, `${pid}\n`, { mode: 0o600 });
+  } catch {
+    // 尽力而为：写不进去最坏退化成没有孤儿检测能力，不影响 supervisor 本身。
+  }
+}
+
+/** 由持锁进程在 release 时删除；只删自己写的那个 PID，避免误删后来者。 */
+export function clearSupervisorLock(paths: DaemonPaths = defaultDaemonPaths(), pid?: number): void {
+  if (pid !== undefined && readLockOwnerPid(paths) !== pid) return;
+  try {
+    rmSync(paths.lockFile, { force: true });
+  } catch {
+    // 忽略。
+  }
+}
+
+function readLockOwnerPid(paths: DaemonPaths): number | undefined {
+  try {
+    const digits = readFileSync(paths.lockFile, "utf8").replace(/[^0-9]/g, "");
+    if (!digits) return undefined;
+    const pid = Number.parseInt(digits, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 返回仍持有端口锁且活着的进程 PID；没有登记、登记指向死进程、或进程已退都返回 null。
+ * 与 findLiveSupervisor 的分工：那个读 pid/state（会被 start 失败路径抹掉），
+ * 这个读 lock 文件（只有持锁者写），两者结合才能覆盖「有锁无登记」的孤儿。
+ */
+export function readSupervisorLockOwner(
+  paths: DaemonPaths = defaultDaemonPaths(),
+  isAlive: (pid: number) => boolean = defaultIsAlive,
+): number | null {
+  const pid = readLockOwnerPid(paths);
+  return pid !== undefined && isAlive(pid) ? pid : null;
 }
 
 // ---------------------------------------------------------------- 日志
@@ -859,8 +927,21 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     }
 
     if (!isAlive(pid)) {
-      clearSupervisorState(paths);
-      err(`supervisor exited immediately after start (PID ${pid}). Log tail:\n`);
+      // 子进程最典型的死法：撞到另一份还活着的 supervisor 持有的端口锁。
+      // 绝不能在这里无条件 clearSupervisorState() —— 那会把那份孤儿的最后
+      // 一条登记（pid/state 文件）也抹掉，让它从此停不掉、也起不来。
+      // lock 文件只有真正拿到锁的进程会写，这里读它来判断是否另有持锁者。
+      const lockOwner = readSupervisorLockOwner(paths, isAlive);
+      if (lockOwner === null) {
+        clearSupervisorState(paths);
+        err(`supervisor exited immediately after start (PID ${pid}). Log tail:\n`);
+      } else {
+        err(
+          `supervisor exited immediately after start (PID ${pid}): another supervisor ` +
+            `(PID ${lockOwner}) holds the singleton port lock. Left pid/state files untouched ` +
+            `so the live one stays discoverable — stop it with: agentsbb stop\n`,
+        );
+      }
       try {
         const tail = tailLines(readFileSync(target, "utf8"), 20);
         if (tail.trim()) err(`${tail.replace(/^/gm, "  ")}\n`);
@@ -887,9 +968,15 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
 
   async function stop(): Promise<void> {
     const running = findRunning();
-    if (!running) {
+    // findRunning() 只看 pid/state 文件，找不到「有锁无登记」的孤儿。lock 文件
+    // 只有持锁者写，是 stop 唯一能发现它的线索 —— 否则用户只能手工 taskkill。
+    const orphanPid = running ? null : readSupervisorLockOwner(paths, isAlive);
+    if (!running && orphanPid === null) {
       const stale = stateFilesPresent();
       clearSupervisorState(paths);
+      // lock 文件里可能残留一个已经死掉的持锁者登记（强退没走 release）。
+      // 它已经不会被判成孤儿，但留着是垃圾，顺手清掉。
+      clearSupervisorLock(paths);
       out(
         stale
           ? "no agentsbb supervisor is running (cleared a stale pid/state file).\n"
@@ -897,9 +984,13 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       );
       return;
     }
-    const pid = running.pid;
-    const count = running.state?.agents.length ?? 0;
-    out(`stopping supervisor PID ${pid}${count ? ` (and its ${count} agent process(es))` : ""}...\n`);
+    const pid = running ? running.pid : orphanPid!;
+    const count = running?.state?.agents.length ?? 0;
+    out(
+      running
+        ? `stopping supervisor PID ${pid}${count ? ` (and its ${count} agent process(es))` : ""}...\n`
+        : `stopping orphaned supervisor PID ${pid} (holds the singleton port lock, no pid/state file)...\n`,
+    );
     if (platform === "win32") {
       // /T 收整棵进程树；Node 的 process.kill 在 Windows 上做不到这一点。
       spawnSyncFn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
@@ -921,6 +1012,9 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
       }
     }
     clearSupervisorState(paths);
+    // 被 taskkill / SIGKILL 强退的进程没机会 release，lock 登记会残留；按 PID
+    // 精确清掉自己这份，别把可能属于别人的新登记删了。
+    if (!isAlive(pid)) clearSupervisorLock(paths, pid);
     if (isAlive(pid)) {
       err(`stop failed: PID ${pid} is still alive — run agentsbb stop again.\n`);
       return;
@@ -1083,10 +1177,14 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     // 找到活的那个照杀不误。**一个说没在跑、一个真杀掉**，用户没有任何办法看出矛盾。
     const live = findRunning();
     const alive = live !== null;
+    // pid/state 两个来源都查不到活进程，不代表没有 supervisor —— 端口锁持有者
+    // 可能是个「有锁无登记」的孤儿。lock 文件只有持锁者写，这里是它的唯一线索。
+    const lockOwner = alive ? null : readSupervisorLockOwner(paths, isAlive);
     const report: DaemonStatusReport = {
       platform,
       running: alive,
       stale: !alive && (stateFilesPresent() || state !== null),
+      ...(lockOwner !== null ? { orphanPid: lockOwner } : {}),
       agents: [],
       logs: [],
       serviceName: DAEMON_SERVICE_NAME,
@@ -1095,7 +1193,14 @@ export function createDaemon(overrides: DaemonOverrides = {}): Daemon {
     if (autostart) report.autostart = autostart;
     const latest = latestLogPath(paths);
     if (latest) report.logs.push(latest);
-    if (!alive) return report;
+    if (!alive) {
+      if (lockOwner !== null) {
+        report.note =
+          `an orphaned supervisor (PID ${lockOwner}) still holds the singleton port lock but has no pid/state file; ` +
+          `run \`agentsbb stop\` to stop it (plain start will keep being refused).`;
+      }
+      return report;
+    }
     const pid = live.pid;
     report.pid = pid;
     const liveState = live.state;
@@ -1687,6 +1792,11 @@ export function formatDaemonStatus(report: DaemonStatusReport, paths: DaemonPath
     if (report.cwd) lines.push(`workdir: ${report.cwd}`);
   } else {
     lines.push("daemon : not running in the background (agents should be offline)");
+    if (report.orphanPid !== undefined) {
+      lines.push(`         an orphaned supervisor (PID ${report.orphanPid}) still holds the singleton`);
+      lines.push("         port lock — pid/state files do not list it. `agentsbb start` will keep being");
+      lines.push("         refused. Run `agentsbb stop` to stop it, then `agentsbb start`.");
+    }
     if (report.stale) {
       lines.push("         a stale pid/state file was left behind (a previous crash or `kill -9`);");
       lines.push("         run `agentsbb stop` to clear it, then `agentsbb start`.");

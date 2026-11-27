@@ -958,7 +958,10 @@ export interface ModelCatalogLoaderOpts {
   // 自身的 default_model 更该被回显 —— 面板上"当前默认"显示的就是用户自己设的值。
   readAgentDefaultModel?: () => string | undefined;
   // Probes one OpenAI-compatible endpoint; `null` = unusable.
-  probe?: (endpoint: ProviderEndpoint) => Promise<string[] | null>;
+  // `timeoutMs` lets the declared-model path cap the request at a short budget
+  // (see DECLARED_PROBE_TIMEOUT_MS) so a hand-written `model = "..."` line never
+  // blocks the web's 8s window while we complete the list from /models.
+  probe?: (endpoint: ProviderEndpoint, timeoutMs?: number) => Promise<string[] | null>;
   logger?: (message: string) => void;
   /** How long a cached catalog is served before a background refresh kicks in. */
   ttlMs?: number;
@@ -1008,6 +1011,16 @@ const EMPTY_CATALOG_TTL_MS = 15_000;
  */
 const DECLARED_CLI_TIMEOUT_MS = 4_000;
 
+/**
+ * 配置里已声明模型的端点也要 probe 一次补全清单时的**短预算**。
+ *
+ * 手写配置里 `model = "glm-5.2"` 只是当下在用的那一条，端点的 GET /models
+ * 往往还有更多可用模型（quukk_direct 实测只回 1 条，面板因此看起来「不全」）。
+ * 但 probe 是网络往返，最坏 8s 会吃掉 web 的等待窗口；2s 足够拿到同机的
+ * 端点清单，超时就退回配置里那条声明，与旧行为等价、绝不把面板变空。
+ */
+const DECLARED_PROBE_TIMEOUT_MS = 2_000;
+
 function groupsFromCatalog(catalog: DiscussionModelCatalog): GroupedProviders {
   const grouped: GroupedProviders = new Map();
   for (const provider of catalog.providers) {
@@ -1041,7 +1054,9 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
   const spec = modelListSpec(opts.agentName);
   const readConfig = opts.readConfig
     ?? ((name: string | undefined) => readAgentConfig(name, { cwd: opts.cwd }));
-  const probe = opts.probe ?? ((endpoint: ProviderEndpoint) => probeProviderModels(endpoint));
+  const probe = opts.probe
+    ?? ((endpoint: ProviderEndpoint, timeoutMs?: number) =>
+      probeProviderModels(endpoint, timeoutMs === undefined ? {} : { timeoutMs }));
   const ttlMs = opts.ttlMs ?? DEFAULT_CACHE_TTL_MS;
   const now = opts.now ?? Date.now;
   let cached: DiscussionModelCatalog | null = null;
@@ -1233,14 +1248,22 @@ export function createModelCatalogLoader(opts: ModelCatalogLoaderOpts): ModelCat
       }
     }
 
-    // 配置里已经写死了模型清单的端点不再 probe：白等最多 8s（正是 web 超时窗口
-    // 的元凶），而且再探一遍也只可能得到同一份清单的子集。
-    const endpoints = (config?.endpoints ?? []).filter(
-      (endpoint) => !config?.declaredModels?.[endpoint.id]?.length,
-    );
+    // 对所有端点 probe，用 /models 的真实清单补全手写配置里的子集。
+    //
+    // 以前「已声明模型的端点直接跳过 probe」，理由是白等 8s 且只会拿到子集。
+    // 但手写的 `model = "glm-5.2"` 只是当下在用的那一条，端点上往往还有更多
+    // 可用模型 —— codex/quukk_direct 就只回报这一条，用户看到的就是「模型
+    // 列表不全」，怎么刷新都只有一条。现在补齐：
+    //   · 已声明的端点用 DECLARED_PROBE_TIMEOUT_MS 短预算，不拖慢 web 窗口；
+    //   · probe 结果走 mergeEndpointModels 与配置清单**并集**，只增不减，原来
+    //     那条声明模型一定保留（瞬时故障也不会让面板变空）。
+    const endpoints = config?.endpoints ?? [];
     if (endpoints.length > 0) {
       const probed = await Promise.all(
-        endpoints.map(async (endpoint) => ({ endpoint, ids: await probe(endpoint) })),
+        endpoints.map(async (endpoint) => {
+          const declared = Boolean(config?.declaredModels?.[endpoint.id]?.length);
+          return { endpoint, declared, ids: await probe(endpoint, declared ? DECLARED_PROBE_TIMEOUT_MS : undefined) };
+        }),
       );
       for (const { endpoint, ids } of probed) {
         if (!ids) {

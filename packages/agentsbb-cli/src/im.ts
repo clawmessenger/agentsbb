@@ -2,6 +2,7 @@ import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ARGV_PROMPT_MAX_CHARS } from "./agents.js";
+import { acpTurnSpecFor } from "./agent-acp-providers.js";
 import { collectProducedArtifacts, snapshotWorkdir, type ProducedArtifact, type WorkdirSnapshot } from "./artifacts.js";
 import type { ActivityStep } from "./agent-activity.js";
 import type { AnsweredTurn, AnsweredTurnStore } from "./answered-turns.js";
@@ -13,6 +14,24 @@ import {
 } from "./discussion-cancel.js";
 import { buildChatStreamFrame, encodeChatStreamWireFrames, parseChatStopRequest, type ChatStreamStatus, type ChatStreamTimelineEntry } from "./chat-stream.js";
 import { buildHtmlCard, extractHtmlFence, htmlReviseFromFilePrompt, htmlRevisePrompt } from "./cards.js";
+import {
+  buildPermissionCard,
+  buildQuestionCard,
+  mapAcpOptionsToChoices,
+  parseNativeQuestionToolInput,
+  parsePermissionMarkers,
+  parseQuestionMarkers,
+  PERMISSION_PROTOCOL_INSTRUCTION,
+  QUESTION_PROTOCOL_INSTRUCTION,
+  type ParsedPermission,
+  resolvePermissionOptionId,
+  stripPermissionMarkers,
+  stripQuestionMarkers,
+  type InteractionReply,
+  type PendingInteraction,
+  type PermissionInteractionRequest,
+  type QuestionInteractionRequest,
+} from "./interaction.js";
 import { buildAutoContinuationPrompt, classifyTurnError, describeTurnError, TurnIncompleteError } from "./turn-error.js";
 import {
   buildModelCatalogResponse,
@@ -49,6 +68,15 @@ import {
   ROLE_RECOMMEND_TURN_TIMEOUT_MS,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
+import {
+  buildTitleSummarizeError,
+  buildTitleSummarizePrompt,
+  buildTitleSummarizeResponse,
+  parseTitleOutput,
+  parseTitleSummarizeRequest,
+  STALE_TITLE_SUMMARIZE_REQUEST_MS,
+  SUMMARIZE_TITLE_ACTION,
+} from "./title-summarize.js";
 import { formatUseModelAck, parseUseModelCommand, routeInCatalog, type UseModelCommand } from "./use-model.js";
 import { isNewSessionCommand, newSessionAck } from "./session-command.js";
 import type { UserModelStore } from "./user-models.js";
@@ -283,6 +311,18 @@ export interface TurnOptions {
   terse?: boolean;
   /** 上游用量回调（只有 serve 模式能拿到），用于把「为什么慢」写进日志。 */
   onUsage?: (usage: { inputTokens: number; outputTokens: number; reasoningTokens: number }) => void;
+  /**
+   * 单聊二次确认：ACP agent 收到权限请求时通过此回调抛出。由 runStreamedTurn
+   * 设置，向用户发 permission 卡片并在点选后经 replyOptionId 回写。未设置 =
+   * 维持自动批准（群聊/讨论组/运维）。
+   */
+  onPermissionRequest?: (req: {
+    id: string;
+    permission: string;
+    choices: Array<{ optionId: string; label: string; reply: "once" | "always" | "reject" }>;
+    replyOptionId: (optionId: string) => void;
+    reject: () => void;
+  }) => void;
 }
 
 export interface TurnRunner {
@@ -461,25 +501,35 @@ export const PRIVATE_TURN_SILENT_STALL_MS = 600_000;
  */
 export const PRIVATE_TURN_TOOL_RUNNING_STALL_MS = 1_800_000;
 
-/**
- * 「运维轮」的停滞窗口（WEB-39 第二次修复，2026-11-25 傍晚）。
- *
- * 前一版只修了「有 running 工具步骤」这一路（PRIVATE_TURN_TOOL_RUNNING_STALL_MS），
- * 但现场证据表明并非所有运维轮都会上报 activity：`relaunch.log` 里部分 ops 轮次
- * 全程 `activity=0`（codex 的某些执行路径只吐正文/思考，不吐工具步骤），这类轮次
- * 落不到长窗口上，仍按 240s（已产正文）/600s（零产出）判 —— 「运维老是超时」
- * 就是这么来的：用户让它查版本、翻配置，它先说一句「我看一下」然后闷头跑命令，
- * 240s 一到就被掐，前端弹「本轮执行超时，已中止」。
- *
- * 所以运维轮单独放宽到 15 分钟：运维本来就是几分钟级的重活（装依赖、跑构建、
- * 批量检查），而它的『停不下来』风险由用户显式「停止」和服务端取消兜住 ——
- * 等错了只是慢，掐早了却要用户重来一遍（还要重跑那 4 分钟的命令）。
- */
-export const PRIVATE_TURN_OPS_STALL_MS = 900_000;
+/** 机器级运维轮在 prompt 前注入的作用域抬头（见 ops-scope.ts 的 opsScopeHeader）。 */
+const OPS_SCOPE_PROMPT_PREFIX = "【运维对象】";
 
-/** 这一轮是不是运维轮：优先看派发信封的 opsAgent，再退回会话 id 的两种运维形态。 */
-export function isOpsTurn(input: { opsAgent?: string | null; conversationId?: string }): boolean {
+/**
+ * 运维轮**不再受无进展停滞守卫自动中止**（WEB-039 第三次修复，2026-11-26）。
+ *
+ * 前两轮先后加了「工具有 running 步骤时 30 分钟」和「运维轮 15 分钟」两档窗口，
+ * 回归仍报「运维老是超时」。原因是识别链路不可靠：私聊守卫拿到的
+ * `conversationId` 是**发送方用户 id**，不是 ops 节点 id，`_ops/ops_/om_` 兜底
+ * 恒不命中；一旦消息没带 `opsAgent`（老会话、会话名被改、服务端代理链路），
+ * 运维轮就退回 240s/600s 被掐，哪怕它正在跑一条几分钟的命令。
+ *
+ * 与其继续调窗口，直接让运维轮豁免停滞守卫：运维本来就是几分钟级的重活
+ * （装依赖、跑构建、批量检查），长命令期间没有增量是常态；它的「停不下来」
+ * 风险由用户显式「停止」和服务端取消兜住 —— 等错了只是慢，掐早了要用户
+ * 重跑那几分钟的命令。
+ */
+export function isOpsTurn(input: {
+  opsAgent?: string | null;
+  conversationId?: string;
+  /** 本轮实际交给 agent 的 prompt；机器级 ops 会带作用域抬头。 */
+  prompt?: string;
+  /** 私聊会话键；运维入口带 entryAgent 时会按 `#<agent>` 分桶。 */
+  sessionKey?: string;
+}): boolean {
   if (input.opsAgent && input.opsAgent.trim() !== "") return true;
+  if (input.prompt?.trimStart().startsWith(OPS_SCOPE_PROMPT_PREFIX)) return true;
+  // privateSessionKey 只有运维入口才带 `#<agent>` 分桶后缀；普通私聊不带。
+  if (/#[^#]+$/.test(input.sessionKey ?? "")) return true;
   const id = input.conversationId ?? "";
   return /_ops$/.test(id) || id.startsWith("ops_") || id.startsWith("om_");
 }
@@ -488,6 +538,7 @@ export function isOpsTurn(input: { opsAgent?: string | null; conversationId?: st
  * 停滞守卫的判定（纯函数，便于单测）。
  *
  * 判据只看「有没有进展」，不看总时长：
+ *   - 运维轮（`opsTurn`）：**永不自动中止**，收尾只认用户停止 / 服务端取消（见上）；
  *   - 有工具正在跑（`runningToolMs` > 0）：按 PRIVATE_TURN_TOOL_RUNNING_STALL_MS
  *     判，工具执行期间没有增量是常态（见上）；
  *   - 已产出过正文：连续 stallMs（默认 PRIVATE_TURN_STALL_MS）无进展 → 掐；
@@ -502,19 +553,19 @@ export function shouldAbortStalledTurn(input: {
   stallMs?: number;
   /** 仍在运行的工具已经跑了多久（ms）；undefined/0 = 当前没有跑着的工具。 */
   runningToolMs?: number;
-  /** 运维轮：窗口整体放宽到 PRIVATE_TURN_OPS_STALL_MS（见该常量的注释）。 */
+  /** 运维轮：豁免停滞守卫，不会被自动判超时。 */
   opsTurn?: boolean;
 }): boolean {
   if (input.aborted || input.terminalSent) return false;
+  // WEB-039：运维轮豁免。放在 runningToolMs 分支之前，确保 activity=0 的
+  // 运维轮和长工具步骤都不会再被任何时间窗口掐断。
+  if (input.opsTurn) return false;
   if (input.runningToolMs !== undefined && input.runningToolMs > 0) {
     return input.runningToolMs >= PRIVATE_TURN_TOOL_RUNNING_STALL_MS;
   }
-  const baseWindow = input.producedText
+  const windowMs = input.producedText
     ? (input.stallMs ?? PRIVATE_TURN_STALL_MS)
     : PRIVATE_TURN_SILENT_STALL_MS;
-  const windowMs = input.opsTurn
-    ? Math.max(baseWindow, PRIVATE_TURN_OPS_STALL_MS)
-    : baseWindow;
   return input.idleMs >= windowMs;
 }
 
@@ -564,6 +615,9 @@ export class MessageDispatcher {
   // cardId -> latest html for cards this bridge produced, so card_action
   // iteration (html_revise) can rebuild context. Bounded: evicts oldest.
   private readonly htmlCards = new Map<string, { html: string; fromUserId: string }>();
+  // 单聊二次确认：permissionId/questionId -> 待决交互。用户点 card_action 时
+  // 反查并回灌给正在阻塞等待的 agent。带 TTL 超时兜底；消费后即从表里删除。
+  private readonly pendingInteractions = new Map<string, PendingInteraction>();
   // requestIds already answered, so 融云's per-reconnect offline replay is a
   // no-op instead of a response burst. Bounded: evicts oldest.
   private readonly answeredCatalogRequests = new Set<string>();
@@ -573,6 +627,9 @@ export class MessageDispatcher {
   // Same guard for the admin role-recommendation preview: a replayed request
   // must not spend a whole agent turn again. Bounded: evicts oldest.
   private readonly answeredRoleRecommendRequests = new Set<string>();
+  // Same guard for the discussion-title summary exchange: a replayed request
+  // must not spend another agent turn. Bounded: evicts oldest.
+  private readonly answeredTitleSummarizeRequests = new Set<string>();
   // 当前在飞的那一轮角色推荐（同一节点同时只允许一个）。
   //
   // 推荐绕过会话队列并发执行，服务端却只等 60s 就作废这一批：用户点重试时，
@@ -872,7 +929,21 @@ export class MessageDispatcher {
         sessionKey: privateSessionKey,
         // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
         // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
-        turnOptions: gate.behaviorPrompt ? { behaviorPrompt: gate.behaviorPrompt } : {},
+        // 协议注入按 agent 类型分流：
+        //   · headless（无 ACP 双向通道）：注入完整协议（操作确认 + 提问）；
+        //   · ACP（走真权限协议）：只注入【提问协议】—— ACP 没有 question 事件，
+        //     原生 question/ask_user 工具也无人应答；behaviorPrompt 会被拼进
+        //     userText（agents.ts runAcpTurn 分支），文本标记协议对 ACP 同样生效。
+        //   · agentName 缺省（测试夹具/未指定执行器）：不注入，避免误伤既有契约。
+        turnOptions: (() => {
+          const behaviorPrompt = gate.behaviorPrompt || "";
+          const agentName = this.deps.agentName;
+          if (!agentName) return behaviorPrompt ? { behaviorPrompt } : {};
+          const isAcp = Boolean(acpTurnSpecFor(agentName));
+          const protocol = isAcp ? QUESTION_PROTOCOL_INSTRUCTION : PERMISSION_PROTOCOL_INSTRUCTION;
+          const withProtocol = [behaviorPrompt, protocol].filter(Boolean).join("\n\n---\n\n");
+          return { behaviorPrompt: withProtocol };
+        })(),
         // 运维入口 agent：随流帧与整包回包带回去，web 端据此把回复归属到
         // 对应 agent 的运维面板（会话按入口 agent 分桶的另一半）。
         opsAgent: entryAgent,
@@ -939,6 +1010,10 @@ export class MessageDispatcher {
       }
       if (cmd.action === ROLE_RECOMMEND_ACTION) {
         await this.handleRoleRecommend(msg, cmd, turns);
+        return;
+      }
+      if (cmd.action === SUMMARIZE_TITLE_ACTION) {
+        await this.handleTitleSummarize(msg, cmd, turns);
         return;
       }
       // 服务端下发的「新开会话」：群聊/讨论组里用户发的指令由服务端识别，
@@ -1268,6 +1343,26 @@ export class MessageDispatcher {
     let seq = 0;
     /** 是否已经发过终态帧（completed/failed/cancelled）：防止外层 catch 重复收尾。 */
     let terminalSent = false;
+
+    // 单聊二次确认（仅 convType=1）：构造注入 agent 的交互回调。等待用户决策期间
+    // 没有正文/chunk，停滞守卫会误杀 —— 这里用 decision Watcher 周期性推进
+    // lastProgressAt，并让有 pending 交互时跳过停滞判定。
+    let awaitingInteraction = false;
+    const interactiveTurnOptions: TurnOptions = {
+      ...(opts.turnOptions ?? {}),
+      ...(ctx.conversationType === 1 ? {
+        onPermissionRequest: (req) => {
+          awaitingInteraction = true;
+          lastProgressAt = Date.now();
+          this.registerPermissionInteraction(req, {
+            requesterId: ctx.requesterId,
+            sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+            onDecision: () => { awaitingInteraction = false; lastProgressAt = Date.now(); },
+          });
+        },
+      } : {}),
+    };
+
     /** 轮次开始时刻：日志里打 elapsed，用来回答「这一轮到底跑了多久」。 */
     const turnStartedAt = Date.now();
     /** 最近一次「有进展」的时刻（正文/思考/工具步骤都算）。见 PRIVATE_TURN_STALL_MS。 */
@@ -1313,12 +1408,16 @@ export class MessageDispatcher {
     //  零输出僵死的兜底由下面的停滞守卫第二档 PRIVATE_TURN_SILENT_STALL_MS 承担。）
     // 停滞守卫（仅私聊）：判据只看「有没有进展」，不看总时长 —— 正文产出后的
     // 停滞用短窗口（PRIVATE_TURN_STALL_MS），全程无产出的僵死用长窗口
-    // （PRIVATE_TURN_SILENT_STALL_MS）。运维跑长命令时工具步骤会持续上报，
-    // 不停推进的轮次不会被这里掐掉。
+    // （PRIVATE_TURN_SILENT_STALL_MS）。运维轮直接豁免（WEB-039）：长命令期间
+    // 没有增量是常态，窗口怎么调都挡不住入口标记缺失时的误杀，收尾交给用户
+    // 「停止」和服务端取消。
     const stallTimer: ReturnType<typeof setInterval> | null = ctx.conversationType === 1
       ? setInterval(() => {
           try {
             if (controller.signal.aborted || terminalSent) return;
+            // 等待用户二次确认期间 agent 正常阻塞（无正文增量），不能按停滞掐掉；
+            // 该等待由交互自己的 TTL（INTERACTION_TTL_MS）兜底。
+            if (awaitingInteraction) return;
             const idleMs = Date.now() - lastProgressAt;
             // 工具还在跑的时候没有增量是正常的（长命令/构建/装依赖）。用步骤
             // 自己的 startedAt 算「这一跑已经多久」，交给纯函数按长窗口判。
@@ -1332,7 +1431,12 @@ export class MessageDispatcher {
               producedText,
               idleMs,
               runningToolMs,
-              opsTurn: isOpsTurn({ opsAgent: opts.opsAgent, conversationId: ctx.conversationId }),
+              opsTurn: isOpsTurn({
+                opsAgent: opts.opsAgent,
+                conversationId: ctx.conversationId,
+                prompt: opts.prompt,
+                sessionKey: opts.sessionKey,
+              }),
             })) return;
             terminalSent = true;
             console.error(
@@ -1396,9 +1500,16 @@ export class MessageDispatcher {
         // old single-shot reply is the whole turn — including the old error
         // semantics (single chat: log only; your_turn: error command_result).
         try {
-          const out = await opts.turns.runTurn(opts.prompt, opts.model, opts.sessionKey, opts.turnOptions);
+          const out = await opts.turns.runTurn(opts.prompt, opts.model, opts.sessionKey, interactiveTurnOptions);
           const uploaded = await this.collectArtifacts(artifactSnapshot);
-          await opts.fallback(this.ensureVisibleReply(out, uploaded));
+          let plainText = this.ensureVisibleReply(out, uploaded);
+          if (ctx.conversationType === 1) {
+            plainText = this.emitInteractionCardsFromText(plainText, {
+              requesterId: ctx.requesterId,
+              sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+            });
+          }
+          await opts.fallback(plainText);
           await this.sendArtifactMessages(ctx, uploaded);
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -1440,6 +1551,9 @@ export class MessageDispatcher {
       // （内容在 activitySnapshot 里），这样同一份信息不会在帧里存两遍。
       // web 端按它渲染「思考卡片 ↔ 工具卡片」交错的流式时间线。
       const timeline: ChatStreamTimelineEntry[] = [];
+      // 原生 question 工具兜底只做一次：中止后中止帧还会带最后一次 activity，
+      // 没有这个闸门就会重复发卡片、重复 abort。
+      let nativeQuestionHandled = false;
       const activeReasoningEntry = (): number | null => {
         const last = timeline[timeline.length - 1];
         return last && last[0] === "r" ? timeline.length - 1 : null;
@@ -1490,6 +1604,15 @@ export class MessageDispatcher {
           activitySnapshot = activity;
           // 同一份快照交给停滞守卫：它只看「有没有 running 的步骤」，不落盘。
           latestActivity = activity;
+          // headless 的原生 question 工具没有应答方：立刻换成卡片交互并中止轮次。
+          if (ctx.conversationType === 1 && !nativeQuestionHandled
+            && this.handleNativeQuestionActivity(activity, {
+              requesterId: ctx.requesterId,
+              sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+            }, () => controller.abort())) {
+            nativeQuestionHandled = true;
+            return;
+          }
         }
         const now = Date.now();
         // 只有「纯正文增量」才走短窗口，并且这一帧不带思考/过程流（见上）。
@@ -1524,7 +1647,7 @@ export class MessageDispatcher {
             sendDelta,
             controller.signal,
             opts.sessionKey,
-            opts.turnOptions,
+            interactiveTurnOptions,
           );
           break;
         } catch (err) {
@@ -1583,8 +1706,15 @@ export class MessageDispatcher {
       // （lib/ai-message-lifecycle.ts 的 streamEchoIndex），两者正文一旦不同，
       // 群里就会出现一对重复气泡。
       const uploaded = await this.collectArtifacts(artifactSnapshot);
-      // 终帧用完整全文（agent 的最终 stdout 可能比 chunk 累积更权威）。
-      const visibleText = this.ensureVisibleReply(finalText || snapshot, uploaded);
+      // 单聊二次确认：agent 正文里的 permission / question 标记解析成交互卡片，
+      // 并把协议原文从正文剥掉（不把标记上屏）。
+      let visibleText = this.ensureVisibleReply(finalText || snapshot, uploaded);
+      if (ctx.conversationType === 1) {
+        visibleText = this.emitInteractionCardsFromText(visibleText, {
+          requesterId: ctx.requesterId,
+          sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+        });
+      }
       // 每轮一行诊断（不含正文）：排查「某个会话看不到思考/过程」时先看这里
       // —— 设备端唯一一处把三路快照的长度写进日志的地方。reasoning=0 说明
       // 这一轮的 agent 根本没吐思考文本（或它的结构化输出没开），不是 web 丢帧。
@@ -2347,6 +2477,63 @@ export class MessageDispatcher {
     }
   }
 
+  /**
+   * 讨论组标题总结：主持节点跑一个精简回合，把议题压成 ≤10 字的一句话标题。
+   * 与角色推荐同族（command 往返 + 精简回合），但更短、更轻，失败只影响标题。
+   */
+  async handleTitleSummarize(
+    msg: InboundIMMessage,
+    cmd: { request_id: string; params?: Record<string, unknown> },
+    turns: TurnRunner,
+  ): Promise<void> {
+    const request = parseTitleSummarizeRequest({
+      request_id: cmd.request_id,
+      service: "discussion",
+      action: SUMMARIZE_TITLE_ACTION,
+      params: cmd.params,
+    });
+    if (!request) return;
+    if (request.timestamp !== undefined) {
+      const ageMs = Date.now() - request.timestamp;
+      if (ageMs > STALE_TITLE_SUMMARIZE_REQUEST_MS) {
+        console.log(`title summarize: skipping stale request ${request.requestId} (${ageMs}ms old)`);
+        return;
+      }
+    }
+    if (this.answeredTitleSummarizeRequests.has(request.requestId)) {
+      console.log(`title summarize: skipping replayed request ${request.requestId}`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    let reply: string;
+    try {
+      const output = await turns.runTurn(buildTitleSummarizePrompt(request), request.model, undefined, {
+        timeoutMs: request.timeoutMs,
+        lean: true,
+      });
+      const title = parseTitleOutput(output);
+      reply = title
+        ? buildTitleSummarizeResponse(request.requestId, title, Date.now() - startedAt)
+        : buildTitleSummarizeError(request.requestId, "title summary invalid", Date.now() - startedAt);
+      if (title) {
+        console.log(`title summarize: answered ${request.requestId} with "${title}" in ${Date.now() - startedAt}ms`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "agent turn failed";
+      console.error(`title summarize: agent turn failed for ${request.requestId}: ${message}`);
+      reply = buildTitleSummarizeError(request.requestId, message, Date.now() - startedAt);
+    }
+
+    await this.deps.send(msg.fromUserId, "command", reply);
+    this.answeredTitleSummarizeRequests.add(request.requestId);
+    while (this.answeredTitleSummarizeRequests.size > 256) {
+      const oldest = this.answeredTitleSummarizeRequests.values().next().value;
+      if (oldest === undefined) break;
+      this.answeredTitleSummarizeRequests.delete(oldest);
+    }
+  }
+
   private rememberAnsweredCatalogRequest(requestId: string): void {
     this.answeredCatalogRequests.add(requestId);
     // Bounded: Set keeps insertion order, so drop the oldest entries.
@@ -2378,13 +2565,238 @@ export class MessageDispatcher {
     );
   }
 
-  // card_action from the web (html_revise): re-run the agent with the last
-  // html + the user's instruction, then card_update-replace the same card.
+  // ---- 单聊二次确认：pending 交互的登记 / 回灌 / 超时 -----------------------
+
+  /** 交互等待上限：超时自动按「拒绝/空选项」回灌，避免 agent 永久挂起。 */
+  private static readonly INTERACTION_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * 注册一个权限请求：登记 pending + 发 permission 卡片 + TTL 兜底。
+   * replyOptionId / reject 来自 acp-turn 的延后 write 闭包。
+   */
+  private registerPermissionInteraction(
+    req: {
+      id: string;
+      permission: string;
+      choices: Array<{ optionId: string; label: string; reply: "once" | "always" | "reject" }>;
+      replyOptionId: (optionId: string) => void;
+      reject: () => void;
+    },
+    ctx: { requesterId: string; sessionKey: string; onDecision?: () => void },
+  ): string {
+    const permissionId = `perm-${ctx.sessionKey}-${req.id}`;
+    const request: PermissionInteractionRequest = {
+      kind: "permission",
+      permissionId,
+      permission: req.permission,
+      choices: req.choices,
+      requesterId: ctx.requesterId,
+      sessionKey: ctx.sessionKey,
+    };
+    const finalize = (reply: InteractionReply): void => {
+      const pending = this.pendingInteractions.get(permissionId);
+      if (!pending || pending.consumed) return;
+      pending.consumed = true;
+      clearTimeout(pending.timer);
+      this.pendingInteractions.delete(permissionId);
+      if (reply.kind === "permission") {
+        const optionId = resolvePermissionOptionId(req.choices, reply.reply);
+        if (optionId) req.replyOptionId(optionId);
+        else req.reject();
+      }
+      ctx.onDecision?.();
+    };
+    const timer = setTimeout(() => {
+      finalize({ kind: "permission", reply: "reject" });
+      void this.sendInteractionCardUpdate(ctx.requesterId, permissionId, "已超时，按「拒绝」处理。");
+    }, MessageDispatcher.INTERACTION_TTL_MS);
+    timer.unref?.();
+    this.pendingInteractions.set(permissionId, {
+      request,
+      reply: (reply) => finalize(reply),
+      expiresAt: Date.now() + MessageDispatcher.INTERACTION_TTL_MS,
+      timer,
+      consumed: false,
+      permissionMode: "protocol",
+    });
+    void this.deps.send(
+      ctx.requesterId,
+      "card_message",
+      JSON.stringify({ msg_type: "card_message", card: buildPermissionCard(request) }),
+    );
+    return permissionId;
+  }
+
+  /**
+   * 从 agent 正文中解析 permission / question 标记并注册交互卡片，返回剥掉
+   * 标记后的正文。仅单聊调用；流式与非流式降级路径共用。
+   */
+  private emitInteractionCardsFromText(
+    text: string,
+    ctx: { requesterId: string; sessionKey: string },
+  ): string {
+    let out = text;
+    const permissions = parsePermissionMarkers(out);
+    if (permissions.length > 0) {
+      out = stripPermissionMarkers(out);
+      for (const p of permissions) this.registerSoftPermissionInteraction(p, ctx);
+    }
+    const questions = parseQuestionMarkers(out);
+    if (questions.length > 0) {
+      out = stripQuestionMarkers(out);
+      for (const q of questions) this.registerQuestionInteraction(q, ctx);
+    }
+    return out;
+  }
+
+  /**
+   * headless 软确认：agent 在正文里输出 permission 标记并停下，本轮结束后
+   * 发卡片；用户点选作为新一轮用户输入续流（无协议级回写通道）。
+   */
+  private registerSoftPermissionInteraction(
+    req: ParsedPermission,
+    ctx: { requesterId: string; sessionKey: string },
+  ): string {
+    const permissionId = `perm-soft-${ctx.sessionKey}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const request: PermissionInteractionRequest = {
+      kind: "permission",
+      permissionId,
+      permission: req.permission,
+      choices: req.choices,
+      requesterId: ctx.requesterId,
+      sessionKey: ctx.sessionKey,
+    };
+    const timer = setTimeout(() => {
+      const pending = this.pendingInteractions.get(permissionId);
+      if (!pending || pending.consumed) return;
+      pending.consumed = true;
+      this.pendingInteractions.delete(permissionId);
+      void this.sendInteractionCardUpdate(ctx.requesterId, permissionId, "已超时，操作已取消。");
+    }, MessageDispatcher.INTERACTION_TTL_MS);
+    timer.unref?.();
+    this.pendingInteractions.set(permissionId, {
+      request,
+      reply: () => { /* 软确认的续流在 handleInteractionAction 里处理 */ },
+      expiresAt: Date.now() + MessageDispatcher.INTERACTION_TTL_MS,
+      timer,
+      consumed: false,
+      permissionMode: "soft",
+    });
+    void this.deps.send(
+      ctx.requesterId,
+      "card_message",
+      JSON.stringify({ msg_type: "card_message", card: buildPermissionCard(request) }),
+    );
+    return permissionId;
+  }
+
+  /**
+   * 注册一个选项提问：登记 pending + 发 question 卡片。用户选项作为「新一轮
+   * 用户输入」续流（与 OpenClaw 插件 question_asked 同语义，不是协议级回写）。
+   */
+  private registerQuestionInteraction(
+    req: { question: string; options: string[]; multiple: boolean },
+    ctx: { requesterId: string; sessionKey: string },
+  ): string {
+    const questionId = `q-${ctx.sessionKey}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const request: QuestionInteractionRequest = {
+      kind: "question",
+      questionId,
+      question: req.question,
+      options: req.options,
+      multiple: req.multiple,
+      requesterId: ctx.requesterId,
+      sessionKey: ctx.sessionKey,
+    };
+    const timer = setTimeout(() => {
+      const pending = this.pendingInteractions.get(questionId);
+      if (!pending || pending.consumed) return;
+      pending.consumed = true;
+      this.pendingInteractions.delete(questionId);
+      void this.sendInteractionCardUpdate(ctx.requesterId, questionId, "已超时，未收到选择。");
+    }, MessageDispatcher.INTERACTION_TTL_MS);
+    timer.unref?.();
+    // question 的 reply 由 handleCardAction 直接读 request 做续流，这里不持有闭包。
+    this.pendingInteractions.set(questionId, {
+      request,
+      reply: () => { /* 选项续流在 handleCardAction 里处理 */ },
+      expiresAt: Date.now() + MessageDispatcher.INTERACTION_TTL_MS,
+      timer,
+      consumed: false,
+    });
+    void this.deps.send(
+      ctx.requesterId,
+      "card_message",
+      JSON.stringify({ msg_type: "card_message", card: buildQuestionCard(request) }),
+    );
+    return questionId;
+  }
+
+  /**
+   * 兜底：agent 直接调用了原生 question / ask_user 交互工具。
+   *
+   * headless serve 没有 TUI 应答方，工具会永远停在 running，用户只看到「正在
+   * question」转圈（2026-11-26 现场）。这里把工具入参转成可点击卡片，并中止
+   * 卡住的轮次；用户点选后沿用 question 语义作为新一轮输入续流。
+   * 返回 true 表示这一轮已改成卡片交互，调用方应停止继续上屏正文。
+   */
+  private handleNativeQuestionActivity(
+    steps: ActivityStep[] | undefined,
+    ctx: { requesterId: string; sessionKey: string },
+    abortTurn: () => void,
+  ): boolean {
+    if (!steps) return false;
+    const step = steps.find((item) =>
+      /^(question|ask_user)$/i.test(item.label)
+      && item.status === "running"
+      && Boolean(item.inputDetail || item.detail),
+    );
+    if (!step) return false;
+    const questions = parseNativeQuestionToolInput(step.inputDetail ?? step.detail);
+    if (questions.length > 0) {
+      for (const question of questions) this.registerQuestionInteraction(question, ctx);
+    } else {
+      // 入参解析不出来也别让它永远挂着：中止并提示用户用文字回答。
+      void this.deps.send(
+        ctx.requesterId,
+        "RC:TxtMsg",
+        JSON.stringify({
+          content: "检测到智能体使用了本设备不支持的原生提问工具，已中止这一轮。请直接用文字告诉我你的选择，我会继续。",
+        }),
+      );
+    }
+    abortTurn();
+    return true;
+  }
+
+  /** 把交互卡片替换成「已决策/已超时」的只读态。 */
+  private async sendInteractionCardUpdate(toUserId: string, cardId: string, text: string): Promise<void> {
+    await this.deps.send(
+      toUserId,
+      "card_update",
+      JSON.stringify({
+        msg_type: "card_update",
+        cardId,
+        mode: "replace",
+        card: { schema: "1.0.0", id: cardId, header: { title: "已处理", icon: "✓" }, sections: [{ kind: "markdown", content: text }] },
+      }),
+    );
+  }
+
+  // card_action from the web: html_revise / permission / answer three kinds.
   private async handleCardAction(msg: InboundIMMessage, turns: TurnRunner): Promise<void> {
-    let action: { cardId?: string; action?: { kind?: string; payload?: Record<string, unknown> } };
+    let action: { cardId?: string; action?: { type?: string; kind?: string; permissionId?: string; reply?: string; questionId?: string; value?: string[]; payload?: Record<string, unknown> } };
     try {
       action = JSON.parse(msg.content);
     } catch {
+      return;
+    }
+    const actionType = action.action?.type;
+    // 单聊二次确认：权限回灌与选项回灌。两者都只认单聊（conversationType=1），
+    // 群聊/讨论组不接这个分支 —— 与产品范围一致。
+    if (actionType === "permission" || actionType === "answer") {
+      if (msg.conversationType !== 1) return;
+      await this.handleInteractionAction(msg, action.action!, turns);
       return;
     }
     const kind = action.action?.kind;
@@ -2443,6 +2855,91 @@ export class MessageDispatcher {
       await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: `生成失败: ${message}` }));
     } finally {
       source?.cleanup();
+    }
+  }
+
+  /**
+   * 单聊二次确认的 card_action 处理。
+   *  - permission：反查 pending，校验身份，把 once/always/reject 回灌给 agent 的延后 write；
+   *  - answer：选项作为「新一轮用户输入」续流（question 语义）。
+   */
+  private async handleInteractionAction(
+    msg: InboundIMMessage,
+    action: { type?: string; permissionId?: string; reply?: string; questionId?: string; value?: string[]; payload?: Record<string, unknown> },
+    turns: TurnRunner,
+  ): Promise<void> {
+    if (action.type === "permission") {
+      const permissionId = action.permissionId;
+      const reply = action.reply;
+      if (!permissionId || (reply !== "once" && reply !== "always" && reply !== "reject")) return;
+      const pending = this.pendingInteractions.get(permissionId);
+      if (!pending || pending.consumed) return; // 幂等：重复点击/离线重放不二次回灌
+      if (pending.request.kind !== "permission") return;
+      // 身份校验：只有发起该请求的单聊用户能决策。
+      if (pending.request.requesterId !== msg.fromUserId) {
+        console.warn(`interaction: permission ${permissionId} from wrong user ${msg.fromUserId}`);
+        return;
+      }
+      const replyLabel = reply === "reject" ? "拒绝" : reply === "always" ? "始终允许" : "允许一次";
+      if (pending.permissionMode === "soft") {
+        // headless 软确认：消费 pending，把用户决定作为新一轮输入续流。
+        pending.consumed = true;
+        clearTimeout(pending.timer);
+        this.pendingInteractions.delete(permissionId);
+        await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${replyLabel}`);
+        // 回灌带上原操作描述：续流靠 session resume 恢复上下文，resume 失效时
+        // agent 是全新会话，只看到「用户选择了允许」会不知道刚才确认的是哪件事。
+        const decisionText = reply === "reject"
+          ? `你之前请求用户确认的操作：${pending.request.permission}\n用户选择了「拒绝」。请取消该操作并说明。`
+          : `你之前请求用户确认的操作：${pending.request.permission}\n用户选择了「${replyLabel}」。请继续执行该操作。`;
+        try {
+          const out = await turns.runTurn(decisionText, undefined, pending.request.sessionKey);
+          await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: `继续执行失败: ${message}` }));
+        }
+        return;
+      }
+      // ACP 真协议：回写 optionId 给阻塞中的 agent。
+      pending.reply({ kind: "permission", reply });
+      await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${replyLabel}`);
+      return;
+    }
+
+    if (action.type === "answer") {
+      const questionId = action.questionId;
+      const value = Array.isArray(action.value) ? action.value.filter((v) => typeof v === "string" && v.trim()) : [];
+      if (!questionId || value.length === 0) return;
+      const pending = this.pendingInteractions.get(questionId);
+      if (!pending || pending.consumed) return;
+      if (pending.request.kind !== "question") return;
+      if (pending.request.requesterId !== msg.fromUserId) {
+        console.warn(`interaction: question ${questionId} from wrong user ${msg.fromUserId}`);
+        return;
+      }
+      pending.consumed = true;
+      clearTimeout(pending.timer);
+      this.pendingInteractions.delete(questionId);
+      await this.sendInteractionCardUpdate(msg.fromUserId, questionId, `已收到你的选择：${value.join("、")}`);
+      // 选项作为新一轮用户输入续流，绑回同一会话键。
+      // 必须把「原问题 + 所有选项」一起回灌：续流靠 session resume 恢复上下文，
+      // 而 resume 在 agent 不支持续接 / 会话过期 / CLI 重启时会失效 —— 那时 agent
+      // 是全新会话，只收到「我选择：番茄炒蛋盖饭」就会答「没看到之前的上下文」。
+      const request = pending.request;
+      const choiceText = [
+        `你之前向用户提问：${request.question}`,
+        `给出的选项：${request.options.join("、")}`,
+        `用户选择了：${value.join("、")}`,
+        "请基于用户的选择继续完成任务。",
+      ].join("\n");
+      try {
+        const out = await turns.runTurn(choiceText, undefined, request.sessionKey);
+        await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: `回答失败: ${message}` }));
+      }
     }
   }
 

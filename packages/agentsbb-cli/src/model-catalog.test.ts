@@ -982,24 +982,25 @@ describe("createModelCatalogLoader with provider endpoints", () => {
 describe("createModelCatalogLoader with config-declared models", () => {
   const QUUKK_ENDPOINT = { id: "quukk", baseUrl: "https://llmapi.example.com/v1" };
 
-  it("serves the declared models without probing the declared endpoint", async () => {
-    const probe = vi.fn(async () => {
-      throw new Error("declared providers must not be probed");
-    });
+  it("probes a declared endpoint on a short budget and unions /models into the declaration", async () => {
+    // 回归：quukk_direct 的配置里只有 `model = "glm-5.2"` 一条，端点 /models
+    // 其实还有更多可用模型。以前跳过 probe 导致面板永远只显示那一条。
+    const probe = vi.fn(async () => ["glm-5.2", "k3", "new-from-endpoint"]);
     const loader = createModelCatalogLoader({
       agentName: "opencode",
       runCommand: vi.fn().mockResolvedValue(""),
       readConfig: () => ({
         endpoints: [QUUKK_ENDPOINT],
         defaultModel: "quukk/glm-5.2",
-        declaredModels: { quukk: ["glm-5.2", "k3"] },
+        declaredModels: { quukk: ["glm-5.2"] },
       }),
       probe,
     });
 
     const catalog = await loader.load();
-    // 声明即事实：再 probe 一遍只可能拿到同一份清单的子集，白等最多 8s。
-    expect(probe).not.toHaveBeenCalled();
+    expect(probe).toHaveBeenCalledTimes(1);
+    // 已声明端点必须带短超时，不能拿默认的 8s 拖慢 web 窗口。
+    expect(probe).toHaveBeenCalledWith(QUUKK_ENDPOINT, 2_000);
     expect(catalog.providers).toEqual([
       {
         id: "quukk",
@@ -1007,13 +1008,39 @@ describe("createModelCatalogLoader with config-declared models", () => {
         models: [
           { id: "glm-5.2", name: "glm-5.2" },
           { id: "k3", name: "k3" },
+          { id: "new-from-endpoint", name: "new-from-endpoint" },
         ],
       },
     ]);
     expect(catalog.defaultModel).toBe("quukk/glm-5.2");
   });
 
-  it("probes only the endpoints that declare no models of their own", async () => {
+  it("keeps the declared model when probing a declared endpoint fails", async () => {
+    // probe 失败/超时绝不缩水面板：配置里那条声明模型仍然要在。
+    const probe = vi.fn(async () => null);
+    const loader = createModelCatalogLoader({
+      agentName: "opencode",
+      runCommand: vi.fn().mockResolvedValue(""),
+      readConfig: () => ({
+        endpoints: [QUUKK_ENDPOINT],
+        defaultModel: "quukk/glm-5.2",
+        declaredModels: { quukk: ["glm-5.2"] },
+      }),
+      probe,
+    });
+
+    const catalog = await loader.load();
+    expect(catalog.providers).toEqual([
+      {
+        id: "quukk",
+        name: "quukk",
+        models: [{ id: "glm-5.2", name: "glm-5.2" }],
+      },
+    ]);
+    expect(catalog.defaultModel).toBe("quukk/glm-5.2");
+  });
+
+  it("probes every endpoint, passing the short budget only to declared ones", async () => {
     const probe = vi.fn(async (endpoint: { id: string }) => [`${endpoint.id}-model`]);
     const loader = createModelCatalogLoader({
       agentName: "opencode",
@@ -1027,10 +1054,14 @@ describe("createModelCatalogLoader with config-declared models", () => {
     });
 
     const catalog = await loader.load();
-    expect(probe).toHaveBeenCalledTimes(1);
-    expect(probe).toHaveBeenCalledWith(expect.objectContaining({ id: "other" }));
+    expect(probe).toHaveBeenCalledTimes(2);
+    // 声明端点带 2s 短预算；未声明端点用默认预算（第二参为 undefined）。
+    expect(probe).toHaveBeenCalledWith(QUUKK_ENDPOINT, 2_000);
+    expect(probe).toHaveBeenCalledWith(expect.objectContaining({ id: "other" }), undefined);
+    // quukk 的并集里既有声明的 glm-5.2，也有 probe 到的 quukk-model。
+    const quukk = catalog.providers.find((provider) => provider.id === "quukk");
+    expect(quukk?.models.map((model) => model.id)).toEqual(["glm-5.2", "quukk-model"]);
     expect(catalog.providers.map((provider) => provider.id)).toEqual(["other", "quukk"]);
-    expect(catalog.providers[1].models.map((model) => model.id)).toEqual(["glm-5.2"]);
   });
 
   // 声明清单是**下限**，不是上限。

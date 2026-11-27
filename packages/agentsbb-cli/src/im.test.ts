@@ -452,6 +452,47 @@ describe("private turn timeout fallback", () => {
     }
   });
 
+  it("WEB-039: an ops turn never times out even after 20 silent minutes", async () => {
+    vi.useFakeTimers();
+    try {
+      const sent: Array<{ to: string; objectName: string; content: string }> = [];
+      const streams: string[] = [];
+      const dispatcher = new MessageDispatcher({
+        send: async (to, objectName, content) => { sent.push({ to, objectName, content }); },
+        sendStream: async (_c, _id, _o, content) => { streams.push(content); },
+        agentName: "opencode",
+      });
+      let aborted = false;
+      // 运维轮全程沉默（查版本/翻配置的长命令，activity=0），模拟悬挂。
+      const pending = dispatcher.handle(
+        {
+          ...inbound("user_ops"),
+          content: JSON.stringify({ content: "查 codex 版本", opsAgent: "codex" }),
+        },
+        {
+          runTurn: async () => "unused",
+          runTurnStreamed: (_p, _m, _d, signal) =>
+            new Promise<string>((_resolve, reject) => {
+              signal?.addEventListener("abort", () => {
+                aborted = true;
+                reject(new Error("agent turn aborted"));
+              }, { once: true });
+            }),
+        },
+      );
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1_200_000);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(aborted).toBe(false);
+      expect(streams.some((c) => c.includes("\"failed\"") && c.includes("turn_timeout"))).toBe(false);
+      expect(sent.some((f) => f.objectName === "RC:TxtMsg" && f.content.includes("响应超时"))).toBe(false);
+      // 轮次仍在跑是预期结果：运维长命令只能由用户「停止」或服务端取消收尾。
+      void pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("guard never fires for non-private venues (no placeholder in group turns)", async () => {
     vi.useFakeTimers();
     try {
@@ -3207,10 +3248,10 @@ describe("chat_stream 终帧补发", () => {
   })
 });
 
-// 停滞守卫（2026-11-17 现场）：运维回了半句之后彻底不动，前端 3 分钟就提示
-// 「可能卡住」——判据必须是「无进展」，不是「总时长超了」。
-// 2026-11-19 取消固定墙钟后它是唯一的收尾判据，分两档：产出正文后的停滞用
-// 短窗口（240s），全程零产出的僵死（serve 悬挂）用长窗口（600s）。
+// 停滞守卫（2026-11-17 现场）：回了半句之后彻底不动，前端提示「可能卡住」——
+// 判据必须是「无进展」，不是「总时长超了」。2026-11-19 取消固定墙钟后它是
+// 唯一的自动收尾判据：产出正文后 240s、全程零产出 600s。
+// WEB-039（2026-11-26）：运维轮彻底豁免，不再按任何时间窗口自动中止。
 describe("shouldAbortStalledTurn", () => {
   const base = { aborted: false, terminalSent: false, producedText: true, idleMs: 0 };
 
@@ -3251,13 +3292,15 @@ describe("shouldAbortStalledTurn", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, runningToolMs: 0 })).toBe(true);
   });
 
-  // WEB-39 二次修复（2026-11-25 傍晚）：部分运维轮全程 activity=0（不吐工具步骤），
-  // 落不到「有 running 步骤」那一档，仍会被 240s 增量窗口掐掉。
-  it("运维轮（无 activity）不再按 240s 判卡死，放宽到 15 分钟", () => {
+  // WEB-39 三次修复（2026-11-26）：15 分钟窗口仍挡不住入口标记缺失导致的误杀，
+  // 运维轮改为彻底豁免 —— 无论 idle 多久、有没有 running 工具都不自动中止。
+  it("运维轮永不因停滞被自动中止", () => {
     expect(shouldAbortStalledTurn({ ...base, idleMs: 240_000, opsTurn: true })).toBe(false);
     expect(shouldAbortStalledTurn({ ...base, idleMs: 600_000, opsTurn: true })).toBe(false);
     expect(shouldAbortStalledTurn({ ...base, producedText: false, idleMs: 600_000, opsTurn: true })).toBe(false);
-    expect(shouldAbortStalledTurn({ ...base, idleMs: 900_000, opsTurn: true })).toBe(true);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 900_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 3_600_000, opsTurn: true })).toBe(false);
+    expect(shouldAbortStalledTurn({ ...base, idleMs: 3_600_000, runningToolMs: 3_600_000, opsTurn: true })).toBe(false);
   });
 
   it("非运维轮的窗口不受影响", () => {
@@ -3273,10 +3316,19 @@ describe("isOpsTurn", () => {
     expect(isOpsTurn({ conversationId: "om_node1" })).toBe(true);
   });
 
+  it("入口标记丢失时仍认运维作用域抬头与分桶会话键", () => {
+    // 私聊守卫拿到的是发送方用户 id，不是 ops 节点 id —— 这两条才是真兜底。
+    expect(isOpsTurn({ conversationId: "user_a", prompt: "【运维对象】codex\n\n查版本" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "user_a", prompt: "  【运维对象】未指定\n\n查版本" })).toBe(true);
+    expect(isOpsTurn({ conversationId: "user_a", sessionKey: "cm-private-user_a#codex" })).toBe(true);
+  });
+
   it("普通私聊/群聊不算运维轮", () => {
     expect(isOpsTurn({ conversationId: "user-1" })).toBe(false);
     expect(isOpsTurn({ opsAgent: "  ", conversationId: "group_9" })).toBe(false);
     expect(isOpsTurn({})).toBe(false);
+    expect(isOpsTurn({ conversationId: "user-1", prompt: "普通问题" })).toBe(false);
+    expect(isOpsTurn({ conversationId: "user-1", sessionKey: "cm-private-user-1" })).toBe(false);
   });
 });
 
@@ -3405,5 +3457,339 @@ describe("MessageDispatcher 群聊/讨论组的新开会话（广播）", () => 
       },
     });
     expect(called).toBe(0);
+  });
+});
+
+describe("MessageDispatcher 单聊二次确认", () => {
+  function permCardAction(permissionId: string, reply: string, fromUserId = "user-1", conversationType = 1) {
+    return {
+      objectName: "card_action",
+      fromUserId,
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType,
+      content: JSON.stringify({
+        cardId: permissionId,
+        action: { type: "permission", permissionId, reply },
+      }),
+    };
+  }
+
+  it("发出 permission 卡片，用户点选后把选择回灌给 agent 并更新卡片", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let repliedOption: string | null = null;
+
+    // 私聊触发 agent；runTurnStreamed 收到我们注入的 onPermissionRequest 后
+    // 登记 pending + 发卡片。这里在回调里不立即答复，模拟"等用户点"。
+    const run = dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "帮我删个文件" }),
+    }, {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        opts?.onPermissionRequest?.({
+          id: "900",
+          permission: "delete file",
+          choices: [
+            { optionId: "allow_once", label: "允许一次", reply: "once" },
+            { optionId: "deny_once", label: "拒绝", reply: "reject" },
+          ],
+          replyOptionId: (optionId) => { repliedOption = optionId; },
+          reject: () => { repliedOption = "rejected"; },
+        });
+        return "done";
+      },
+    });
+    await run;
+
+    // 卡片已发出（含 permission section）。
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const permSection = card.sections.find((s: { kind: string }) => s.kind === "permission");
+    expect(permSection.permission).toBe("delete file");
+    expect(repliedOption).toBeNull(); // 还没点，不能提前回灌
+
+    // 用户点"拒绝" → 回灌 deny_once，并发 card_update。
+    await dispatcher.handle(permCardAction(permSection.permissionId, "reject"), {
+      runTurn: async () => "should not be used",
+    });
+    expect(repliedOption).toBe("deny_once");
+    const update = deps.sent.find((s) => s.objectName === "card_update");
+    expect(update).toBeDefined();
+  });
+
+  it("拒绝跨用户与重复点击：只有发起者能决策，且只回灌一次", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let replyCount = 0;
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "删文件" }),
+    }, {
+      runTurn: async (_p, _m, _sk, opts) => {
+        opts?.onPermissionRequest?.({
+          id: "901",
+          permission: "delete",
+          choices: [{ optionId: "allow_once", label: "允许一次", reply: "once" }],
+          replyOptionId: () => { replyCount += 1; },
+          reject: () => {},
+        });
+        return "done";
+      },
+    });
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message")!;
+    const permSection = JSON.parse(cardMsg.content).card.sections.find((s: { kind: string }) => s.kind === "permission");
+
+    // 别的用户点 → 不回灌
+    await dispatcher.handle(permCardAction(permSection.permissionId, "once", "user-2"), { runTurn: async () => "" });
+    expect(replyCount).toBe(0);
+    // 发起者点 → 回灌一次
+    await dispatcher.handle(permCardAction(permSection.permissionId, "once"), { runTurn: async () => "" });
+    expect(replyCount).toBe(1);
+    // 重复点（离线重放）→ 不二次回灌
+    await dispatcher.handle(permCardAction(permSection.permissionId, "once"), { runTurn: async () => "" });
+    expect(replyCount).toBe(1);
+  });
+
+  it("群聊的 permission card_action 被忽略（范围仅限单聊）", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    await dispatcher.handle(permCardAction("perm-x", "once", "user-1", 3), {
+      runTurn: async () => "",
+    });
+    expect(deps.sent.length).toBe(0);
+  });
+
+  it("原生 question 工具卡住时换成选择卡片，并中止这一轮", async () => {
+    const sent: Array<{ to: string; objectName: string; content: string }> = [];
+    const dispatcher = new MessageDispatcher({
+      send: async (to, objectName, content) => { sent.push({ to, objectName, content }); },
+      sendStream: async () => {},
+      agentName: "opencode",
+    });
+    let aborted = false;
+    const step: ActivityStep = {
+      id: "call-q",
+      kind: "tool",
+      label: "question",
+      status: "running",
+      inputDetail: JSON.stringify({
+        questions: [{ question: "晚饭吃什么？", options: ["番茄炒蛋", "可乐鸡翅"], multiple: false }],
+      }),
+    };
+    const pending = dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "帮我选个晚饭" }),
+    }, {
+      runTurn: async () => "unused",
+      runTurnStreamed: (_p, _m, onDelta, signal) => new Promise<string>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("agent turn aborted"));
+        }, { once: true });
+        void onDelta("", undefined, [step]);
+      }),
+    });
+    await pending;
+    expect(aborted).toBe(true);
+    const cardMsg = sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const q = card.sections.find((s: { kind: string }) => s.kind === "question");
+    expect(q.question).toBe("晚饭吃什么？");
+    expect(q.options.map((o: { label: string }) => o.label)).toEqual(["番茄炒蛋", "可乐鸡翅"]);
+
+    // 点选后沿用 question 语义：作为新一轮用户输入续流。
+    const prompts: string[] = [];
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "answer", questionId: q.questionId, value: ["可乐鸡翅"] },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "好，就这个。"; },
+    });
+    expect(prompts[0]).toContain("晚饭吃什么？");
+    expect(prompts[0]).toContain("番茄炒蛋");
+    expect(prompts[0]).toContain("可乐鸡翅");
+    expect(prompts[0]).not.toBe("我选择：可乐鸡翅");
+  });
+});
+
+describe("MessageDispatcher headless 软确认", () => {
+  it("agent 输出 permission 标记时发卡片，用户点允许后续流继续执行", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const prompts: string[] = [];
+
+    const marker = '[interaction:permission] {"permission":"删除 /tmp/a.txt","options":[{"reply":"once","label":"允许一次"},{"reply":"reject","label":"拒绝"}]} [/interaction]';
+    // 降级路径（无 sendStream）：runTurn 返回带标记的正文。
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "删掉临时文件" }),
+    }, {
+      runTurn: async () => `我准备删除该文件。\n${marker}`,
+    });
+
+    // 卡片已发出，且标记未上屏（fallback 的整包文本被剥掉标记）。
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const permSection = card.sections.find((s: { kind: string }) => s.kind === "permission");
+    expect(permSection.permission).toBe("删除 /tmp/a.txt");
+    const delivered = deps.sent.find((s) => s.objectName === "RC:TxtMsg");
+    expect(delivered?.content).not.toContain("interaction:permission");
+
+    // 用户点「允许一次」→ 续流，续流提示词含用户决定。
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "permission", permissionId: permSection.permissionId, reply: "once" },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "已删除。"; },
+    });
+    expect(prompts.length).toBe(1);
+    expect(prompts[0]).toContain("允许一次");
+    expect(prompts[0]).toContain("继续执行");
+    // 续流必须自带原操作描述：resume 失效时 agent 是全新会话，不知道确认的是哪件事。
+    expect(prompts[0]).toContain("删除 /tmp/a.txt");
+  });
+
+  it("agent 输出 question 标记后，用户点选续流带上原问题和全部选项", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const prompts: string[] = [];
+
+    const marker = '[interaction:question] {"question":"晚饭三选一，选哪个？","options":["番茄炒蛋盖饭","蒜香黄焖鸡","麻婆豆腐盖饭"]} [/interaction]';
+    // 降级路径（无 sendStream）：runTurn 返回带标记的正文 → 解析成 question 卡片。
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "你说我三个菜吗？" }),
+    }, {
+      runTurn: async () => `晚晚三选一，先给你三个方向：\n${marker}`,
+    });
+
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const questionSection = card.sections.find((s: { kind: string }) => s.kind === "question");
+    expect(questionSection.question).toBe("晚饭三选一，选哪个？");
+    expect(questionSection.options).toHaveLength(3);
+
+    // 用户点选 → 续流提示词必须自带上下文，不能只发「我选择：…」。
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "answer", questionId: questionSection.questionId, value: ["番茄炒蛋盖饭"] },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "好的，做法是……"; },
+    });
+
+    expect(prompts.length).toBe(1);
+    expect(prompts[0]).toContain("晚饭三选一，选哪个？");
+    expect(prompts[0]).toContain("番茄炒蛋盖饭");
+    expect(prompts[0]).toContain("蒜香黄焖鸡");
+    expect(prompts[0]).toContain("麻婆豆腐盖饭");
+    expect(prompts[0]).not.toContain("interaction:question");
+  });
+});
+
+// 全平台提问协议注入：headless 注入完整协议（操作确认+提问），ACP 只注入提问协议。
+// ACP 的 behaviorPrompt 会被拼进 userText（agents.ts runAcpTurn 分支），所以提问
+// 标记协议对 ACP 同样生效——这是 ACP 6 家能弹 question 卡片的关键。
+describe("private question protocol injection by agent type", () => {
+  const snapshotWith = (agent: string, behaviorPrompt: string): PermissionSnapshot => ({
+    ownerUserId: "owner_1",
+    ownerUserIdPresent: true,
+    agents: [{ agent, nodeId: "node_x", allowPrivate: true, behaviorPrompt, version: 1 }],
+    updatedAt: Date.now(),
+  });
+  const inbound = (): Parameters<MessageDispatcher["handle"]>[0] => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user_q",
+    toUserId: "rc_node_x",
+    targetId: "rc_node_x",
+    conversationType: 1,
+    content: JSON.stringify({ content: "你好" }),
+  });
+
+  const captureBehaviorPrompt = async (agentName: string): Promise<string | undefined> => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName,
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => snapshotWith(agentName, "用户自定义行为"),
+    });
+    let seen: string | undefined;
+    await dispatcher.handle(inbound(), {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        seen = opts?.behaviorPrompt;
+        return "ok";
+      },
+    });
+    return seen;
+  };
+
+  it("headless agent gets both the operation-confirm and the question protocol", async () => {
+    const prompt = await captureBehaviorPrompt("kimi");
+    expect(prompt).toContain("用户自定义行为");
+    expect(prompt).toContain("[interaction:permission]");
+    expect(prompt).toContain("[interaction:question]");
+    expect(prompt).toContain("不要调用内置的 question");
+  });
+
+  it("ACP agent gets only the question protocol, not the operation-confirm one", async () => {
+    const prompt = await captureBehaviorPrompt("kiro-cli");
+    expect(prompt).toContain("用户自定义行为");
+    expect(prompt).toContain("[interaction:question]");
+    expect(prompt).toContain("不要调用内置的 question");
+    expect(prompt).not.toContain("[interaction:permission]");
+  });
+
+  it("agentName missing keeps the old contract (no protocol injected)", async () => {
+    // agentName 缺省（未指定执行器的测试夹具）不注入，避免误伤既有行为契约。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seen: string | undefined;
+    await dispatcher.handle(inbound(), {
+      runTurn: async (_p, _m, _sk, opts) => { seen = opts?.behaviorPrompt; return "ok"; },
+    });
+    expect(seen).toBeUndefined();
   });
 });
