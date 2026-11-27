@@ -198,6 +198,16 @@ export interface AgentArgvContext {
    * 随本机 config.toml 变形。
    */
   codexCredential?: CodexCredentialPlan | null;
+  /**
+   * WEB-057：本轮 agent 应该使用的**工作目录根**（设备端全局 workdir）。
+   *
+   * codex 的 `exec resume <id>` 会从 rollout 里恢复会话自己保存的旧 cwd，覆盖
+   * 子进程 spawn 时传入的 cwd —— 表现为虾说平台切换工作目录后，Codex 会话仍
+   * 在旧目录读文件。实测（codex-cli 0.169.0）：`codex exec --cd <DIR> … resume
+   * <id>` 的参数位置合法，`--cd` 放在 exec 层（resume 之前）对首次与续接会话
+   * 都生效。这里由真正 spawn 的调用方把 workdir 传进来，策略只负责拼 argv。
+   */
+  cwd?: string;
 }
 type AgentArgvStrategy = (
   prompt: string,
@@ -507,6 +517,14 @@ const agentArgvStrategies: Readonly<Record<string, AgentArgvStrategy>> = {
     ...(ctx?.fsRestricted
       ? ["--sandbox", "read-only"]
       : ["--sandbox", "workspace-write"]),
+    // WEB-057：显式把设备端全局 workdir 传给 codex，作为会话工作目录根。
+    // 必须在 exec 层（resume 之前）给出：`codex exec resume <id>` 会从 rollout
+    // 里恢复会话自己保存的旧 cwd，覆盖 spawn 的 cwd —— 这正是「平台换了工作目录，
+    // Codex 会话还在旧目录读文件」的根因。实测 codex-cli 0.169.0：`--cd` 放在
+    // `--sandbox` 之后、`resume` 之前，首次会话和续接会话都接受（参数位置合法，
+    // 假 id 时只报 no rollout found，不会判非法参数）。没有配置 workdir 时不传，
+    // 保持旧行为（codex 用自己那套默认目录）。
+    ...(ctx?.cwd ? ["--cd", ctx.cwd] : []),
     // 续接要换成 `exec resume <id> <prompt>` 的子命令形态（prompt 必须跟在 id
     // 后面）。实测 0.144.6：`codex exec resume <uuid> "hi" --json` 会被正常接受，
     // 不存在的 id 报 `no rollout found for thread id …`（见 agent-sessions.ts 的
@@ -2825,6 +2843,8 @@ export function runAgentTurn(opts: RunAgentTurnOpts): Promise<string> {
         fsRestricted,
         ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
         ...(codexPlan ? { codexCredential: codexPlan } : {}),
+        // WEB-057：把设备端 workdir 传给 argv 策略（codex 用它拼 --cd）。
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
       })
       : [];
     const argvMode = strategyArgs.length > 0;
