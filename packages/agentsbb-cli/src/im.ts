@@ -18,9 +18,11 @@ import {
   buildPermissionCard,
   buildQuestionCard,
   mapAcpOptionsToChoices,
+  parseNativeQuestionToolInput,
   parsePermissionMarkers,
   parseQuestionMarkers,
   PERMISSION_PROTOCOL_INSTRUCTION,
+  QUESTION_PROTOCOL_INSTRUCTION,
   type ParsedPermission,
   resolvePermissionOptionId,
   stripPermissionMarkers,
@@ -66,6 +68,15 @@ import {
   ROLE_RECOMMEND_TURN_TIMEOUT_MS,
   STALE_ROLE_RECOMMEND_REQUEST_MS,
 } from "./role-recommend.js";
+import {
+  buildTitleSummarizeError,
+  buildTitleSummarizePrompt,
+  buildTitleSummarizeResponse,
+  parseTitleOutput,
+  parseTitleSummarizeRequest,
+  STALE_TITLE_SUMMARIZE_REQUEST_MS,
+  SUMMARIZE_TITLE_ACTION,
+} from "./title-summarize.js";
 import { formatUseModelAck, parseUseModelCommand, routeInCatalog, type UseModelCommand } from "./use-model.js";
 import { isNewSessionCommand, newSessionAck } from "./session-command.js";
 import type { UserModelStore } from "./user-models.js";
@@ -616,6 +627,9 @@ export class MessageDispatcher {
   // Same guard for the admin role-recommendation preview: a replayed request
   // must not spend a whole agent turn again. Bounded: evicts oldest.
   private readonly answeredRoleRecommendRequests = new Set<string>();
+  // Same guard for the discussion-title summary exchange: a replayed request
+  // must not spend another agent turn. Bounded: evicts oldest.
+  private readonly answeredTitleSummarizeRequests = new Set<string>();
   // 当前在飞的那一轮角色推荐（同一节点同时只允许一个）。
   //
   // 推荐绕过会话队列并发执行，服务端却只等 60s 就作废这一批：用户点重试时，
@@ -915,17 +929,20 @@ export class MessageDispatcher {
         sessionKey: privateSessionKey,
         // 行为规范只走指令层（codex 的 AGENTS.md 标记块 / opencode 的
         // instructions 文件），**绝不拼进 text** —— 那会污染用户原话。
-        // headless agent 无 ACP 双向权限通道：追加操作确认协议指令，让它在
-        // 敏感操作前输出标记并停下（软确认）。ACP agent 走真协议，不注入。
+        // 协议注入按 agent 类型分流：
+        //   · headless（无 ACP 双向通道）：注入完整协议（操作确认 + 提问）；
+        //   · ACP（走真权限协议）：只注入【提问协议】—— ACP 没有 question 事件，
+        //     原生 question/ask_user 工具也无人应答；behaviorPrompt 会被拼进
+        //     userText（agents.ts runAcpTurn 分支），文本标记协议对 ACP 同样生效。
+        //   · agentName 缺省（测试夹具/未指定执行器）：不注入，避免误伤既有契约。
         turnOptions: (() => {
           const behaviorPrompt = gate.behaviorPrompt || "";
-          // 只有明确是 headless agent（有名字且非 ACP）才注入软确认指令；agentName
-          // 缺省（测试夹具/未指定执行器）时不注入，避免误伤既有行为契约。
-          const headless = Boolean(this.deps.agentName) && !acpTurnSpecFor(this.deps.agentName);
-          const withProtocol = headless
-            ? [behaviorPrompt, PERMISSION_PROTOCOL_INSTRUCTION].filter(Boolean).join("\n\n---\n\n")
-            : behaviorPrompt;
-          return withProtocol ? { behaviorPrompt: withProtocol } : {};
+          const agentName = this.deps.agentName;
+          if (!agentName) return behaviorPrompt ? { behaviorPrompt } : {};
+          const isAcp = Boolean(acpTurnSpecFor(agentName));
+          const protocol = isAcp ? QUESTION_PROTOCOL_INSTRUCTION : PERMISSION_PROTOCOL_INSTRUCTION;
+          const withProtocol = [behaviorPrompt, protocol].filter(Boolean).join("\n\n---\n\n");
+          return { behaviorPrompt: withProtocol };
         })(),
         // 运维入口 agent：随流帧与整包回包带回去，web 端据此把回复归属到
         // 对应 agent 的运维面板（会话按入口 agent 分桶的另一半）。
@@ -993,6 +1010,10 @@ export class MessageDispatcher {
       }
       if (cmd.action === ROLE_RECOMMEND_ACTION) {
         await this.handleRoleRecommend(msg, cmd, turns);
+        return;
+      }
+      if (cmd.action === SUMMARIZE_TITLE_ACTION) {
+        await this.handleTitleSummarize(msg, cmd, turns);
         return;
       }
       // 服务端下发的「新开会话」：群聊/讨论组里用户发的指令由服务端识别，
@@ -1530,6 +1551,9 @@ export class MessageDispatcher {
       // （内容在 activitySnapshot 里），这样同一份信息不会在帧里存两遍。
       // web 端按它渲染「思考卡片 ↔ 工具卡片」交错的流式时间线。
       const timeline: ChatStreamTimelineEntry[] = [];
+      // 原生 question 工具兜底只做一次：中止后中止帧还会带最后一次 activity，
+      // 没有这个闸门就会重复发卡片、重复 abort。
+      let nativeQuestionHandled = false;
       const activeReasoningEntry = (): number | null => {
         const last = timeline[timeline.length - 1];
         return last && last[0] === "r" ? timeline.length - 1 : null;
@@ -1580,6 +1604,15 @@ export class MessageDispatcher {
           activitySnapshot = activity;
           // 同一份快照交给停滞守卫：它只看「有没有 running 的步骤」，不落盘。
           latestActivity = activity;
+          // headless 的原生 question 工具没有应答方：立刻换成卡片交互并中止轮次。
+          if (ctx.conversationType === 1 && !nativeQuestionHandled
+            && this.handleNativeQuestionActivity(activity, {
+              requesterId: ctx.requesterId,
+              sessionKey: opts.sessionKey ?? turnSessionKey("private", ctx.requesterId),
+            }, () => controller.abort())) {
+            nativeQuestionHandled = true;
+            return;
+          }
         }
         const now = Date.now();
         // 只有「纯正文增量」才走短窗口，并且这一帧不带思考/过程流（见上）。
@@ -2444,6 +2477,63 @@ export class MessageDispatcher {
     }
   }
 
+  /**
+   * 讨论组标题总结：主持节点跑一个精简回合，把议题压成 ≤10 字的一句话标题。
+   * 与角色推荐同族（command 往返 + 精简回合），但更短、更轻，失败只影响标题。
+   */
+  async handleTitleSummarize(
+    msg: InboundIMMessage,
+    cmd: { request_id: string; params?: Record<string, unknown> },
+    turns: TurnRunner,
+  ): Promise<void> {
+    const request = parseTitleSummarizeRequest({
+      request_id: cmd.request_id,
+      service: "discussion",
+      action: SUMMARIZE_TITLE_ACTION,
+      params: cmd.params,
+    });
+    if (!request) return;
+    if (request.timestamp !== undefined) {
+      const ageMs = Date.now() - request.timestamp;
+      if (ageMs > STALE_TITLE_SUMMARIZE_REQUEST_MS) {
+        console.log(`title summarize: skipping stale request ${request.requestId} (${ageMs}ms old)`);
+        return;
+      }
+    }
+    if (this.answeredTitleSummarizeRequests.has(request.requestId)) {
+      console.log(`title summarize: skipping replayed request ${request.requestId}`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    let reply: string;
+    try {
+      const output = await turns.runTurn(buildTitleSummarizePrompt(request), request.model, undefined, {
+        timeoutMs: request.timeoutMs,
+        lean: true,
+      });
+      const title = parseTitleOutput(output);
+      reply = title
+        ? buildTitleSummarizeResponse(request.requestId, title, Date.now() - startedAt)
+        : buildTitleSummarizeError(request.requestId, "title summary invalid", Date.now() - startedAt);
+      if (title) {
+        console.log(`title summarize: answered ${request.requestId} with "${title}" in ${Date.now() - startedAt}ms`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "agent turn failed";
+      console.error(`title summarize: agent turn failed for ${request.requestId}: ${message}`);
+      reply = buildTitleSummarizeError(request.requestId, message, Date.now() - startedAt);
+    }
+
+    await this.deps.send(msg.fromUserId, "command", reply);
+    this.answeredTitleSummarizeRequests.add(request.requestId);
+    while (this.answeredTitleSummarizeRequests.size > 256) {
+      const oldest = this.answeredTitleSummarizeRequests.values().next().value;
+      if (oldest === undefined) break;
+      this.answeredTitleSummarizeRequests.delete(oldest);
+    }
+  }
+
   private rememberAnsweredCatalogRequest(requestId: string): void {
     this.answeredCatalogRequests.add(requestId);
     // Bounded: Set keeps insertion order, so drop the oldest entries.
@@ -2642,6 +2732,43 @@ export class MessageDispatcher {
     return questionId;
   }
 
+  /**
+   * 兜底：agent 直接调用了原生 question / ask_user 交互工具。
+   *
+   * headless serve 没有 TUI 应答方，工具会永远停在 running，用户只看到「正在
+   * question」转圈（2026-11-26 现场）。这里把工具入参转成可点击卡片，并中止
+   * 卡住的轮次；用户点选后沿用 question 语义作为新一轮输入续流。
+   * 返回 true 表示这一轮已改成卡片交互，调用方应停止继续上屏正文。
+   */
+  private handleNativeQuestionActivity(
+    steps: ActivityStep[] | undefined,
+    ctx: { requesterId: string; sessionKey: string },
+    abortTurn: () => void,
+  ): boolean {
+    if (!steps) return false;
+    const step = steps.find((item) =>
+      /^(question|ask_user)$/i.test(item.label)
+      && item.status === "running"
+      && Boolean(item.inputDetail || item.detail),
+    );
+    if (!step) return false;
+    const questions = parseNativeQuestionToolInput(step.inputDetail ?? step.detail);
+    if (questions.length > 0) {
+      for (const question of questions) this.registerQuestionInteraction(question, ctx);
+    } else {
+      // 入参解析不出来也别让它永远挂着：中止并提示用户用文字回答。
+      void this.deps.send(
+        ctx.requesterId,
+        "RC:TxtMsg",
+        JSON.stringify({
+          content: "检测到智能体使用了本设备不支持的原生提问工具，已中止这一轮。请直接用文字告诉我你的选择，我会继续。",
+        }),
+      );
+    }
+    abortTurn();
+    return true;
+  }
+
   /** 把交互卡片替换成「已决策/已超时」的只读态。 */
   private async sendInteractionCardUpdate(toUserId: string, cardId: string, text: string): Promise<void> {
     await this.deps.send(
@@ -2760,9 +2887,11 @@ export class MessageDispatcher {
         clearTimeout(pending.timer);
         this.pendingInteractions.delete(permissionId);
         await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${replyLabel}`);
+        // 回灌带上原操作描述：续流靠 session resume 恢复上下文，resume 失效时
+        // agent 是全新会话，只看到「用户选择了允许」会不知道刚才确认的是哪件事。
         const decisionText = reply === "reject"
-          ? `你刚才请求确认的操作，用户选择了「拒绝」。请取消该操作并说明。`
-          : `你刚才请求确认的操作，用户选择了「${replyLabel}」。请继续执行该操作。`;
+          ? `你之前请求用户确认的操作：${pending.request.permission}\n用户选择了「拒绝」。请取消该操作并说明。`
+          : `你之前请求用户确认的操作：${pending.request.permission}\n用户选择了「${replyLabel}」。请继续执行该操作。`;
         try {
           const out = await turns.runTurn(decisionText, undefined, pending.request.sessionKey);
           await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
@@ -2794,9 +2923,18 @@ export class MessageDispatcher {
       this.pendingInteractions.delete(questionId);
       await this.sendInteractionCardUpdate(msg.fromUserId, questionId, `已收到你的选择：${value.join("、")}`);
       // 选项作为新一轮用户输入续流，绑回同一会话键。
-      const choiceText = `我选择：${value.join("、")}`;
+      // 必须把「原问题 + 所有选项」一起回灌：续流靠 session resume 恢复上下文，
+      // 而 resume 在 agent 不支持续接 / 会话过期 / CLI 重启时会失效 —— 那时 agent
+      // 是全新会话，只收到「我选择：番茄炒蛋盖饭」就会答「没看到之前的上下文」。
+      const request = pending.request;
+      const choiceText = [
+        `你之前向用户提问：${request.question}`,
+        `给出的选项：${request.options.join("、")}`,
+        `用户选择了：${value.join("、")}`,
+        "请基于用户的选择继续完成任务。",
+      ].join("\n");
       try {
-        const out = await turns.runTurn(choiceText, undefined, pending.request.sessionKey);
+        const out = await turns.runTurn(choiceText, undefined, request.sessionKey);
         await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

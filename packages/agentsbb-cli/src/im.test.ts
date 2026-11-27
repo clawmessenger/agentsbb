@@ -3568,6 +3568,69 @@ describe("MessageDispatcher 单聊二次确认", () => {
     });
     expect(deps.sent.length).toBe(0);
   });
+
+  it("原生 question 工具卡住时换成选择卡片，并中止这一轮", async () => {
+    const sent: Array<{ to: string; objectName: string; content: string }> = [];
+    const dispatcher = new MessageDispatcher({
+      send: async (to, objectName, content) => { sent.push({ to, objectName, content }); },
+      sendStream: async () => {},
+      agentName: "opencode",
+    });
+    let aborted = false;
+    const step: ActivityStep = {
+      id: "call-q",
+      kind: "tool",
+      label: "question",
+      status: "running",
+      inputDetail: JSON.stringify({
+        questions: [{ question: "晚饭吃什么？", options: ["番茄炒蛋", "可乐鸡翅"], multiple: false }],
+      }),
+    };
+    const pending = dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "帮我选个晚饭" }),
+    }, {
+      runTurn: async () => "unused",
+      runTurnStreamed: (_p, _m, onDelta, signal) => new Promise<string>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("agent turn aborted"));
+        }, { once: true });
+        void onDelta("", undefined, [step]);
+      }),
+    });
+    await pending;
+    expect(aborted).toBe(true);
+    const cardMsg = sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const q = card.sections.find((s: { kind: string }) => s.kind === "question");
+    expect(q.question).toBe("晚饭吃什么？");
+    expect(q.options.map((o: { label: string }) => o.label)).toEqual(["番茄炒蛋", "可乐鸡翅"]);
+
+    // 点选后沿用 question 语义：作为新一轮用户输入续流。
+    const prompts: string[] = [];
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "answer", questionId: q.questionId, value: ["可乐鸡翅"] },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "好，就这个。"; },
+    });
+    expect(prompts[0]).toContain("晚饭吃什么？");
+    expect(prompts[0]).toContain("番茄炒蛋");
+    expect(prompts[0]).toContain("可乐鸡翅");
+    expect(prompts[0]).not.toBe("我选择：可乐鸡翅");
+  });
 });
 
 describe("MessageDispatcher headless 软确认", () => {
@@ -3614,5 +3677,119 @@ describe("MessageDispatcher headless 软确认", () => {
     expect(prompts.length).toBe(1);
     expect(prompts[0]).toContain("允许一次");
     expect(prompts[0]).toContain("继续执行");
+    // 续流必须自带原操作描述：resume 失效时 agent 是全新会话，不知道确认的是哪件事。
+    expect(prompts[0]).toContain("删除 /tmp/a.txt");
+  });
+
+  it("agent 输出 question 标记后，用户点选续流带上原问题和全部选项", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const prompts: string[] = [];
+
+    const marker = '[interaction:question] {"question":"晚饭三选一，选哪个？","options":["番茄炒蛋盖饭","蒜香黄焖鸡","麻婆豆腐盖饭"]} [/interaction]';
+    // 降级路径（无 sendStream）：runTurn 返回带标记的正文 → 解析成 question 卡片。
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "你说我三个菜吗？" }),
+    }, {
+      runTurn: async () => `晚晚三选一，先给你三个方向：\n${marker}`,
+    });
+
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const questionSection = card.sections.find((s: { kind: string }) => s.kind === "question");
+    expect(questionSection.question).toBe("晚饭三选一，选哪个？");
+    expect(questionSection.options).toHaveLength(3);
+
+    // 用户点选 → 续流提示词必须自带上下文，不能只发「我选择：…」。
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "answer", questionId: questionSection.questionId, value: ["番茄炒蛋盖饭"] },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "好的，做法是……"; },
+    });
+
+    expect(prompts.length).toBe(1);
+    expect(prompts[0]).toContain("晚饭三选一，选哪个？");
+    expect(prompts[0]).toContain("番茄炒蛋盖饭");
+    expect(prompts[0]).toContain("蒜香黄焖鸡");
+    expect(prompts[0]).toContain("麻婆豆腐盖饭");
+    expect(prompts[0]).not.toContain("interaction:question");
+  });
+});
+
+// 全平台提问协议注入：headless 注入完整协议（操作确认+提问），ACP 只注入提问协议。
+// ACP 的 behaviorPrompt 会被拼进 userText（agents.ts runAcpTurn 分支），所以提问
+// 标记协议对 ACP 同样生效——这是 ACP 6 家能弹 question 卡片的关键。
+describe("private question protocol injection by agent type", () => {
+  const snapshotWith = (agent: string, behaviorPrompt: string): PermissionSnapshot => ({
+    ownerUserId: "owner_1",
+    ownerUserIdPresent: true,
+    agents: [{ agent, nodeId: "node_x", allowPrivate: true, behaviorPrompt, version: 1 }],
+    updatedAt: Date.now(),
+  });
+  const inbound = (): Parameters<MessageDispatcher["handle"]>[0] => ({
+    objectName: "RC:TxtMsg",
+    fromUserId: "user_q",
+    toUserId: "rc_node_x",
+    targetId: "rc_node_x",
+    conversationType: 1,
+    content: JSON.stringify({ content: "你好" }),
+  });
+
+  const captureBehaviorPrompt = async (agentName: string): Promise<string | undefined> => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({
+      send: deps.send,
+      agentName,
+      permissionNodeId: "node_x",
+      permissionSnapshot: () => snapshotWith(agentName, "用户自定义行为"),
+    });
+    let seen: string | undefined;
+    await dispatcher.handle(inbound(), {
+      runTurn: async (_prompt, _model, _sessionKey, opts) => {
+        seen = opts?.behaviorPrompt;
+        return "ok";
+      },
+    });
+    return seen;
+  };
+
+  it("headless agent gets both the operation-confirm and the question protocol", async () => {
+    const prompt = await captureBehaviorPrompt("kimi");
+    expect(prompt).toContain("用户自定义行为");
+    expect(prompt).toContain("[interaction:permission]");
+    expect(prompt).toContain("[interaction:question]");
+    expect(prompt).toContain("不要调用内置的 question");
+  });
+
+  it("ACP agent gets only the question protocol, not the operation-confirm one", async () => {
+    const prompt = await captureBehaviorPrompt("kiro-cli");
+    expect(prompt).toContain("用户自定义行为");
+    expect(prompt).toContain("[interaction:question]");
+    expect(prompt).toContain("不要调用内置的 question");
+    expect(prompt).not.toContain("[interaction:permission]");
+  });
+
+  it("agentName missing keeps the old contract (no protocol injected)", async () => {
+    // agentName 缺省（未指定执行器的测试夹具）不注入，避免误伤既有行为契约。
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    let seen: string | undefined;
+    await dispatcher.handle(inbound(), {
+      runTurn: async (_p, _m, _sk, opts) => { seen = opts?.behaviorPrompt; return "ok"; },
+    });
+    expect(seen).toBeUndefined();
   });
 });

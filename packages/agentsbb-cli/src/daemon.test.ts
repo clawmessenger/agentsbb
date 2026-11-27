@@ -6,11 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  clearSupervisorLock,
   createDaemon,
   decodeCommandOutput,
   defaultDaemonPaths,
   findLiveSupervisor,
   formatDaemonStatus,
+  readSupervisorLockOwner,
   injectStartupVbsSelfHeal,
   injectStartupVbsWatchdogLoop,
   supervisorSpawnArgv,
@@ -19,6 +21,7 @@ import {
   STARTUP_VBS_WATCHDOG_LOOP_MARKER,
   WATCHDOG_LOOP_INTERVAL_MS,
   WATCHDOG_LOOP_PID_FILE,
+  writeSupervisorLock,
   writeSupervisorState,
   type DaemonOverrides,
   type DaemonPaths,
@@ -261,6 +264,34 @@ describe("daemon start", () => {
     expect(h.spawns).toHaveLength(1);
     expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("777");
   });
+
+  it("keeps pid/state files when a live lock owner explains the child's instant death", async () => {
+    // 竞态现场：本次 spawn 的进程撞到另一份孤儿持有的端口锁而自杀。此时绝不能
+    // 清掉 pid/state —— 那是孤儿唯一的可发现线索（P0）。
+    const h = harness();
+    h.alive.add(4242); // 孤儿，持有端口锁
+    writeSupervisorLock(h.paths, 4242);
+    writeFileSync(h.paths.pidFile, "555\n"); // start 刚写下的、已经死掉的本次 PID
+
+    await expect(h.daemon.start()).rejects.toThrow(/failed to stay up/);
+
+    expect(existsSync(h.paths.pidFile)).toBe(true);
+    expect(readFileSync(h.paths.pidFile, "utf8").trim()).toBe("555");
+    expect(h.errors.join("")).toContain("PID 4242");
+    expect(h.errors.join("")).toContain("holds the singleton port lock");
+    expect(existsSync(h.paths.lockFile)).toBe(true);
+  });
+
+  it("still clears pid/state when the child died with no lock owner present", async () => {
+    const h = harness(); // 没有任何活进程，也没有 lock 登记
+    mkdirSync(h.paths.stateDir, { recursive: true });
+    writeFileSync(h.paths.pidFile, "555\n");
+
+    await expect(h.daemon.start()).rejects.toThrow(/failed to stay up/);
+
+    expect(existsSync(h.paths.pidFile)).toBe(false);
+    expect(h.errors.join("")).toContain("exited immediately after start (PID 555)");
+  });
 });
 
 describe("daemon stop", () => {
@@ -312,6 +343,30 @@ describe("daemon stop", () => {
     await h.daemon.stop();
     expect(h.lines.join("")).toContain("no agentsbb supervisor is running.");
     expect(h.lines.join("")).not.toContain("stale");
+  });
+
+  it("stops an orphaned supervisor found only through the port-lock registration", async () => {
+    const h = harness();
+    // pid/state 文件全无（被失败的 start 抹掉了），但 lock 文件记着活着的 35232。
+    h.alive.add(35232);
+    writeSupervisorLock(h.paths, 35232);
+
+    await h.daemon.stop();
+
+    expect(h.signals).toEqual([{ pid: 35232, signal: "SIGTERM" }]);
+    expect(h.lines.join("")).toContain("orphaned supervisor PID 35232");
+    expect(h.lines.join("")).toContain("stopped.");
+    expect(existsSync(h.paths.lockFile)).toBe(false);
+  });
+
+  it("clears a dead lock registration without signaling anyone", async () => {
+    const h = harness();
+    writeSupervisorLock(h.paths, 999); // 写登记，但 999 不活着
+
+    await h.daemon.stop();
+
+    expect(h.signals).toHaveLength(0);
+    expect(existsSync(h.paths.lockFile)).toBe(false);
   });
 
   it("kills the whole process tree on Windows", async () => {
@@ -444,6 +499,46 @@ describe("daemon status", () => {
     mkdirSync(join(h.home, ".config", "systemd", "user"), { recursive: true });
     writeFileSync(join(h.home, ".config", "systemd", "user", "agentsbb.service"), "[Unit]\n");
     expect(h.daemon.status().autostart).toContain("systemd user service");
+  });
+
+  it("reports an orphaned supervisor found only via the port-lock registration", () => {
+    const h = harness();
+    h.alive.add(35232); // 持有端口锁的孤儿，pid/state 文件里没有它
+    writeSupervisorLock(h.paths, 35232);
+
+    const report = h.daemon.status();
+
+    expect(report.running).toBe(false); // 不撒谎说在跑
+    expect(report.orphanPid).toBe(35232);
+    const text = formatDaemonStatus(report, h.paths);
+    expect(text).toContain("orphaned supervisor (PID 35232)");
+    expect(text).toContain("agentsbb stop");
+    expect(text).toContain("start it with: agentsbb start");
+  });
+
+  it("does not report a dead lock registration as an orphan", () => {
+    const h = harness();
+    writeSupervisorLock(h.paths, 35232); // 登记了，但进程已经不在
+
+    const report = h.daemon.status();
+
+    expect(report.orphanPid).toBeUndefined();
+    expect(formatDaemonStatus(report, h.paths)).not.toContain("orphaned supervisor");
+  });
+});
+
+describe("supervisor lock registration", () => {
+  it("clearSupervisorLock only removes the registration of the calling pid", () => {
+    const h = harness();
+    writeSupervisorLock(h.paths, 4242);
+
+    clearSupervisorLock(h.paths, 999); // 别人不能删
+    expect(existsSync(h.paths.lockFile)).toBe(true);
+    h.alive.add(4242);
+    expect(readSupervisorLockOwner(h.paths, (pid) => h.alive.has(pid))).toBe(4242);
+
+    clearSupervisorLock(h.paths, 4242); // 本人可以删
+    expect(existsSync(h.paths.lockFile)).toBe(false);
   });
 });
 
