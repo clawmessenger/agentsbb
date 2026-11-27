@@ -3626,7 +3626,10 @@ describe("MessageDispatcher 单聊二次确认", () => {
     }, {
       runTurn: async (prompt) => { prompts.push(prompt); return "好，就这个。"; },
     });
-    expect(prompts[0]).toBe("我选择：可乐鸡翅");
+    expect(prompts[0]).toContain("晚饭吃什么？");
+    expect(prompts[0]).toContain("番茄炒蛋");
+    expect(prompts[0]).toContain("可乐鸡翅");
+    expect(prompts[0]).not.toBe("我选择：可乐鸡翅");
   });
 });
 
