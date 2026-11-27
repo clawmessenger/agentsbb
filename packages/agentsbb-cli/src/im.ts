@@ -2883,9 +2883,11 @@ export class MessageDispatcher {
         clearTimeout(pending.timer);
         this.pendingInteractions.delete(permissionId);
         await this.sendInteractionCardUpdate(msg.fromUserId, permissionId, `已处理：${replyLabel}`);
+        // 回灌带上原操作描述：续流靠 session resume 恢复上下文，resume 失效时
+        // agent 是全新会话，只看到「用户选择了允许」会不知道刚才确认的是哪件事。
         const decisionText = reply === "reject"
-          ? `你刚才请求确认的操作，用户选择了「拒绝」。请取消该操作并说明。`
-          : `你刚才请求确认的操作，用户选择了「${replyLabel}」。请继续执行该操作。`;
+          ? `你之前请求用户确认的操作：${pending.request.permission}\n用户选择了「拒绝」。请取消该操作并说明。`
+          : `你之前请求用户确认的操作：${pending.request.permission}\n用户选择了「${replyLabel}」。请继续执行该操作。`;
         try {
           const out = await turns.runTurn(decisionText, undefined, pending.request.sessionKey);
           await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
@@ -2917,9 +2919,18 @@ export class MessageDispatcher {
       this.pendingInteractions.delete(questionId);
       await this.sendInteractionCardUpdate(msg.fromUserId, questionId, `已收到你的选择：${value.join("、")}`);
       // 选项作为新一轮用户输入续流，绑回同一会话键。
-      const choiceText = `我选择：${value.join("、")}`;
+      // 必须把「原问题 + 所有选项」一起回灌：续流靠 session resume 恢复上下文，
+      // 而 resume 在 agent 不支持续接 / 会话过期 / CLI 重启时会失效 —— 那时 agent
+      // 是全新会话，只收到「我选择：番茄炒蛋盖饭」就会答「没看到之前的上下文」。
+      const request = pending.request;
+      const choiceText = [
+        `你之前向用户提问：${request.question}`,
+        `给出的选项：${request.options.join("、")}`,
+        `用户选择了：${value.join("、")}`,
+        "请基于用户的选择继续完成任务。",
+      ].join("\n");
       try {
-        const out = await turns.runTurn(choiceText, undefined, pending.request.sessionKey);
+        const out = await turns.runTurn(choiceText, undefined, request.sessionKey);
         await this.deps.send(msg.fromUserId, "RC:TxtMsg", JSON.stringify({ content: out }));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

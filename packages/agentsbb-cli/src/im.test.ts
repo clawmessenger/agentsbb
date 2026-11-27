@@ -3674,5 +3674,54 @@ describe("MessageDispatcher headless 软确认", () => {
     expect(prompts.length).toBe(1);
     expect(prompts[0]).toContain("允许一次");
     expect(prompts[0]).toContain("继续执行");
+    // 续流必须自带原操作描述：resume 失效时 agent 是全新会话，不知道确认的是哪件事。
+    expect(prompts[0]).toContain("删除 /tmp/a.txt");
+  });
+
+  it("agent 输出 question 标记后，用户点选续流带上原问题和全部选项", async () => {
+    const deps = makeDeps();
+    const dispatcher = new MessageDispatcher({ send: deps.send });
+    const prompts: string[] = [];
+
+    const marker = '[interaction:question] {"question":"晚饭三选一，选哪个？","options":["番茄炒蛋盖饭","蒜香黄焖鸡","麻婆豆腐盖饭"]} [/interaction]';
+    // 降级路径（无 sendStream）：runTurn 返回带标记的正文 → 解析成 question 卡片。
+    await dispatcher.handle({
+      objectName: "RC:TxtMsg",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({ content: "你说我三个菜吗？" }),
+    }, {
+      runTurn: async () => `晚晚三选一，先给你三个方向：\n${marker}`,
+    });
+
+    const cardMsg = deps.sent.find((s) => s.objectName === "card_message");
+    expect(cardMsg).toBeDefined();
+    const card = JSON.parse(cardMsg!.content).card;
+    const questionSection = card.sections.find((s: { kind: string }) => s.kind === "question");
+    expect(questionSection.question).toBe("晚饭三选一，选哪个？");
+    expect(questionSection.options).toHaveLength(3);
+
+    // 用户点选 → 续流提示词必须自带上下文，不能只发「我选择：…」。
+    await dispatcher.handle({
+      objectName: "card_action",
+      fromUserId: "user-1",
+      toUserId: "rc_node_x",
+      targetId: "rc_node_x",
+      conversationType: 1,
+      content: JSON.stringify({
+        action: { type: "answer", questionId: questionSection.questionId, value: ["番茄炒蛋盖饭"] },
+      }),
+    }, {
+      runTurn: async (prompt) => { prompts.push(prompt); return "好的，做法是……"; },
+    });
+
+    expect(prompts.length).toBe(1);
+    expect(prompts[0]).toContain("晚饭三选一，选哪个？");
+    expect(prompts[0]).toContain("番茄炒蛋盖饭");
+    expect(prompts[0]).toContain("蒜香黄焖鸡");
+    expect(prompts[0]).toContain("麻婆豆腐盖饭");
+    expect(prompts[0]).not.toContain("interaction:question");
   });
 });
